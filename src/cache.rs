@@ -38,11 +38,17 @@ use crate::resolve::BuckalResolve;
 ///            incompatible where their resolution lacks a platform, and binaries
 ///            only the tests enable are emitted only for integration tests. A
 ///            version 6 to 8 cache is stale in the same way.
+/// Version 10: rules change from an unchanged resolution again: no test variant of
+///            a library the tests do not build, binaries and tests link only a
+///            Rust library, a path dependency outside the workspace gets its
+///            library only, proc-macro unit tests get `proc_macro`, and a
+///            host-only library the tests build for the target gets a test
+///            variant. A version 9 cache certifies rules without these.
 ///
 /// Migration strategy:
 /// - If found < expected (stale cache from older Buckal): ignore the old cache and rebuild.
 /// - If found > expected (cache from newer Buckal): exit immediately and prompt the user to upgrade.
-const CACHE_VERSION: u32 = 9;
+const CACHE_VERSION: u32 = 10;
 
 /// The oldest cache version whose record of the fixups a generation applied
 /// (`fixup_rustc_flags`, `fixups`) is still read, from a cache whose rules are
