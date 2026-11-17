@@ -472,8 +472,7 @@ fn root_owned_names(ctx: &BuckalContext) -> Vec<(&'static str, &'static str)> {
 
 /// Refuse a BUCK file that would declare a target name twice: two generated
 /// rules, a generated rule and a kept hand-written call, or either and a rule
-/// spliced in later (`reserved`, as `(function, name)`); or two build scripts
-/// with one crate name.
+/// spliced in later (`reserved`, as `(function, name)`).
 fn check_namespace(
     rules: &[Rule],
     calls: &[(String, String)],
@@ -486,24 +485,6 @@ fn check_namespace(
             return Err(format!(
                 "generation emits two rules named `{name}` (`{first}` and `{}`); rename what generates one of them",
                 rule.function()
-            ));
-        }
-    }
-    // A build script's crate name comes from its rule name, which maps `-` and
-    // `.` alike to `_`: two build scripts it gives one crate name are refused.
-    let build_scripts = build_script_names(rules);
-    let mut crates: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
-    for rule in rules {
-        let Rule::RustBinary(binary) = rule else {
-            continue;
-        };
-        if !build_scripts.contains(&binary.name) {
-            continue;
-        }
-        if let Some(first) = crates.insert(&binary.crate_name, &binary.name) {
-            return Err(format!(
-                "generation emits two build scripts with the crate name `{}` (`{first}` and `{}`); rename the module or variant one of them comes from",
-                binary.crate_name, binary.name
             ));
         }
     }

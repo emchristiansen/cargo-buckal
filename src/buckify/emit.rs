@@ -263,8 +263,8 @@ const PACKAGE_FILES_GLOB: &str = "**/**";
 
 /// The crate name of the build script binary `name`: `-` and the `.` of a wasm
 /// variant's module key (`build-script-wasm-<package>.<variant>-build`) become `_`,
-/// as rustc accepts only an identifier. Two build scripts of a package that this
-/// gives one crate name are refused when the BUCK file is written.
+/// as rustc accepts only an identifier. Two build scripts of a package may share
+/// a crate name (`a-b` and `a_b`): Buck2 needs unique rule names, not crate names.
 fn build_script_crate_name(name: &str) -> String {
     name.replace(['-', '.'], "_")
 }
