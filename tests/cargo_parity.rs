@@ -34,26 +34,38 @@ struct TreeLine {
     depth: usize,
     /// The line is below a `[build-dependencies]` header of its parent.
     build_edge: bool,
+    /// The line is below a `[dev-dependencies]` header of its parent: a test's
+    /// dependency, compiled for the target.
+    dev_edge: bool,
     proc_macro: bool,
     id: Option<PackageId>,
     features: BTreeSet<String>,
 }
 
-/// The package lines `cargo tree -e normal,build --target <triple>` shows, in order.
+/// The package lines `cargo tree -e normal,build --target <triple>` shows, in order:
+/// the production build. With `tests` (`Some(features)`), `cargo tree -e
+/// normal,build,dev --features <features>`: the build `cargo test --features
+/// <features>` makes, dev-dependencies (target context) included.
 fn cargo_tree(
     manifest: &Path,
     triple: &str,
+    tests: Option<&[String]>,
     by_name_version: &HashMap<(String, String), PackageId>,
 ) -> Vec<TreeLine> {
-    let output = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned()))
-        .args([
-            "tree",
-            "--workspace",
-            "-e",
-            "normal,build",
-            "--target",
-            triple,
-        ])
+    let mut command = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned()));
+    command.args(["tree", "--workspace", "--target", triple]);
+    match tests {
+        None => {
+            command.args(["-e", "normal,build"]);
+        }
+        Some(features) => {
+            command.args(["-e", "normal,build,dev"]);
+            if !features.is_empty() {
+                command.args(["--features", &features.join(",")]);
+            }
+        }
+    }
+    let output = command
         .args(["-f", "{p}|{f}", "--manifest-path"])
         .arg(manifest)
         .output()
@@ -65,9 +77,8 @@ fn cargo_tree(
     );
     let text = String::from_utf8(output.stdout).unwrap();
     let mut lines = Vec::new();
-    // Per depth: whether the current section of children there is
-    // `[build-dependencies]`.
-    let mut build_section: Vec<bool> = Vec::new();
+    // Per depth: the current section header of the children there.
+    let mut build_section: Vec<Option<char>> = Vec::new();
     for line in text.lines() {
         if line.trim().is_empty() {
             build_section.clear();
@@ -85,13 +96,20 @@ fn cargo_tree(
         let rest: String = chars[4 * units..].iter().collect();
         if rest.starts_with('[') {
             // A section header for the children at depth `units + 1`.
-            build_section.resize(units + 2, false);
-            build_section[units + 1] = rest.starts_with("[build-dependencies]");
+            build_section.resize(units + 2, None);
+            build_section[units + 1] = if rest.starts_with("[build-dependencies]") {
+                Some('b')
+            } else if rest.starts_with("[dev-dependencies]") {
+                Some('d')
+            } else {
+                None
+            };
             continue;
         }
         let depth = units;
-        build_section.resize(depth + 1, false);
-        let build_edge = build_section[depth];
+        build_section.resize(depth + 1, None);
+        let build_edge = build_section[depth] == Some('b');
+        let dev_edge = build_section[depth] == Some('d');
         // A new node: the sections of its own children start over.
         build_section.truncate(depth + 1);
         let (package, features) = rest.split_once('|').expect("{p}|{f}");
@@ -101,6 +119,7 @@ fn cargo_tree(
         lines.push(TreeLine {
             depth,
             build_edge,
+            dev_edge,
             proc_macro: package.contains("(proc-macro)"),
             id: by_name_version.get(&(name, version)).cloned(),
             features: features
@@ -128,7 +147,14 @@ struct Report {
     not_built: usize,
 }
 
-fn compare(manifest: &Path, platforms: &BTreeMap<String, String>) -> (Report, PlatformFeatures) {
+/// Compare BUCKAL's resolution with `cargo tree`'s: production, or with `tests`
+/// (`Some(test_features)`) the test contexts (test variants and test host variants,
+/// else the production rules the tests share).
+fn compare(
+    manifest: &Path,
+    platforms: &BTreeMap<String, String>,
+    tests: Option<&[String]>,
+) -> (Report, PlatformFeatures) {
     let metadata = MetadataCommand::new()
         .manifest_path(manifest)
         .exec()
@@ -149,9 +175,13 @@ fn compare(manifest: &Path, platforms: &BTreeMap<String, String>) -> (Report, Pl
     for key in ambiguous {
         by_name_version.remove(&key);
     }
-    let resolved =
-        resolve_platform_features(Some(manifest.to_str().unwrap()), platforms, &packages, &[])
-            .expect("resolve");
+    let resolved = resolve_platform_features(
+        Some(manifest.to_str().unwrap()),
+        platforms,
+        &packages,
+        tests.unwrap_or(&[]),
+    )
+    .expect("resolve");
     let mut report = Report::default();
     for (platform, triple) in platforms {
         let union: HashMap<String, BTreeSet<String>> = MetadataCommand::new()
@@ -174,8 +204,8 @@ fn compare(manifest: &Path, platforms: &BTreeMap<String, String>) -> (Report, Pl
         let expected = |id: &PackageId| -> Option<(Features, Features)> {
             let resolution = resolved.get(id)?;
             let main = resolution.features.get(platform).cloned();
-            let target = (!resolution.host_context).then(|| main.clone()).flatten();
-            let host = if resolution.host_context {
+            let mut target = (!resolution.host_context).then(|| main.clone()).flatten();
+            let mut host = if resolution.host_context {
                 main
             } else {
                 resolution
@@ -184,12 +214,20 @@ fn compare(manifest: &Path, platforms: &BTreeMap<String, String>) -> (Report, Pl
                     .and_then(|h| h.features.get(platform).cloned())
                     .or(main)
             };
+            if tests.is_some() {
+                if let Some(test) = &resolution.test_variant {
+                    target = test.features.get(platform).cloned();
+                }
+                if let Some(test_host) = &resolution.test_host_variant {
+                    host = test_host.features.get(platform).cloned();
+                }
+            }
             Some((target, host))
         };
         // The context of each depth's current node; `None` below a root whose
         // context cannot be told.
         let mut contexts: Vec<Option<Context>> = Vec::new();
-        for line in cargo_tree(manifest, triple, &by_name_version) {
+        for line in cargo_tree(manifest, triple, tests, &by_name_version) {
             contexts.truncate(line.depth);
             let Some(id) = line.id.clone() else {
                 report.unattributed += 1;
@@ -221,7 +259,9 @@ fn compare(manifest: &Path, platforms: &BTreeMap<String, String>) -> (Report, Pl
                 // cannot be placed, and neither can its dependencies.
                 let in_target = target == Some(line.features.clone());
                 let in_host = host == Some(line.features.clone());
-                let has_variant = resolved.get(&id).is_some_and(|r| r.host_variant.is_some());
+                let has_variant = resolved.get(&id).is_some_and(|r| {
+                    r.host_variant.is_some() || tests.is_some() && r.test_host_variant.is_some()
+                });
                 if line.proc_macro || in_host && !in_target {
                     Some(Context::Host)
                 } else if in_target && in_host && has_variant {
@@ -238,6 +278,13 @@ fn compare(manifest: &Path, platforms: &BTreeMap<String, String>) -> (Report, Pl
             } else {
                 match contexts[line.depth - 1] {
                     None => None,
+                    // A test's dependency of a host compilation (a proc-macro or a
+                    // host-only member): its unit tests are compiled for the host and
+                    // its integration tests for the target, so the context of the
+                    // dependency cannot be told.
+                    Some(Context::Host) if line.dev_edge => None,
+                    // A test's dependency of a target compilation (proc-macros aside).
+                    Some(_) if line.dev_edge && !line.proc_macro => Some(Context::Target),
                     Some(Context::Host) => Some(Context::Host),
                     Some(Context::Target) if line.build_edge || line.proc_macro => {
                         Some(Context::Host)
@@ -266,7 +313,10 @@ fn compare(manifest: &Path, platforms: &BTreeMap<String, String>) -> (Report, Pl
                     id.repr, line.features
                 ));
             }
-            if context == Context::Target && union.get(&id.repr) != Some(&line.features) {
+            if tests.is_none()
+                && context == Context::Target
+                && union.get(&id.repr) != Some(&line.features)
+            {
                 report
                     .metadata_differs
                     .insert((platform.clone(), id.repr.clone()));
@@ -284,13 +334,18 @@ fn write(path: &Path, content: &str) {
 /// Feature unification that differs per platform and per context: `common` gets `a`
 /// from `app` everywhere, `b` and the optional `helper` from `web` on wasm32 only,
 /// `c` from `app`'s build script (host only), `d` from the proc-macro `pm`, and `h`
-/// on `helper` from a dev-dependency (tests only).
+/// on `helper` from a dev-dependency (tests only). Under `cargo test --features
+/// test_lib`: the proc-macro `pm` (a member) gets `test_lib`, but the build
+/// dependency `gen` does not (command-line features reach members' target
+/// compilations and host-only members); the dev-dependency proc-macro `dpm`, which
+/// only the tests build (not a member, like a third-party crate), gives the host
+/// `hostlib` that `pm` also uses feature `x`.
 fn fixture() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write(
         &root.join("Cargo.toml"),
-        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"web\", \"common\", \"pm\", \"helper\"]\n",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"web\", \"common\", \"pm\", \"helper\", \"gen\", \"hostlib\"]\nexclude = [\"dpm\"]\n",
     );
     let package = |name: &str, body: &str| {
         format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{body}")
@@ -310,17 +365,32 @@ fn fixture() -> tempfile::TempDir {
         &root.join("pm/Cargo.toml"),
         &package(
             "pm",
-            "[lib]\nproc-macro = true\n[dependencies]\ncommon = { path = \"../common\", features = [\"d\"] }\n",
+            "[lib]\nproc-macro = true\n[features]\ntest_lib = []\n[dependencies]\ncommon = { path = \"../common\", features = [\"d\"] }\nhostlib = { path = \"../hostlib\" }\n",
         ),
     );
     write(
         &root.join("app/Cargo.toml"),
         &package(
             "app",
-            "[dependencies]\ncommon = { path = \"../common\", features = [\"a\"] }\npm = { path = \"../pm\" }\n[build-dependencies]\ncommon = { path = \"../common\", features = [\"c\"] }\n[dev-dependencies]\nhelper = { path = \"../helper\", features = [\"h\"] }\n",
+            "[dependencies]\ncommon = { path = \"../common\", features = [\"a\"] }\npm = { path = \"../pm\" }\n[build-dependencies]\ncommon = { path = \"../common\", features = [\"c\"] }\ngen = { path = \"../gen\" }\n[dev-dependencies]\nhelper = { path = \"../helper\", features = [\"h\"] }\ndpm = { path = \"../dpm\" }\n",
         ),
     );
     write(&root.join("app/build.rs"), "fn main() {}\n");
+    write(
+        &root.join("gen/Cargo.toml"),
+        &package("gen", "[features]\ntest_lib = []\n"),
+    );
+    write(
+        &root.join("hostlib/Cargo.toml"),
+        &package("hostlib", "[features]\nx = []\n"),
+    );
+    write(
+        &root.join("dpm/Cargo.toml"),
+        &package(
+            "dpm",
+            "[lib]\nproc-macro = true\n[dependencies]\nhostlib = { path = \"../hostlib\", features = [\"x\"] }\n",
+        ),
+    );
     write(
         &root.join("web/Cargo.toml"),
         &package(
@@ -328,7 +398,9 @@ fn fixture() -> tempfile::TempDir {
             "[target.'cfg(target_arch = \"wasm32\")'.dependencies]\ncommon = { path = \"../common\", features = [\"b\", \"helper\"] }\n",
         ),
     );
-    for member in ["app", "web", "common", "pm", "helper"] {
+    for member in [
+        "app", "web", "common", "pm", "helper", "gen", "hostlib", "dpm",
+    ] {
         write(&root.join(member).join("src/lib.rs"), "");
     }
     dir
@@ -352,7 +424,7 @@ fn set(items: &[&str]) -> BTreeSet<String> {
 fn test_production_features_match_cargo() {
     let dir = fixture();
     let manifest = dir.path().join("Cargo.toml");
-    let (report, resolved) = compare(&manifest, &platforms());
+    let (report, resolved) = compare(&manifest, &platforms(), None);
     assert!(report.mismatches.is_empty(), "{report:#?}");
     assert!(report.compared >= 10, "{report:#?}");
     // `cargo metadata` merges what differs; the old rules carried that merge.
@@ -384,11 +456,109 @@ fn test_production_features_match_cargo() {
     );
 }
 
+fn find<'a>(
+    resolved: &'a PlatformFeatures,
+    name: &str,
+) -> &'a cargo_buckal::platform_features::PlatformResolution {
+    resolved
+        .iter()
+        .find(|(id, _)| id.repr.contains(&format!("/{name}#")))
+        .map(|(_, r)| r)
+        .unwrap()
+}
+
+#[test]
+fn test_test_contexts_match_cargo() {
+    let dir = fixture();
+    let manifest = dir.path().join("Cargo.toml");
+    let features = ["test_lib".to_owned()];
+    let (report, resolved) = compare(&manifest, &platforms(), Some(&features));
+    assert!(report.mismatches.is_empty(), "{report:#?}");
+    assert!(report.compared >= 10, "{report:#?}");
+    assert_eq!(report.unattributed, 0, "{report:#?}");
+
+    // Under the tests, the host `hostlib` has `x` (from `dpm`, a dev-dependency) and
+    // the proc-macro `pm` has `test_lib` and uses that `hostlib`; production has
+    // neither.
+    let hostlib = find(&resolved, "hostlib");
+    assert_eq!(hostlib.features["linux-x86_64"], set(&[]));
+    assert_eq!(
+        hostlib.test_host_variant.as_ref().unwrap().features["linux-x86_64"],
+        set(&["x"])
+    );
+    let pm = find(&resolved, "pm");
+    assert_eq!(pm.features["linux-x86_64"], set(&[]));
+    assert_eq!(
+        pm.test_host_variant.as_ref().unwrap().features["linux-x86_64"],
+        set(&["test_lib"])
+    );
+    // `gen` is a build dependency, which `--features` does not reach on the host.
+    assert!(find(&resolved, "gen").test_host_variant.is_none());
+    // `dpm` is built for the tests only: emitted from the tests' resolution.
+    let dpm = find(&resolved, "dpm");
+    assert!(dpm.test_context && dpm.host_context);
+    // `app` uses `pm`, so its tests compile it apart (a test variant) against
+    // `pm`'s test host variant.
+    let app = find(&resolved, "app");
+    assert!(app.test_variant.is_some());
+    let pm_id = resolved
+        .keys()
+        .find(|id| id.repr.contains("/pm#"))
+        .unwrap()
+        .repr
+        .clone();
+    assert!(app.test_host_variant_deps.contains(&pm_id));
+    // Production is the same as without test features.
+    let (production, _) = compare(&manifest, &platforms(), None);
+    assert!(production.mismatches.is_empty(), "{production:#?}");
+}
+
+#[test]
+#[ignore = "set BUCKAL_PARITY_MANIFEST (and BUCKAL_PARITY_TEST_FEATURES) for a workspace"]
+fn test_test_contexts_match_cargo_on_workspace() {
+    let manifest = std::env::var("BUCKAL_PARITY_MANIFEST").expect("BUCKAL_PARITY_MANIFEST");
+    let features: Vec<String> = std::env::var("BUCKAL_PARITY_TEST_FEATURES")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|f| !f.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let (report, resolved) = compare(Path::new(&manifest), &platforms(), Some(&features));
+    let test_variants = resolved
+        .values()
+        .filter(|r| r.test_variant.is_some())
+        .count();
+    let test_host_variants = resolved
+        .values()
+        .filter(|r| r.test_host_variant.is_some())
+        .count();
+    eprintln!(
+        "tests --features {features:?}: compared {} cargo tree package lines; {} mismatches; {} lines unattributed; {} lines of packages never built; {test_variants} test variants, {test_host_variants} test host variants",
+        report.compared,
+        report.mismatches.len(),
+        report.unattributed,
+        report.not_built,
+    );
+    for mismatch in &report.mismatches {
+        eprintln!("MISMATCH {mismatch}");
+    }
+    for (id, r) in &resolved {
+        if r.test_host_variant.is_some() {
+            eprintln!("TEST-HOST-VARIANT {}", id.repr);
+        }
+        // Built only for the tests, and for the host there.
+        if r.test_context && (r.host_context || r.host_variant.is_some()) {
+            eprintln!("TEST-ONLY-HOST {}", id.repr);
+        }
+    }
+    assert!(report.mismatches.is_empty());
+}
+
 #[test]
 #[ignore = "set BUCKAL_PARITY_MANIFEST to a workspace's Cargo.toml"]
 fn test_production_features_match_cargo_on_workspace() {
     let manifest = std::env::var("BUCKAL_PARITY_MANIFEST").expect("BUCKAL_PARITY_MANIFEST");
-    let (report, _) = compare(Path::new(&manifest), &platforms());
+    let (report, _) = compare(Path::new(&manifest), &platforms(), None);
     eprintln!(
         "compared {} cargo tree package lines; {} mismatches; {} lines unattributed; {} lines of packages cargo build builds nothing of; cargo metadata --filter-platform differs from cargo's target-context features for {} (platform, package) pairs",
         report.compared,

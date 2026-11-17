@@ -1231,3 +1231,84 @@ fn test_test_features_resolve_tests_apart() {
     assert_eq!(f.buck("selfy"), selfy);
     assert_eq!(f.buck("user"), user);
 }
+
+#[test]
+fn test_test_host_variants_through_generation() {
+    // `dpm`, a proc-macro only the tests use (not a member), gives the host
+    // `hostlib` feature `x`; `pm`, a proc-macro of the ordinary build, uses `hostlib`
+    // without it. Cargo compiles the tests' `pm` and `hostlib` (and its build script)
+    // apart; production stays as `cargo build` resolves it.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"pm\", \"hostlib\"]\nexclude = [\"dpm\"]\n",
+    );
+    write(
+        &f.ws.join("app/Cargo.toml"),
+        &manifest(
+            "app",
+            "[dependencies]\npm = { path = \"../pm\" }\n[dev-dependencies]\ndpm = { path = \"../dpm\" }\n",
+        ),
+    );
+    write(&f.ws.join("app/src/lib.rs"), "");
+    for (name, body) in [
+        (
+            "pm",
+            "[lib]\nproc-macro = true\n[dependencies]\nhostlib = { path = \"../hostlib\" }\n",
+        ),
+        (
+            "dpm",
+            "[lib]\nproc-macro = true\n[dependencies]\nhostlib = { path = \"../hostlib\", features = [\"x\"] }\n",
+        ),
+        ("hostlib", "[features]\nx = []\n"),
+    ] {
+        write(&f.ws.join(name).join("Cargo.toml"), &manifest(name, body));
+        write(&f.ws.join(name).join("src/lib.rs"), "");
+    }
+    write(&f.ws.join("hostlib/build.rs"), "fn main() {}\n");
+    f.migrate(&[]);
+
+    let hostlib = f.buck("hostlib");
+    assert!(!rule(&hostlib, "hostlib").contains("features"), "{hostlib}");
+    let variant = rule(&hostlib, "hostlib-test-host");
+    assert!(variant.contains("    features = [\"x\"],\n"), "{variant}");
+    assert!(
+        variant.contains("build-script-test-host-run[out_dir]"),
+        "{variant}"
+    );
+    assert!(
+        rule(&hostlib, "build-script-test-host-run").contains("    features = [\"x\"],\n"),
+        "{hostlib}"
+    );
+    rule(&hostlib, "build-script-test-host-build");
+
+    let pm = f.buck("pm");
+    assert!(rule(&pm, "pm").contains("\"//hostlib:hostlib\""), "{pm}");
+    let pm_variant = rule(&pm, "pm-test-host");
+    assert!(
+        pm_variant.contains("\"//hostlib:hostlib-test-host\""),
+        "{pm_variant}"
+    );
+
+    // The test-only proc-macro is emitted for the tests, against the tests' host.
+    let dpm = f.buck("dpm");
+    assert!(
+        rule(&dpm, "dpm").contains("\"//hostlib:hostlib-test-host\""),
+        "{dpm}"
+    );
+
+    // Production `app` uses production `pm`; its tests use the tests' `pm`.
+    let app = f.buck("app");
+    assert!(rule(&app, "app").contains("\"//pm:pm\""), "{app}");
+    for name in ["unittest", "app-test"] {
+        let r = rule(&app, name);
+        assert!(r.contains("\"//pm:pm-test-host\""), "{r}");
+        assert!(!r.contains("\"//pm:pm\""), "{r}");
+    }
+    assert!(rule(&app, "unittest").contains("\"//dpm:dpm\""), "{app}");
+
+    // A fixed point.
+    f.migrate(&["--no-cache"]);
+    assert_eq!(f.buck("hostlib"), hostlib);
+    assert_eq!(f.buck("app"), app);
+}

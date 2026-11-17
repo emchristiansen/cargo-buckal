@@ -229,15 +229,36 @@ pub(super) fn test_variant_name(name: &str) -> String {
     format!("{name}-test")
 }
 
-/// Whether a test-context rule of `node` (not compiled for the host) must use
-/// `dep_node`'s test variant.
-fn uses_test_variant(node: &BuckalNode, kind: CargoTargetKind, dep_node: &BuckalNode) -> bool {
-    node.platform_features.test_context
-        && !is_host_context(node, kind)
-        && node
-            .platform_features
-            .test_variant_deps
-            .contains(&dep_node.package_id.repr)
+/// The name (or label) of the test host variant of the rule `name`.
+pub(super) fn test_host_variant_name(name: &str) -> String {
+    format!("{name}-test-host")
+}
+
+/// The variant of `dep_node` that the test-context rule `kind` of `node` uses: for
+/// a host compilation (a build script or host-only rule) or a host-only dependency
+/// (a proc-macro), its test host variant, else its host variant (in a host
+/// compilation); for a target compilation, its test variant.
+fn test_context_variant(
+    node: &BuckalNode,
+    kind: CargoTargetKind,
+    dep_node: &BuckalNode,
+) -> Option<fn(&str) -> String> {
+    let resolution = &node.platform_features;
+    let dep = &dep_node.package_id.repr;
+    let host_rule = is_host_context(node, kind);
+    if host_rule || dep_node.platform_features.host_context {
+        if resolution.test_host_variant_deps.contains(dep) {
+            Some(test_host_variant_name)
+        } else if host_rule && resolution.host_variant_deps.contains(dep) {
+            Some(host_variant_name)
+        } else {
+            None
+        }
+    } else if resolution.test_variant_deps.contains(dep) {
+        Some(test_variant_name)
+    } else {
+        None
+    }
 }
 
 /// The role of `kind`'s dependency edges in Cargo's resolution.
@@ -360,10 +381,12 @@ fn dep_label(
             dep.name, dep_node.name
         )
     })?;
-    if is_host_context(node, kind) && uses_host_variant(node, dep_node) {
+    if node.platform_features.test_context {
+        if let Some(variant) = test_context_variant(node, kind, dep_node) {
+            target_label = variant(&target_label);
+        }
+    } else if is_host_context(node, kind) && uses_host_variant(node, dep_node) {
         target_label = host_variant_name(&target_label);
-    } else if uses_test_variant(node, kind, dep_node) {
-        target_label = test_variant_name(&target_label);
     }
     Ok((target_label, alias))
 }

@@ -269,13 +269,27 @@ impl BuckalResolve {
                             let child_name = &dag[child_idx].name;
                             if lenient {
                                 // In lenient mode, skip the cyclic dev edge so we still
-                                // have all nodes. The parent's tests lose this dev-dependency.
-                                crate::buckal_warn!(
-                                    "Skipping dev-dependency `{}` -> `{}`, which forms a cycle; tests of `{}` will not see it.",
-                                    parent_name,
-                                    child_name,
-                                    parent_name
-                                );
+                                // have all nodes. A package's dev-dependency on itself
+                                // needs no edge: its tests compile against its own
+                                // library, and the features the edge enables are in the
+                                // tests' resolution (with per-platform resolution). Any
+                                // other cyclic dev-dependency is not a dependency of the
+                                // parent's tests.
+                                if parent_idx == child_idx {
+                                    crate::buckal_note!(
+                                        "Dev-dependency of `{}` on itself needs no edge; with `feature_platforms`, its tests use `{}` with the features it enables.",
+                                        parent_name,
+                                        parent_name
+                                    );
+                                } else {
+                                    crate::buckal_warn!(
+                                        "Skipping dev-dependency `{}` -> `{}`, which forms a cycle; the tests of `{}` do not depend on `{}`.",
+                                        parent_name,
+                                        child_name,
+                                        parent_name,
+                                        child_name
+                                    );
+                                }
                                 continue;
                             }
                             bail!(

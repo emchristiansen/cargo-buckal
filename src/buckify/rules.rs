@@ -17,11 +17,12 @@ use super::includes::{
     IncludeGap, UnprovidedInclude, in_nested_package, repository_path, unprovided_includes,
 };
 
-use super::deps::{host_variant_name, test_variant_name};
+use super::deps::{host_variant_name, test_host_variant_name, test_variant_name};
 use super::emit::{
     emit_buildscript_build, emit_buildscript_run, emit_cargo_manifest, emit_filegroup,
     emit_git_fetch, emit_http_archive, emit_rust_binary, emit_rust_library, emit_rust_test,
-    host_variant_build_target, patch_with_buildscript, test_variant_build_target,
+    host_variant_build_target, patch_with_buildscript, test_host_variant_build_target,
+    test_variant_build_target,
 };
 
 /// Buckifies a third-party dependency into a list of BUCK rules.
@@ -107,6 +108,13 @@ pub fn buckify_dep_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         ctx,
     ));
     buck_rules.extend(test_variant_rules(
+        node,
+        lib_target,
+        &node.name,
+        &manifest_dir,
+        ctx,
+    ));
+    buck_rules.extend(test_host_variant_rules(
         node,
         lib_target,
         &node.name,
@@ -337,6 +345,13 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
             &manifest_dir,
             ctx,
         ));
+        buck_rules.extend(test_host_variant_rules(
+            node,
+            lib_target,
+            lib_name,
+            &manifest_dir,
+            ctx,
+        ));
     }
 
     apply_fixups(&mut buck_rules, node, ctx);
@@ -553,15 +568,63 @@ fn test_variant_rules(
     let Some(resolution) = node.platform_features.test_variant_resolution() else {
         return Vec::new();
     };
-    let test_node = BuckalNode {
+    variant_rules(
+        node,
+        resolution,
+        lib_target,
+        &test_variant_name(lib_name),
+        test_variant_build_target,
+        manifest_dir,
+        ctx,
+    )
+}
+
+/// The rules of `node`'s test host variant, if it has one: its library
+/// `<lib_name>-test-host` and, with a build script,
+/// `build-script-test-host-build`/`build-script-test-host-run`, compiled with the
+/// tests' host-context resolution. The tests' build scripts and proc-macros (and
+/// what those use) depend on it.
+fn test_host_variant_rules(
+    node: &BuckalNode,
+    lib_target: &BuckalTarget,
+    lib_name: &str,
+    manifest_dir: &Utf8PathBuf,
+    ctx: &BuckalContext,
+) -> Vec<Rule> {
+    let Some(resolution) = node.platform_features.test_host_variant_resolution() else {
+        return Vec::new();
+    };
+    variant_rules(
+        node,
+        resolution,
+        lib_target,
+        &test_host_variant_name(lib_name),
+        test_host_variant_build_target,
+        manifest_dir,
+        ctx,
+    )
+}
+
+/// A variant `name` of `node`'s library compiled with `resolution`, with its own
+/// build script rules (`build_target_of` the package's) if it has a build script.
+fn variant_rules(
+    node: &BuckalNode,
+    resolution: crate::platform_features::PlatformResolution,
+    lib_target: &BuckalTarget,
+    name: &str,
+    build_target_of: fn(&BuckalTarget) -> BuckalTarget,
+    manifest_dir: &Utf8PathBuf,
+    ctx: &BuckalContext,
+) -> Vec<Rule> {
+    let variant_node = BuckalNode {
         platform_features: resolution,
         ..node.clone()
     };
     let mut rules = vec![Rule::RustLibrary(emit_rust_library(
-        &test_node,
+        &variant_node,
         lib_target,
         manifest_dir,
-        &test_variant_name(lib_name),
+        name,
         ctx,
     ))];
     let custom_build_target = node
@@ -569,21 +632,21 @@ fn test_variant_rules(
         .iter()
         .find(|t| t.kind.contains(&TargetKind::CustomBuild));
     if let Some(build_target) = custom_build_target {
-        let test_build = test_variant_build_target(build_target);
+        let variant_build = build_target_of(build_target);
         for rule in &mut rules {
             if let Some(rust_rule) = rule.as_rust_rule_mut() {
-                patch_with_buildscript(rust_rule, &test_build);
+                patch_with_buildscript(rust_rule, &variant_build);
             }
         }
         rules.push(Rule::RustBinary(emit_buildscript_build(
-            &test_build,
-            &test_node,
+            &variant_build,
+            &variant_node,
             manifest_dir,
             ctx,
         )));
         rules.push(Rule::BuildscriptRun(emit_buildscript_run(
-            &test_node,
-            &test_build,
+            &variant_node,
+            &variant_build,
             ctx,
         )));
     }

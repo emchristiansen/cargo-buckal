@@ -198,6 +198,22 @@ pub struct PlatformResolution {
     /// variants. Set for a package Cargo builds only for tests.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub test_context: bool,
+    /// The package as the tests' host compilations (build scripts, proc-macros and
+    /// what they use) need it, where that differs from the host compilation of the
+    /// ordinary build (or depends on a package that does). Emitted as the
+    /// `<lib>-test-host` variant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_host_variant: Option<HostVariant>,
+    /// Dependencies (`PackageId::repr`) with a test host variant, which this
+    /// package's test-context host compilations (and its proc-macro dependencies of
+    /// test-context rules) use.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub test_host_variant_deps: BTreeSet<String>,
+    /// Dependencies with an emitted host variant (`<lib>-host`), as the test context
+    /// sees them: test-context host compilations use those that have no test host
+    /// variant.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub test_context_host_variant_deps: BTreeSet<String>,
 }
 
 /// The resolution of one more compilation context of a package: the host variant of
@@ -242,19 +258,46 @@ impl PlatformResolution {
             deps: host.deps.clone(),
             host_context: true,
             host_variant_deps: self.host_variant_deps.clone(),
+            // A package only the tests build: its host variant is in the test context.
+            test_context: self.test_context,
+            test_variant_deps: self.test_variant_deps.clone(),
+            test_host_variant_deps: self.test_host_variant_deps.clone(),
             ..Default::default()
+        })
+    }
+
+    /// The labelling of a test-context resolution of this package: host variants as
+    /// the test context sees them, and test and test host variants.
+    fn in_test_context(&self, resolution: PlatformResolution) -> PlatformResolution {
+        PlatformResolution {
+            host_variant_deps: self.test_context_host_variant_deps.clone(),
+            test_variant_deps: self.test_variant_deps.clone(),
+            test_host_variant_deps: self.test_host_variant_deps.clone(),
+            test_context: true,
+            ..resolution
+        }
+    }
+
+    /// The resolution of the test host variant, if the package has one.
+    pub fn test_host_variant_resolution(&self) -> Option<PlatformResolution> {
+        self.test_host_variant.as_ref().map(|host| {
+            self.in_test_context(PlatformResolution {
+                features: host.features.clone(),
+                deps: host.deps.clone(),
+                host_context: true,
+                ..Default::default()
+            })
         })
     }
 
     /// The resolution of the test variant's library, if the package has one.
     pub fn test_variant_resolution(&self) -> Option<PlatformResolution> {
-        self.test_variant.as_ref().map(|test| PlatformResolution {
-            features: test.features.clone(),
-            deps: test.deps.clone(),
-            host_variant_deps: self.host_variant_deps.clone(),
-            test_variant_deps: self.test_variant_deps.clone(),
-            test_context: true,
-            ..Default::default()
+        self.test_variant.as_ref().map(|test| {
+            self.in_test_context(PlatformResolution {
+                features: test.features.clone(),
+                deps: test.deps.clone(),
+                ..Default::default()
+            })
         })
     }
 
@@ -263,13 +306,7 @@ impl PlatformResolution {
     pub fn test_resolution(&self) -> PlatformResolution {
         match &self.tests {
             None => self.exec_resolution(),
-            Some(tests) => PlatformResolution {
-                // Host variants are the main resolution's: those are the ones emitted.
-                host_variant_deps: self.host_variant_deps.clone(),
-                test_variant_deps: self.test_variant_deps.clone(),
-                test_context: true,
-                ..tests.exec_resolution()
-            },
+            Some(tests) => self.in_test_context(tests.exec_resolution()),
         }
     }
 
@@ -285,6 +322,7 @@ impl PlatformResolution {
                 host_context: false,
                 host_variant_deps: self.host_variant_deps.clone(),
                 test_variant_deps: self.test_variant_deps.clone(),
+                test_host_variant_deps: self.test_host_variant_deps.clone(),
                 test_context: self.test_context,
                 ..Default::default()
             },
@@ -325,14 +363,14 @@ pub fn resolve_platform_features(
     packages: &HashMap<PackageId, Package>,
     test_features: &[String],
 ) -> Result<PlatformFeatures> {
-    let main = resolve_shape(manifest_path, platforms, packages, GraphShape::Build)?;
-    let tests = resolve_shape(
+    let (main, _) = resolve_shape(manifest_path, platforms, packages, GraphShape::Build)?;
+    let (tests, tests_host_built) = resolve_shape(
         manifest_path,
         platforms,
         packages,
         GraphShape::Test(test_features),
     )?;
-    Ok(with_test_resolution(main, tests))
+    Ok(with_test_resolution(main, tests, &tests_host_built))
 }
 
 /// Which compilation Cargo plans in a unit graph.
@@ -349,7 +387,7 @@ fn resolve_shape(
     platforms: &BTreeMap<String, String>,
     packages: &HashMap<PackageId, Package>,
     shape: GraphShape,
-) -> Result<PlatformFeatures> {
+) -> Result<(PlatformFeatures, BTreeSet<PackageId>)> {
     let mut target: HashMap<PackageId, ContextResolution> = HashMap::new();
     let mut host: HashMap<PackageId, ContextResolution> = HashMap::new();
     for (platform, triple) in platforms {
@@ -376,7 +414,8 @@ fn resolve_shape(
             }
         }
     }
-    Ok(combine_contexts(target, host))
+    let host_built = host.keys().cloned().collect();
+    Ok((combine_contexts(target, host), host_built))
 }
 
 /// Combine the ordinary build's resolution (`main`) with the tests' (`tests`).
@@ -389,7 +428,56 @@ fn resolve_shape(
 fn with_test_resolution(
     mut main: PlatformFeatures,
     mut tests: PlatformFeatures,
+    tests_host_built: &BTreeSet<PackageId>,
 ) -> PlatformFeatures {
+    // The host compilation of a package: its main resolution when it is host-only,
+    // else its host variant, else (built for the target alike) the target one.
+    let host_side = |r: &PlatformResolution| -> HostVariant {
+        match (&r.host_variant, r.host_context) {
+            (Some(host), false) => host.clone(),
+            _ => HostVariant {
+                features: r.features.clone(),
+                deps: r.deps.clone(),
+            },
+        }
+    };
+    let host_edges = |h: &HostVariant| (h.deps.normal.clone(), h.deps.build.clone());
+    // Packages the tests compile for the host differently from the ordinary build
+    // (one that only the tests build is emitted from the tests' resolution and needs
+    // no variant), or whose host dependencies there do.
+    let in_both_on_host = |id: &PackageId| {
+        tests_host_built.contains(id) && main.contains_key(id) && tests.contains_key(id)
+    };
+    let mut host_variants: BTreeSet<String> = tests
+        .iter()
+        .filter(|(id, t)| {
+            in_both_on_host(id) && {
+                let (m, t) = (host_side(&main[*id]), host_side(t));
+                m.features != t.features || host_edges(&m) != host_edges(&t)
+            }
+        })
+        .map(|(id, _)| id.repr.clone())
+        .collect();
+    loop {
+        let more: Vec<String> = tests
+            .iter()
+            .filter(|(id, _)| in_both_on_host(id) && !host_variants.contains(&id.repr))
+            .filter(|(_, t)| {
+                let h = host_side(t);
+                h.deps
+                    .normal
+                    .values()
+                    .chain(h.deps.build.values())
+                    .flatten()
+                    .any(|dep| host_variants.contains(dep))
+            })
+            .map(|(id, _)| id.repr.clone())
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        host_variants.extend(more);
+    }
     let lib_edges = |r: &PlatformResolution| (r.deps.normal.clone(), r.deps.build.clone());
     let differs = |m: &PlatformResolution, t: &PlatformResolution| {
         m.features != t.features || lib_edges(m) != lib_edges(t)
@@ -400,7 +488,18 @@ fn with_test_resolution(
     };
     let mut variants: BTreeSet<String> = tests
         .iter()
-        .filter(|(id, t)| in_both_on_target(id) && differs(&main[*id], t))
+        .filter(|(id, t)| {
+            in_both_on_target(id)
+                && (differs(&main[*id], t)
+                    // Its build script or a proc-macro it uses is compiled otherwise
+                    // for the tests.
+                    || t.deps
+                        .normal
+                        .values()
+                        .chain(t.deps.build.values())
+                        .flatten()
+                        .any(|dep| host_variants.contains(dep)))
+        })
         .map(|(id, _)| id.repr.clone())
         .collect();
     loop {
@@ -423,16 +522,45 @@ fn with_test_resolution(
         variants.extend(more);
     }
 
+    // Packages whose `<lib>-host` rule is emitted: host variants of the ordinary
+    // build, and those of packages only the tests build.
+    let emitted_host_variants: BTreeSet<String> = main
+        .iter()
+        .filter(|(_, m)| m.host_variant.is_some())
+        .map(|(id, _)| id.repr.clone())
+        .chain(
+            tests
+                .iter()
+                .filter(|(id, t)| !main.contains_key(*id) && t.host_variant.is_some())
+                .map(|(id, _)| id.repr.clone()),
+        )
+        .collect();
+
     let ids: BTreeSet<PackageId> = main.keys().chain(tests.keys()).cloned().collect();
     for id in ids {
         let Some(t) = tests.remove(&id) else {
             continue;
         };
-        let test_variant_deps: BTreeSet<String> = t
+        let all_deps: BTreeSet<String> = t
             .deps
             .all()
             .chain(t.exec_context.iter().flat_map(|e| e.deps.all()))
+            .chain(t.host_variant.iter().flat_map(|h| h.deps.all()))
+            .cloned()
+            .collect();
+        let test_variant_deps: BTreeSet<String> = all_deps
+            .iter()
             .filter(|dep| variants.contains(*dep))
+            .cloned()
+            .collect();
+        let test_host_variant_deps: BTreeSet<String> = all_deps
+            .iter()
+            .filter(|dep| host_variants.contains(*dep))
+            .cloned()
+            .collect();
+        let test_context_host_variant_deps: BTreeSet<String> = all_deps
+            .iter()
+            .filter(|dep| emitted_host_variants.contains(*dep))
             .cloned()
             .collect();
         match main.get_mut(&id) {
@@ -440,6 +568,9 @@ fn with_test_resolution(
                 // Built for the tests only: its rules are in the test context.
                 let mut only = t;
                 only.test_variant_deps = test_variant_deps;
+                only.test_host_variant_deps = test_host_variant_deps;
+                only.host_variant_deps = test_context_host_variant_deps.clone();
+                only.test_context_host_variant_deps = test_context_host_variant_deps;
                 only.test_context = true;
                 main.insert(id, only);
             }
@@ -450,13 +581,18 @@ fn with_test_resolution(
                         deps: t.deps.clone(),
                     });
                 }
+                if host_variants.contains(&id.repr) {
+                    m.test_host_variant = Some(host_side(&t));
+                }
                 let same = m.features == t.features
                     && m.deps == t.deps
                     && m.exec_context == t.exec_context;
-                if !same || !test_variant_deps.is_empty() {
+                if !same || !test_variant_deps.is_empty() || !test_host_variant_deps.is_empty() {
                     m.tests = Some(Box::new(t));
                 }
                 m.test_variant_deps = test_variant_deps;
+                m.test_host_variant_deps = test_host_variant_deps;
+                m.test_context_host_variant_deps = test_context_host_variant_deps;
             }
         }
     }
