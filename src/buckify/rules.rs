@@ -186,6 +186,13 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         platform_features: node.platform_features.test_resolution(),
         ..node.clone()
     };
+    // The library's inline unit tests are compiled in the library's own context: on
+    // the host for a host-only library (a proc-macro), apart from its integration
+    // tests on the target.
+    let unit_test_node = BuckalNode {
+        platform_features: node.platform_features.unit_test_resolution(),
+        ..node.clone()
+    };
     let has_test_variant = node.platform_features.test_variant.is_some();
     // Rules compiled in the test context: they use the package's own test variant.
     let mut test_context_rules: Set<String> = Set::new();
@@ -251,7 +258,8 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
 
         if !ctx.repo_config.ignore_tests && lib_target.test {
             // If the library target has inline tests, emit a rust_test rule for it
-            let rust_test = emit_rust_test(&test_node, lib_target, &manifest_dir, "unittest", ctx);
+            let rust_test =
+                emit_rust_test(&unit_test_node, lib_target, &manifest_dir, "unittest", ctx);
             test_context_rules.insert("unittest".to_owned());
 
             buck_rules.push(Rule::RustTest(rust_test));
@@ -307,13 +315,23 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         // Patch the rust_library and rust_binary rules to support build scripts; rules
         // in the test context use the test variant's, whose features are the tests'.
         let test_build = test_variant_build_target(build_target);
+        // A host-only library's unit tests are a host compilation of the tests: they
+        // use the test host variant's build script where there is one.
+        let unit_test_build = (node.platform_features.host_context
+            && node.platform_features.test_host_variant.is_some())
+        .then(|| test_host_variant_build_target(build_target));
         for rule in &mut buck_rules {
             let for_tests = has_test_variant
                 && rule
                     .name()
                     .is_some_and(|name| test_context_rules.contains(name));
+            let unit_test_host = unit_test_build
+                .as_ref()
+                .filter(|_| rule.name() == Some("unittest"));
             if let Some(rust_rule) = rule.as_rust_rule_mut() {
-                if for_tests {
+                if let Some(build) = unit_test_host {
+                    patch_with_buildscript(rust_rule, build);
+                } else if for_tests {
                     patch_with_buildscript(rust_rule, &test_build);
                 } else {
                     patch_with_buildscript(rust_rule, build_target);

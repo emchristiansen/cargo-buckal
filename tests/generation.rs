@@ -1312,3 +1312,102 @@ fn test_test_host_variants_through_generation() {
     assert_eq!(f.buck("hostlib"), hostlib);
     assert_eq!(f.buck("app"), app);
 }
+
+/// The review's context fixture (t_800b7f5f CTX-UNIT-1, CTX-DEV-1): `app` uses
+/// `shared` with `target-f` and the proc-macro `pm`, which uses `shared` with
+/// `host-f`. `pm` has inline tests (using `shared`'s host-f-only API and the
+/// unix-only dev-dependency `nativeonly`) and an integration test; `wasmonly` is a
+/// wasm32-only dev-dependency.
+fn pm_contexts_fixture(with_integration_test: bool) -> Kept {
+    let f = proc_macro_fixture(with_integration_test);
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"pm\", \"shared\", \"nativeonly\", \"wasmonly\"]\n",
+    );
+    write(
+        &f.ws.join("app/Cargo.toml"),
+        &manifest(
+            "app",
+            "[dependencies]\npm = { path = \"../pm\" }\nshared = { path = \"../shared\", features = [\"target-f\"] }\n",
+        ),
+    );
+    write(
+        &f.ws.join("pm/Cargo.toml"),
+        &manifest(
+            "pm",
+            "[lib]\nproc-macro = true\n[dependencies]\nshared = { path = \"../shared\", features = [\"host-f\"] }\n\
+             [target.'cfg(unix)'.dev-dependencies]\nnativeonly = { path = \"../nativeonly\" }\n\
+             [target.'cfg(target_arch = \"wasm32\")'.dev-dependencies]\nwasmonly = { path = \"../wasmonly\" }\n",
+        ),
+    );
+    write(
+        &f.ws.join("pm/src/lib.rs"),
+        "extern crate proc_macro;\n#[proc_macro]\npub fn sample(_: proc_macro::TokenStream) -> proc_macro::TokenStream {\n    shared::host();\n    proc_macro::TokenStream::new()\n}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn unit() {\n        shared::host();\n        nativeonly::value();\n    }\n}\n",
+    );
+    if with_integration_test {
+        write(
+            &f.ws.join("pm/tests/api.rs"),
+            "#[test]\nfn api() {\n    pm::sample!();\n}\n",
+        );
+    }
+    write(
+        &f.ws.join("shared/Cargo.toml"),
+        &manifest("shared", "[features]\nhost-f = []\ntarget-f = []\n"),
+    );
+    write(
+        &f.ws.join("shared/src/lib.rs"),
+        "#[cfg(all(feature = \"host-f\", not(feature = \"target-f\")))]\npub fn host() {}\n",
+    );
+    for name in ["nativeonly", "wasmonly"] {
+        write(&f.ws.join(name).join("Cargo.toml"), &manifest(name, ""));
+        write(&f.ws.join(name).join("src/lib.rs"), "pub fn value() {}\n");
+    }
+    f
+}
+
+/// The quoted labels of the list that starts at `list` (`[` ... `]`).
+fn labels(list: &str) -> Vec<&str> {
+    list[..list.find(']').unwrap()]
+        .split('"')
+        .skip(1)
+        .step_by(2)
+        .collect()
+}
+
+/// The labels of a rule's top-level `deps` list.
+fn top_deps(rule: &str) -> Vec<&str> {
+    rule.find("\n    deps = [")
+        .map_or_else(Vec::new, |at| labels(&rule[at + 13..]))
+}
+
+#[test]
+fn test_proc_macro_unit_tests_are_host_compilations() {
+    for with_integration_test in [true, false] {
+        let f = pm_contexts_fixture(with_integration_test);
+        f.migrate(&[]);
+        let pm = f.buck("pm");
+        let shared = f.buck("shared");
+        // Ordinary `shared` has both features; `shared-host` only `host-f`.
+        assert!(rule(&shared, "shared").contains("target-f"), "{shared}");
+        let host = rule(&shared, "shared-host");
+        assert!(
+            host.contains("host-f") && !host.contains("target-f"),
+            "{host}"
+        );
+        assert!(rule(&pm, "pm").contains("\"//shared:shared-host\""), "{pm}");
+
+        // CTX-UNIT-1: Cargo compiles pm's inline tests for the host, with the host
+        // `shared` (`mode=test, kind=proc-macro, platform=null`), whether or not an
+        // integration test (on the target) exists.
+        let unittest = rule(&pm, "unittest");
+        assert!(unittest.contains("\"//shared:shared-host\""), "{unittest}");
+        assert!(!unittest.contains("\"//shared:shared\""), "{unittest}");
+        // The host unit tests have the host's unix-only dev-dependency on every
+        // platform (the host is unix), and no wasm32-only one.
+        assert!(
+            top_deps(unittest).contains(&"//nativeonly:nativeonly"),
+            "{unittest}"
+        );
+        assert!(!unittest.contains("wasmonly"), "{unittest}");
+    }
+}

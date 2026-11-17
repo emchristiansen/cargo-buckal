@@ -310,6 +310,22 @@ impl PlatformResolution {
         }
     }
 
+    /// The resolution that the library's inline unit tests are compiled with: the
+    /// library's own context (the host for a host-only library, whose unit tests
+    /// Cargo compiles for the host), from the test resolution where there is a
+    /// separate one. Integration tests and binaries use [`Self::test_resolution`]
+    /// and [`Self::exec_resolution`] instead.
+    pub fn unit_test_resolution(&self) -> PlatformResolution {
+        let own_context = |r: &PlatformResolution| PlatformResolution {
+            exec_context: None,
+            ..r.clone()
+        };
+        match &self.tests {
+            None => own_context(self),
+            Some(tests) => self.in_test_context(own_context(tests)),
+        }
+    }
+
     /// The resolution that the package's binaries and tests are compiled with: the
     /// target context when the library itself is host-only and the executables are
     /// not, else the package's main resolution.
