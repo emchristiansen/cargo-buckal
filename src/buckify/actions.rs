@@ -378,7 +378,11 @@ impl OwnedNames {
         match (function, name) {
             ("filegroup", Some(name)) => self.filegroups.contains(name),
             ("export_file", Some(name)) => self.exports.contains(name),
-            ("configured_alias", Some(name)) => name == crate::wasm::MODULE_ALIAS,
+            ("configured_alias", Some(name)) => {
+                name == crate::wasm::MODULE_ALIAS
+                    || name.starts_with(&format!("{}.", crate::wasm::MODULE_ALIAS))
+            }
+            ("wasm_sha256", _) => true,
             _ => GENERATED_RULE_KINDS.contains(&function),
         }
     }

@@ -1,0 +1,6 @@
+# Add to the buckal cell's tool/BUCK, beside manifest_parse and buildscript_run.
+native.python_bootstrap_binary(
+    name = "wasm_sha256",
+    main = "wasm_sha256.py",
+    visibility = ["PUBLIC"],
+)

@@ -218,6 +218,15 @@ pub struct RepoConfig {
 /// reaches a package declaring `[package.metadata.buck2.test-env]` `VAR = { wasm =
 /// "<package>" }` gets `VAR = "$(location <package>:lib-wasm-wasm32[cdylib])"` in
 /// its `run_env`.
+///
+/// A package also builds each `[package.metadata.buck2.wasm-variants.<name>]`
+/// (`features`, required and exact; `profile`, the module's when not given) as a
+/// module of its own graph: `<lib>-wasm-<package>.<name>` variants and
+/// `configured_alias(name = "lib-wasm-wasm32.<name>")`, named by `variant =
+/// "<name>"` beside `wasm`. `{ wasm_sha256 = "<package>" }` (with an optional
+/// `variant`) names the file holding the module's lowercase hex SHA-256, which the
+/// buckal cell's `wasm_sha256` (`@buckal//:wasm_digest.bzl`) computes as
+/// `<alias>-sha256`, emitted only for a module a declaration names this way.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WasmConfig {

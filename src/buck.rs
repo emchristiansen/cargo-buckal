@@ -26,6 +26,7 @@ pub enum Rule {
     RustTest(RustTest),
     BuildscriptRun(BuildscriptRun),
     ConfiguredAlias(ConfiguredAlias),
+    WasmSha256(WasmSha256),
 }
 
 /// Buck2's native `configured_alias`: `actual` configured for `platform`.
@@ -35,6 +36,17 @@ pub struct ConfiguredAlias {
     pub name: String,
     pub actual: String,
     pub platform: String,
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub visibility: Set<String>,
+}
+
+/// The buckal cell's `wasm_sha256` (`@buckal//:wasm_digest.bzl`): a file holding
+/// the lowercase hex SHA-256 of `src` (a module's `[cdylib]`), with no newline.
+#[derive(Serialize, Debug, PartialEq, Clone)]
+#[serde(rename = "wasm_sha256")]
+pub struct WasmSha256 {
+    pub name: String,
+    pub src: String,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub visibility: Set<String>,
 }
@@ -54,6 +66,7 @@ impl Rule {
             Rule::RustTest(r) => Some(&r.name),
             Rule::BuildscriptRun(r) => Some(&r.name),
             Rule::ConfiguredAlias(r) => Some(&r.name),
+            Rule::WasmSha256(r) => Some(&r.name),
         }
     }
 
@@ -1455,6 +1468,7 @@ fn rule_map_key(rule: &Rule) -> String {
         Rule::RustTest(r) => format!("rust_test[{}]", r.name),
         Rule::BuildscriptRun(r) => format!("buildscript_run[{}]", r.name),
         Rule::ConfiguredAlias(r) => format!("configured_alias[{}]", r.name),
+        Rule::WasmSha256(r) => format!("wasm_sha256[{}]", r.name),
     }
 }
 
