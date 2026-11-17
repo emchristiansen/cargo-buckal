@@ -10,9 +10,12 @@ pub mod config;
 pub mod context;
 pub mod filter;
 pub mod platform;
+pub mod platform_features;
 pub mod registry;
 pub mod resolve;
 pub mod utils;
+pub mod wasm;
+pub mod workspace_inputs;
 
 use std::sync::OnceLock;
 

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::buckal_error;
 use crate::utils::{UnwrapOrExit, get_cache_path};
 
-use crate::config::RepoPatchConfig;
+use crate::config::{PackageFixup, RepoConfig, RepoPatchConfig};
 use crate::resolve::BuckalResolve;
 
 // type Fingerprint = [u8; 32];
@@ -17,16 +17,55 @@ use crate::resolve::BuckalResolve;
 /// Version 2: Added multi-platform support to the cache format.
 /// Version 3: Switched to BuckalNode-based fingerprinting (DAG refactor).
 /// Version 4: Include version patch config in fingerprints.
-/// Version 5: Canonicalized workspace-internal path-source PackageIds to the
-///            `($WORKSPACE)` `file://`-URL form. Pre-v5 caches stored the
-///            absolute workspace path verbatim (always so on Windows, where
-///            canonicalization used to no-op), so diffing an older cache against a
-///            v5-format snapshot would report spurious add/remove entries.
+/// Version 5: Include each package's effective `[fixups]` and its full per-platform,
+///            per-context resolution in fingerprints; first-party crates compile from
+///            their checkout paths, tests declare their package's files and integration
+///            tests name their binaries, host variants and ordered `rustc_flags`. A
+///            version 4 cache holds fingerprints of rules generated without these, so it
+///            is stale and everything is regenerated.
+/// Version 6: Record the fixup `rustc_flags` each generation added, so that `--merge`
+///            tells them from manual edits after the fixup changes or is removed.
+/// Version 7: `mapped_srcs` destinations are emitted as repository paths. A version 6
+///            cache vouches for package-relative destinations, so it is stale.
+/// Version 8: rules change from an unchanged resolution (headers, the library's own
+///            context for proc-macro unit tests, binary unit tests, build-script
+///            output on tests, kept dev edges, ...). A version 6 or 7 cache certifies
+///            rules this version would not write, so every package is regenerated;
+///            its record of the fixups that generation applied stays valid and is
+///            kept for `--merge`.
+/// Version 9: rules change from an unchanged resolution again: packages that no
+///            configured platform builds are incompatible, target compilations are
+///            incompatible where their resolution lacks a platform, and binaries
+///            only the tests enable are emitted only for integration tests. A
+///            version 6 to 8 cache is stale in the same way.
+/// Version 10: rules change from an unchanged resolution again: no test variant of
+///            a library the tests do not build, binaries and tests link only a
+///            Rust library, a path dependency outside the workspace gets its
+///            library only, proc-macro unit tests get `proc_macro`, and a
+///            host-only library the tests build for the target gets a test
+///            variant. A version 9 cache certifies rules without these.
+/// Version 11: a package's dev-dependency on itself links its library into its
+///            unit tests (a dev edge of the tests' resolution to itself). A version
+///            10 cache certifies rules without it.
+/// Version 12: a library host compilations use through its plain rule is not
+///            marked incompatible on a platform (Fable N6).
+/// Version 13: no test variant from a build dependency's target test variant.
+/// Version 14: `export_files` rules carry the `buckal-export-files` label.
+///
+/// Upstream's version 5 (path-source ids canonicalised through their `file://` URL,
+/// #102) is adopted here without a version of its own: on a path Cargo does not
+/// escape the keys are unchanged, and elsewhere a cache's absolute keys only make
+/// that generation regenerate (path sources are never removed).
 ///
 /// Migration strategy:
 /// - If found < expected (stale cache from older Buckal): ignore the old cache and rebuild.
 /// - If found > expected (cache from newer Buckal): exit immediately and prompt the user to upgrade.
-const CACHE_VERSION: u32 = 5;
+const CACHE_VERSION: u32 = 14;
+
+/// The oldest cache version whose record of the fixups a generation applied
+/// (`fixup_rustc_flags`, `fixups`) is still read, from a cache whose rules are
+/// outdated.
+const OLDEST_RECORD_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fingerprint([u8; 32]);
@@ -126,6 +165,40 @@ impl PackageIdExt for PackageId {
 pub struct BuckalCache {
     fingerprints: BTreeMap<PackageId, Fingerprint>,
     version: u32,
+    /// This is not a record of generated rules, only an inventory of the packages
+    /// (rebuilt from current metadata because no compatible cache exists). It still
+    /// detects removals, but every surviving package must be regenerated: their BUCK
+    /// files may come from another generator version, or from nothing at all.
+    #[serde(skip)]
+    regenerate_all: bool,
+    /// Loaded from disk: a record of a previous generation, whose fixup flags
+    /// (`fixup_rustc_flags`) are known.
+    #[serde(skip)]
+    recorded: bool,
+    /// Loaded from an older cache version: it records what that generation applied,
+    /// but its fingerprints do not certify rules this version writes, so every
+    /// package is regenerated.
+    #[serde(skip)]
+    rules_outdated: bool,
+    /// The fixup `rustc_flags` this generation added, by package name, so that a
+    /// later `--merge` can tell them from manual edits once they change or go away.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    fixup_rustc_flags: BTreeMap<String, Vec<String>>,
+    /// The fixups this generation applied, by package name, so that a later
+    /// `--merge` can tell their set-valued contributions (dependencies,
+    /// compatibility, environment) from manual edits once they change or go away.
+    /// `None` in a cache written before this was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fixups: Option<BTreeMap<String, PackageFixup>>,
+    /// The host compilations that resolved differently per configured platform in
+    /// this generation (see `BuckalContext::host_platform_differences`). `None`
+    /// without `feature_platforms`, and in a cache written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_platform_differences: Option<Vec<String>>,
+    /// A digest of each recorded entry's resolution (see
+    /// `BuckalContext::host_platform_difference_digests`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_platform_difference_digests: Option<BTreeMap<String, String>>,
 }
 
 impl BuckalCache {
@@ -134,18 +207,97 @@ impl BuckalCache {
         workspace_root: &Utf8PathBuf,
         patch_config: &RepoPatchConfig,
     ) -> Self {
+        Self::from_resolve_with_fixups(resolve, workspace_root, patch_config, &BTreeMap::new())
+    }
+
+    /// Fingerprints that also cover each package's effective `[fixups.<package>]`
+    /// (none, or the configured one), so that adding, changing or removing a fixup
+    /// regenerates exactly that package's rules in an ordinary cached migration.
+    pub fn from_resolve_with_fixups(
+        resolve: &BuckalResolve,
+        workspace_root: &Utf8PathBuf,
+        patch_config: &RepoPatchConfig,
+        fixups: &BTreeMap<String, PackageFixup>,
+    ) -> Self {
+        Self::from_resolve_with_options(resolve, workspace_root, patch_config, fixups, &[])
+    }
+
+    /// Fingerprints for the repository configuration `config`: its fixups (see
+    /// [`Self::from_resolve_with_fixups`]) and the workspace-level settings that
+    /// change first-party packages' rules, with `workspace_inputs`: what else of
+    /// the workspace reaches every first-party package's rules (the declared test
+    /// environments), serialized; empty when nothing does.
+    pub fn from_resolve_with_config(
+        resolve: &BuckalResolve,
+        workspace_root: &Utf8PathBuf,
+        config: &RepoConfig,
+        workspace_inputs: &[u8],
+    ) -> Self {
+        let mut key = config.first_party_generation_key();
+        if !workspace_inputs.is_empty() {
+            key.extend(b"workspace_inputs");
+            key.extend(workspace_inputs);
+        }
+        Self::from_resolve_with_options(
+            resolve,
+            workspace_root,
+            &config.patch,
+            &config.fixups,
+            &key,
+        )
+    }
+
+    fn from_resolve_with_options(
+        resolve: &BuckalResolve,
+        workspace_root: &Utf8PathBuf,
+        patch_config: &RepoPatchConfig,
+        fixups: &BTreeMap<String, PackageFixup>,
+        first_party_key: &[u8],
+    ) -> Self {
         let fingerprints = resolve
             .nodes()
             .map(|node| {
-                (
-                    node.package_id.canonicalize(workspace_root),
-                    resolve.fingerprint_of(&node.package_id, workspace_root, patch_config),
-                )
+                let mut base =
+                    resolve.fingerprint_of(&node.package_id, workspace_root, patch_config);
+                if !first_party_key.is_empty()
+                    && matches!(node.kind, crate::resolve::NodeKind::FirstParty { .. })
+                {
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(&base.0);
+                    hasher.update(b"workspace");
+                    hasher.update(first_party_key);
+                    base = Fingerprint(*hasher.finalize().as_bytes());
+                }
+                let fingerprint = match fixups.get(&node.name) {
+                    None => base,
+                    Some(fixup) => {
+                        let mut hasher = blake3::Hasher::new();
+                        hasher.update(&base.0);
+                        hasher.update(b"fixup");
+                        hasher.update(
+                            &serde_json::to_vec(fixup).expect("a fixup serializes to JSON"),
+                        );
+                        Fingerprint(*hasher.finalize().as_bytes())
+                    }
+                };
+                (node.package_id.canonicalize(workspace_root), fingerprint)
             })
+            .collect();
+        let fixup_rustc_flags = fixups
+            .iter()
+            .filter(|(_, fixup)| !fixup.rustc_flags.is_empty())
+            .map(|(name, fixup)| (name.clone(), fixup.rustc_flags.clone()))
             .collect();
         Self {
             fingerprints,
             version: CACHE_VERSION,
+            regenerate_all: false,
+            recorded: false,
+            rules_outdated: false,
+            fixup_rustc_flags,
+            fixups: Some(fixups.clone()),
+            host_platform_differences: None,
+            host_platform_difference_digests: None,
         }
     }
 
@@ -153,19 +305,61 @@ impl BuckalCache {
         Self {
             fingerprints: BTreeMap::new(),
             version: CACHE_VERSION,
+            regenerate_all: false,
+            recorded: false,
+            rules_outdated: false,
+            fixup_rustc_flags: BTreeMap::new(),
+            fixups: None,
+            host_platform_differences: None,
+            host_platform_difference_digests: None,
         }
     }
 
-    /// Read and parse the on-disk cache, exiting if it was written by a newer
-    /// Buckal. The returned cache may still be a stale (older) version — callers
-    /// decide whether to reject or migrate it.
-    fn read_from_disk() -> Result<Self, Error> {
+    /// Record the host compilations that resolve differently per platform.
+    pub fn with_host_platform_differences(
+        mut self,
+        differences: Option<Vec<String>>,
+        digests: Option<BTreeMap<String, String>>,
+    ) -> Self {
+        self.host_platform_differences = differences;
+        self.host_platform_difference_digests = digests;
+        self
+    }
+
+    /// The recorded digests of the entries' resolutions, if recorded.
+    pub fn host_platform_difference_digests(&self) -> Option<&BTreeMap<String, String>> {
+        self.recorded
+            .then_some(self.host_platform_difference_digests.as_ref())
+            .flatten()
+    }
+
+    /// The recorded host compilations that resolve differently per platform, if
+    /// this is a record of a generation that kept them.
+    pub fn host_platform_differences(&self) -> Option<&[String]> {
+        self.recorded
+            .then_some(self.host_platform_differences.as_deref())
+            .flatten()
+    }
+
+    /// Mark this cache as an inventory rebuilt from metadata, not a record of
+    /// generated rules: diffing against it regenerates every surviving package.
+    pub fn into_unverified_inventory(mut self) -> Self {
+        self.regenerate_all = true;
+        self
+    }
+
+    /// Whether this is an inventory whose packages must all be regenerated.
+    pub fn is_unverified_inventory(&self) -> bool {
+        self.regenerate_all
+    }
+
+    pub fn load() -> Result<Self, Error> {
         let cache_path = get_cache_path().unwrap_or_exit_ctx("failed to get cache path");
         if !cache_path.exists() {
             return Err(anyhow!("Cache file does not exist"));
         }
         let content = std::fs::read_to_string(&cache_path)?;
-        let cache = toml::from_str::<BuckalCache>(&content)
+        let mut cache = toml::from_str::<BuckalCache>(&content)
             .map_err(|e| anyhow!("Failed to parse cache file: {}", e))?;
         if cache.version > CACHE_VERSION {
             buckal_error!(
@@ -175,66 +369,16 @@ impl BuckalCache {
             );
             std::process::exit(1);
         }
-        Ok(cache)
-    }
-
-    pub fn load() -> Result<Self, Error> {
-        let cache = Self::read_from_disk()?;
-        if cache.version < CACHE_VERSION {
+        if cache.version < OLDEST_RECORD_VERSION {
             return Err(anyhow!(
                 "Cache version is stale (found {}, expected {})",
                 cache.version,
                 CACHE_VERSION
             ));
         }
+        cache.rules_outdated = cache.version < CACHE_VERSION;
+        cache.recorded = true;
         Ok(cache)
-    }
-
-    /// Like [`load`](Self::load), but upgrades an older-but-migratable cache in
-    /// place instead of rejecting it.
-    ///
-    /// A bare `load()` returns `Err` on any stale version, which `migrate`
-    /// turns into [`new_empty`](Self::new_empty) — and an empty `last` cache
-    /// reports nothing as `Removed`, leaving orphaned BUCK targets behind on a
-    /// version bump. `migrate` cannot fall back to rebuilding the prior state
-    /// from `cargo metadata` (the way add/remove/update do) because there is no
-    /// pending manifest edit: current metadata already equals the new state, so
-    /// removed packages are simply absent from it.
-    ///
-    /// The v4→v5 bump only changed how workspace path-source `PackageId`s are
-    /// keyed (verbatim absolute path → `($WORKSPACE)`), not the struct layout,
-    /// so we can preserve removal detection by re-keying the old fingerprints
-    /// with the fixed canonicalizer. Fingerprint *values* are kept as-is; any
-    /// that no longer match a freshly computed snapshot just re-emit as
-    /// `Changed`, which is safe (and on Windows actively rewrites BUCK files
-    /// that had embedded an absolute path).
-    pub fn load_migrated(workspace_root: &Utf8PathBuf) -> Result<Self, Error> {
-        let cache = Self::read_from_disk()?;
-        if cache.version == CACHE_VERSION {
-            return Ok(cache);
-        }
-        if cache.version == 4 {
-            return Ok(cache.rekeyed_v4_to_v5(workspace_root));
-        }
-        Err(anyhow!(
-            "Cache version is stale and not migratable (found {}, expected {})",
-            cache.version,
-            CACHE_VERSION
-        ))
-    }
-
-    /// Re-key a v4 cache's fingerprints to the v5 `($WORKSPACE)` form. v5 only
-    /// changed key canonicalization, so the package set is preserved verbatim —
-    /// which is what keeps `diff()` reporting `Removed` across the bump.
-    fn rekeyed_v4_to_v5(self, workspace_root: &Utf8PathBuf) -> Self {
-        Self {
-            fingerprints: self
-                .fingerprints
-                .into_iter()
-                .map(|(id, fp)| (id.canonicalize(workspace_root), fp))
-                .collect(),
-            version: CACHE_VERSION,
-        }
     }
 
     pub fn save(&self) {
@@ -244,11 +388,28 @@ impl BuckalCache {
         std::fs::write(cache_path, format!("{}\n{}", comment, content)).unwrap_or_exit();
     }
 
+    /// The fixup `rustc_flags` of the generation this cache records, if it records
+    /// one (an inventory or an empty cache does not).
+    pub fn previous_fixup_record(&self) -> Option<BTreeMap<String, Vec<String>>> {
+        (self.recorded && !self.regenerate_all).then(|| self.fixup_rustc_flags.clone())
+    }
+
+    /// The fixups of the generation this cache records, if it records them.
+    pub fn previous_fixups_record(&self) -> Option<BTreeMap<String, PackageFixup>> {
+        (self.recorded && !self.regenerate_all)
+            .then(|| self.fixups.clone())
+            .flatten()
+    }
+
     pub fn diff(&self, other: &BuckalCache, workspace_root: &Utf8PathBuf) -> BuckalChange {
-        let mut _diff = BuckalChange::default();
+        let mut _diff = BuckalChange {
+            previous_fixup_rustc_flags: other.previous_fixup_record(),
+            previous_fixups: other.previous_fixups_record(),
+            ..Default::default()
+        };
         for (id, fp) in &self.fingerprints {
             if let Some(other_fp) = other.fingerprints.get(id) {
-                if fp != other_fp {
+                if fp != other_fp || other.regenerate_all || other.rules_outdated {
                     _diff
                         .changes
                         .insert(id.resolve(workspace_root), ChangeType::Changed);
@@ -275,6 +436,29 @@ impl BuckalCache {
 #[derive(Debug, Default)]
 pub struct BuckalChange {
     pub changes: BTreeMap<PackageId, ChangeType>,
+    /// The fixup `rustc_flags` the previous generation added, by package name, when
+    /// a cache records them (`None`: unknown, so `--merge` cannot tell them from
+    /// manual edits).
+    pub previous_fixup_rustc_flags: Option<BTreeMap<String, Vec<String>>>,
+    /// The fixups the previous generation applied, by package name, when a cache
+    /// records them (`None`: unknown, so `--merge` cannot tell their set-valued
+    /// contributions from manual edits).
+    pub previous_fixups: Option<BTreeMap<String, PackageFixup>>,
+}
+
+impl BuckalChange {
+    /// Add `other`'s changes for packages this one does not change already.
+    pub fn merge(&mut self, other: BuckalChange) {
+        for (id, change) in other.changes {
+            self.changes.entry(id).or_insert(change);
+        }
+        if self.previous_fixup_rustc_flags.is_none() {
+            self.previous_fixup_rustc_flags = other.previous_fixup_rustc_flags;
+        }
+        if self.previous_fixups.is_none() {
+            self.previous_fixups = other.previous_fixups;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -286,7 +470,7 @@ pub enum ChangeType {
 
 #[cfg(test)]
 mod tests {
-    use super::{CACHE_VERSION, PackageIdExt};
+    use super::PackageIdExt;
     use cargo_metadata::{PackageId, camino::Utf8PathBuf};
 
     // `cargo metadata` reports `workspace_root` as a *native* filesystem path,
@@ -423,71 +607,5 @@ mod tests {
             repr: format!("{}_sidecar/lib/bar#0.1.0", ws_prefix()),
         };
         assert_eq!(id.canonicalize(&ws()).repr, id.repr);
-    }
-
-    #[test]
-    fn cache_version_bumped_for_workspace_pathfmt_change() {
-        // v5 is the bump for ($WORKSPACE) path-id canonicalization: pre-v5 caches
-        // store the absolute workspace path verbatim (always so on Windows), so an
-        // older cache must be rebuilt rather than diffed against the v5 form. Pinned
-        // exactly — not `>=` — so a future bump is a deliberate, visible event:
-        // when you bump CACHE_VERSION, update this assertion and add the rationale
-        // to the CACHE_VERSION doc comment.
-        assert_eq!(CACHE_VERSION, 5);
-    }
-
-    #[test]
-    fn migrating_v4_cache_preserves_removal_detection() {
-        use super::{BuckalCache, ChangeType, Fingerprint};
-        use std::collections::BTreeMap;
-
-        // A v4 snapshot as written on Windows: workspace path-source ids stored
-        // with the absolute path verbatim (the pre-v5 canonicalize no-op).
-        let foo_abs = PackageId {
-            repr: format!("{}/crates/foo#0.1.0", ws_prefix()),
-        };
-        let bar_abs = PackageId {
-            repr: format!("{}/crates/bar#0.1.0", ws_prefix()),
-        };
-        let mut v4 = BTreeMap::new();
-        v4.insert(foo_abs.clone(), Fingerprint::new([1u8; 32]));
-        v4.insert(bar_abs.clone(), Fingerprint::new([2u8; 32]));
-        let v4_cache = BuckalCache {
-            fingerprints: v4,
-            version: 4,
-        };
-
-        // The new resolve dropped `bar` from the manifest; its keys are v5-canonical.
-        let foo_canon = foo_abs.canonicalize(&ws());
-        let mut v5 = BTreeMap::new();
-        v5.insert(foo_canon.clone(), Fingerprint::new([1u8; 32]));
-        let new_cache = BuckalCache {
-            fingerprints: v5,
-            version: CACHE_VERSION,
-        };
-
-        let migrated = v4_cache.rekeyed_v4_to_v5(&ws());
-        let changes = new_cache.diff(&migrated, &ws());
-
-        // `bar` must be reported as Removed. Discarding the stale cache (the old
-        // new_empty() path) would silently keep its orphaned BUCK target — the
-        // regression Codex flagged.
-        let bar_resolved = bar_abs.canonicalize(&ws()).resolve(&ws());
-        assert!(
-            matches!(
-                changes.changes.get(&bar_resolved),
-                Some(ChangeType::Removed)
-            ),
-            "removed workspace crate must be detected as Removed after v4->v5 migration; got {:?}",
-            changes.changes
-        );
-        // `foo` is unchanged (same fingerprint, key now aligned), so the
-        // migration introduces no spurious diff entry for it.
-        let foo_resolved = foo_canon.resolve(&ws());
-        assert!(
-            !changes.changes.contains_key(&foo_resolved),
-            "unchanged crate must not appear in the diff after migration; got {:?}",
-            changes.changes
-        );
     }
 }

@@ -5,7 +5,6 @@ use cargo_metadata::MetadataCommand;
 use clap::Parser;
 
 use crate::{
-    cache::BuckalCache,
     context::BuckalContext,
     utils::{UnwrapOrExit, ensure_prerequisites, get_last_cache, section},
 };
@@ -51,8 +50,9 @@ pub fn execute(args: &UpdateArgs) {
 
     let ctx = BuckalContext::new(args.manifest_path.clone());
 
-    let new_cache =
-        BuckalCache::from_resolve(&ctx.resolve, &ctx.workspace_root, &ctx.repo_config.patch);
+    ctx.check_host_platform_differences(false);
+
+    let new_cache = ctx.new_cache();
     let changes = new_cache.diff(&last_cache, &ctx.workspace_root);
 
     changes.apply(&ctx);

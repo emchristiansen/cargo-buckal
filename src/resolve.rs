@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache::{Fingerprint, PackageIdExt};
 use crate::config::RepoPatchConfig;
+use crate::platform_features::PlatformResolution;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeKind {
@@ -47,6 +48,9 @@ pub struct BuckalTarget {
     pub doctest: bool,
     /// Whether tests are enabled for this target.
     pub test: bool,
+    /// Features the target needs (Cargo's `required-features`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_features: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +59,13 @@ pub struct BuckalNode {
     pub name: String,
     pub version: String,
     pub features: Vec<String>,
+    /// Features and dependencies Cargo resolves for this package on each configured
+    /// platform (Reindeer platform name), when `feature_platforms` is set in
+    /// buckal.toml. Empty otherwise, in which case `features` (the union over every
+    /// platform that `cargo metadata` reports) and every resolved dependency are used
+    /// everywhere.
+    #[serde(default, skip_serializing_if = "PlatformResolution::is_empty")]
+    pub platform_features: PlatformResolution,
     pub kind: NodeKind,
     pub edition: Edition,
     // -- Fields from Package --
@@ -85,7 +96,16 @@ pub fn is_lib_like(kind: &TargetKind) -> bool {
 pub struct BuckalResolve {
     pub dag: Dag<BuckalNode, BuckalDep, u32>,
     pub index_map: HashMap<PackageId, NodeIndex<u32>>,
+    /// Dev-dependency edges that would close a cycle among packages, by dependent
+    /// (with `skip_dev_dependency_cycles`). Only tests use dev-dependencies, and a
+    /// test is a rule of its own, apart from the package's library: its edge to the
+    /// dependency closes no cycle among Buck rules. They are kept outside the
+    /// acyclic package graph and still reach the dependent's tests.
+    pub test_only_edges: TestOnlyEdges,
 }
+
+/// See [`BuckalResolve::test_only_edges`].
+pub type TestOnlyEdges = HashMap<NodeIndex<u32>, Vec<(NodeIndex<u32>, BuckalDep)>>;
 
 impl BuckalResolve {
     /// O(1) lookup of a node by its `PackageId`.
@@ -100,7 +120,7 @@ impl BuckalResolve {
     /// first normal/build deps, then dev deps. Returns an error if any edge would form
     /// a cycle — Buck2 requires a strictly acyclic dependency graph.
     ///
-    /// When `lenient` is `true`, dev-dependency cycles are silently skipped instead of
+    /// When `lenient` is `true`, dev-dependency cycles are skipped (with a warning) instead of
     /// causing a hard error. This is used by the cache fallback path where having all
     /// nodes (for removal detection) matters more than strict edge accuracy.
     pub fn from_metadata(
@@ -112,6 +132,7 @@ impl BuckalResolve {
     ) -> anyhow::Result<Self> {
         let mut dag = Dag::<BuckalNode, BuckalDep, u32>::new();
         let mut index_map = HashMap::new();
+        let mut test_only_edges = TestOnlyEdges::new();
 
         // Create nodes
         for (pkg_id, node) in nodes_map {
@@ -143,6 +164,7 @@ impl BuckalResolve {
                     src_path: t.src_path.clone(),
                     doctest: t.doctest,
                     test: t.test,
+                    required_features: t.required_features.clone(),
                 })
                 .collect();
 
@@ -153,6 +175,7 @@ impl BuckalResolve {
                 name: package.name.to_string(),
                 version: package.version.to_string(),
                 features: node.features.iter().map(|f| f.to_string()).collect(),
+                platform_features: Default::default(),
                 kind,
                 edition: package.edition,
                 manifest_path: package.manifest_path.clone(),
@@ -207,8 +230,12 @@ impl BuckalResolve {
             }
         }
 
-        // Pass 2: Dev deps only
-        for (pkg_id, node) in nodes_map {
+        // Pass 2: Dev deps only. In package-id order: when a dev edge would close a
+        // cycle, which edge is skipped depends on the edges inserted before it, so a
+        // stable order keeps the generated rules stable across runs.
+        let mut dev_order: Vec<_> = nodes_map.iter().collect();
+        dev_order.sort_by(|(a, _), (b, _)| a.repr.cmp(&b.repr));
+        for (pkg_id, node) in dev_order {
             if let Some(&parent_idx) = index_map.get(pkg_id) {
                 for dep in &node.deps {
                     if let Some(&child_idx) = index_map.get(&dep.pkg) {
@@ -247,12 +274,30 @@ impl BuckalResolve {
                         // edges here, and (2) ensure downstream consumers correctly
                         // scope dev edges to test targets only.
                         // See: https://github.com/buck2hub/cargo-buckal/pull/75#discussion_r2975238783
-                        if dag.add_edge(parent_idx, child_idx, buckal_dep).is_err() {
+                        if let Err(cycle) = dag.add_edge(parent_idx, child_idx, buckal_dep) {
                             let parent_name = &dag[parent_idx].name;
                             let child_name = &dag[child_idx].name;
                             if lenient {
-                                // In lenient mode (cache fallback), skip the cyclic
-                                // dev edge so we still have all nodes for diffing.
+                                // A package's dev-dependency on itself needs no edge in
+                                // the package graph: with per-platform resolution, the
+                                // tests' resolution records it (Cargo's unit graph links
+                                // the library into the unit tests) and the unit tests
+                                // depend on the library as the tests build it. Any other
+                                // cycle-closing dev edge is kept for the dependent's
+                                // tests only: the tests are rules apart from the
+                                // library, so no Buck rule depends on itself through it.
+                                if parent_idx == child_idx {
+                                    crate::buckal_note!(
+                                        "Dev-dependency of `{}` on itself needs no package edge; with `feature_platforms`, its unit tests link `{}` as the tests build it.",
+                                        parent_name,
+                                        parent_name
+                                    );
+                                } else {
+                                    test_only_edges
+                                        .entry(parent_idx)
+                                        .or_default()
+                                        .push((child_idx, cycle.0));
+                                }
                                 continue;
                             }
                             bail!(
@@ -275,7 +320,11 @@ impl BuckalResolve {
             }
         }
 
-        Ok(Self { dag, index_map })
+        Ok(Self {
+            dag,
+            index_map,
+            test_only_edges,
+        })
     }
 
     pub fn dependents(&self, pkg_id: &PackageId) -> Vec<&BuckalNode> {
@@ -336,6 +385,13 @@ impl BuckalResolve {
             .children(idx)
             .iter(&self.dag)
             .map(|(edge_idx, node_idx)| (&self.dag[edge_idx], &self.dag[node_idx]))
+            .chain(
+                self.test_only_edges
+                    .get(&idx)
+                    .into_iter()
+                    .flatten()
+                    .map(|(child, dep)| (dep, &self.dag[*child])),
+            )
             .collect()
     }
 
@@ -372,6 +428,19 @@ impl BuckalResolve {
         sorted_features.sort();
         for f in &sorted_features {
             hasher.update(f.as_bytes());
+        }
+        // Per-platform, per-context resolution: features, edges, host context and host
+        // variants (BTree order is deterministic). Hashed only when present, so
+        // fingerprints of repositories that do not configure it are unchanged.
+        // Dependencies are named by `PackageId::repr`, which holds the absolute path of
+        // a path dependency: canonicalised like the edges below, so that the
+        // fingerprint does not depend on where the workspace is checked out (N12).
+        if !node.platform_features.is_empty() {
+            hasher.update(b"platform_resolution");
+            let mut resolution = serde_json::to_value(&node.platform_features)
+                .expect("a platform resolution serializes to JSON");
+            canonicalize_package_ids(&mut resolution, workspace_root);
+            hasher.update(&serde_json::to_vec(&resolution).expect("a JSON value serializes"));
         }
 
         // 4. NodeKind (FirstParty already stores relative_path)
@@ -456,6 +525,28 @@ impl BuckalResolve {
             hasher.update(&dep_encoded);
             hasher.update(child_canonical_id.repr.as_bytes());
         }
+        // Dev edges kept for the tests only.
+        let mut test_only: Vec<_> = self
+            .test_only_edges
+            .get(&idx)
+            .into_iter()
+            .flatten()
+            .map(|(child, dep)| {
+                (
+                    self.dag[*child].package_id.canonicalize(workspace_root),
+                    dep,
+                )
+            })
+            .collect();
+        test_only.sort_by(|(a, _), (b, _)| a.repr.cmp(&b.repr));
+        for (child_canonical_id, dep) in &test_only {
+            hasher.update(b"test-only");
+            let dep_encoded =
+                bincode_next::serde::encode_to_vec(*dep, bincode_next::config::standard())
+                    .expect("Serialization failed");
+            hasher.update(&dep_encoded);
+            hasher.update(child_canonical_id.repr.as_bytes());
+        }
 
         // 9. Version patch config — if a patch references this node's crate name
         //    AND this node's version matches the patch's "from" or "to", include
@@ -488,6 +579,34 @@ impl BuckalResolve {
         }
 
         Fingerprint::new(hasher.finalize().into())
+    }
+}
+
+/// Replace the workspace root in every package id of `value` (strings and object
+/// keys) by `($WORKSPACE)`, as [`PackageIdExt::canonicalize`] does.
+fn canonicalize_package_ids(value: &mut serde_json::Value, workspace_root: &Utf8PathBuf) {
+    let canonical = |text: &str| {
+        PackageId {
+            repr: text.to_owned(),
+        }
+        .canonicalize(workspace_root)
+        .repr
+    };
+    match value {
+        serde_json::Value::String(text) => *text = canonical(text),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                canonicalize_package_ids(item, workspace_root);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let entries = std::mem::take(map);
+            for (key, mut item) in entries {
+                canonicalize_package_ids(&mut item, workspace_root);
+                map.insert(canonical(&key), item);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -549,6 +668,7 @@ mod tests {
             name: name.to_string(),
             version: version.to_string(),
             features: vec![],
+            platform_features: Default::default(),
             kind: NodeKind::ThirdParty,
             edition: Edition::E2021,
             manifest_path: fixture_path(name).join("Cargo.toml"),
@@ -589,7 +709,11 @@ mod tests {
         dag.add_edge(idx_a, idx_b, make_dep("b")).unwrap();
         dag.add_edge(idx_b, idx_c, make_dep("c")).unwrap();
 
-        let resolve = BuckalResolve { dag, index_map };
+        let resolve = BuckalResolve {
+            dag,
+            index_map,
+            test_only_edges: Default::default(),
+        };
 
         // B's dependents should be [A]
         let b_dependents = resolve.dependents(&make_pkg_id("b"));
@@ -638,7 +762,11 @@ mod tests {
         index_map.insert(node_a.package_id.clone(), idx_a);
         index_map.insert(node_b.package_id.clone(), idx_b);
 
-        let resolve = BuckalResolve { dag, index_map };
+        let resolve = BuckalResolve {
+            dag,
+            index_map,
+            test_only_edges: Default::default(),
+        };
 
         assert!(resolve.find_by_name("serde", None).is_some());
         assert!(resolve.find_by_name("serde", Some("1.0.0")).is_some());
@@ -658,6 +786,7 @@ mod tests {
         let idx1 = dag.add_node(node1.clone());
         index_map.insert(node1.package_id.clone(), idx1);
         let resolve1 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag,
             index_map: index_map.clone(),
         };
@@ -667,6 +796,7 @@ mod tests {
         let idx2 = dag2.add_node(node2.clone());
         index_map2.insert(node2.package_id.clone(), idx2);
         let resolve2 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag: dag2,
             index_map: index_map2,
         };
@@ -676,6 +806,7 @@ mod tests {
         let idx3 = dag3.add_node(node3.clone());
         index_map3.insert(node3.package_id.clone(), idx3);
         let resolve3 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag: dag3,
             index_map: index_map3,
         };
@@ -767,7 +898,11 @@ mod tests {
         dag.add_edge(idx_a, idx_cv1, make_dep("common")).unwrap();
         dag.add_edge(idx_b, idx_cv2, make_dep("common")).unwrap();
 
-        let resolve = BuckalResolve { dag, index_map };
+        let resolve = BuckalResolve {
+            dag,
+            index_map,
+            test_only_edges: Default::default(),
+        };
 
         // Total: root + dep_a + dep_b + common@1.0 + common@2.0 = 5 nodes
         assert_eq!(resolve.nodes().count(), 5);
@@ -861,7 +996,11 @@ mod tests {
         dag.add_edge(idx_a, idx_b, make_dep("b")).unwrap();
         dag.add_edge(idx_b, idx_c, make_dep("c")).unwrap();
 
-        let resolve = BuckalResolve { dag, index_map };
+        let resolve = BuckalResolve {
+            dag,
+            index_map,
+            test_only_edges: Default::default(),
+        };
 
         // A → B: one pair with dep name "b" pointing to node "b"
         let a_deps = resolve.deps_of(&make_pkg_id("a"));
@@ -914,7 +1053,11 @@ mod tests {
         )
         .unwrap();
 
-        let resolve = BuckalResolve { dag, index_map };
+        let resolve = BuckalResolve {
+            dag,
+            index_map,
+            test_only_edges: Default::default(),
+        };
 
         let a_deps = resolve.deps_of(&make_pkg_id("a"));
         assert_eq!(a_deps.len(), 2);
@@ -945,6 +1088,7 @@ mod tests {
         let idx_a1 = dag1.add_node(node_a1.clone());
         index_map1.insert(node_a1.package_id.clone(), idx_a1);
         let resolve1 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag: dag1,
             index_map: index_map1,
         };
@@ -960,6 +1104,7 @@ mod tests {
         index_map2.insert(node_b2.package_id.clone(), idx_b2);
         dag2.add_edge(idx_a2, idx_b2, make_dep("b")).unwrap();
         let resolve2 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag: dag2,
             index_map: index_map2,
         };
@@ -976,6 +1121,7 @@ mod tests {
         dag3.add_edge(idx_a3, idx_b3, make_dep("b-renamed"))
             .unwrap();
         let resolve3 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag: dag3,
             index_map: index_map3,
         };
@@ -1023,7 +1169,11 @@ mod tests {
         index_map.insert(child.package_id.clone(), idx_child);
         dag.add_edge(idx_parent, idx_child, make_dep("child"))
             .unwrap();
-        let resolve = BuckalResolve { dag, index_map };
+        let resolve = BuckalResolve {
+            dag,
+            index_map,
+            test_only_edges: Default::default(),
+        };
 
         let fp_no_patch = resolve.fingerprint_of(
             &parent.package_id,
@@ -1085,7 +1235,11 @@ mod tests {
             });
         }
 
-        let resolve = BuckalResolve { dag, index_map };
+        let resolve = BuckalResolve {
+            dag,
+            index_map,
+            test_only_edges: Default::default(),
+        };
 
         // dependencies() should return b exactly once (not duplicated)
         let a_deps = resolve.dependencies(&make_pkg_id("a"));
@@ -1183,7 +1337,11 @@ mod tests {
             .unwrap();
         }
 
-        let resolve = BuckalResolve { dag, index_map };
+        let resolve = BuckalResolve {
+            dag,
+            index_map,
+            test_only_edges: Default::default(),
+        };
 
         // deps_of should return TWO edges: "foo" (Normal) and "bar" (Dev)
         let a_deps = resolve.deps_of(&make_pkg_id("a"));
@@ -1237,6 +1395,7 @@ mod tests {
                 name: "foo".to_string(),
                 version: "1.0.0".to_string(),
                 features: vec![],
+                platform_features: Default::default(),
                 kind: NodeKind::FirstParty {
                     relative_path: String::new(),
                 },
@@ -1247,6 +1406,7 @@ mod tests {
                     kind: vec![TargetKind::Lib],
                     src_path: root.join("src").join("lib.rs"),
                     doctest: true,
+                    required_features: Vec::new(),
                     test: true,
                 }],
                 source: None,
@@ -1257,7 +1417,14 @@ mod tests {
             let mut index_map = HashMap::new();
             let idx = dag.add_node(node);
             index_map.insert(pkg_id.clone(), idx);
-            (BuckalResolve { dag, index_map }, pkg_id)
+            (
+                BuckalResolve {
+                    dag,
+                    index_map,
+                    test_only_edges: Default::default(),
+                },
+                pkg_id,
+            )
         }
 
         let (alice_root, alice_prefix) = checkout("alice/project");
@@ -1317,6 +1484,7 @@ mod tests {
         dag1.add_edge(idx_p1, idx_a1, make_dep("alpha")).unwrap();
         dag1.add_edge(idx_p1, idx_b1, make_dep("beta")).unwrap();
         let resolve1 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag: dag1,
             index_map: map1,
         };
@@ -1337,6 +1505,7 @@ mod tests {
         dag2.add_edge(idx_p2, idx_b2, make_dep("beta")).unwrap();
         dag2.add_edge(idx_p2, idx_a2, make_dep("alpha")).unwrap();
         let resolve2 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag: dag2,
             index_map: map2,
         };
@@ -1364,6 +1533,7 @@ mod tests {
                 name: "serde".to_string(),
                 version: "1.0.200".to_string(),
                 features: vec!["derive".to_string(), "std".to_string()],
+                platform_features: Default::default(),
                 kind: NodeKind::ThirdParty,
                 edition: Edition::E2021,
                 manifest_path: Utf8PathBuf::from(format!(
@@ -1379,6 +1549,7 @@ mod tests {
                     )),
                     doctest: true,
                     test: true,
+                    required_features: Vec::new(),
                 }],
                 source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
                 links: None,
@@ -1395,6 +1566,7 @@ mod tests {
         let idx1 = dag1.add_node(node1.clone());
         map1.insert(node1.package_id.clone(), idx1);
         let resolve1 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag: dag1,
             index_map: map1,
         };
@@ -1404,6 +1576,7 @@ mod tests {
         let idx2 = dag2.add_node(node2.clone());
         map2.insert(node2.package_id.clone(), idx2);
         let resolve2 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag: dag2,
             index_map: map2,
         };

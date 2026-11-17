@@ -7,7 +7,11 @@ use starlark_syntax::syntax::ast::{ArgumentP, AstExpr, AstNoPayload, AstStmt, Ex
 use starlark_syntax::syntax::{AstModule, Dialect};
 
 use crate::buckal_error;
+use crate::platform_features::PlatformAttrs;
 
+// A package has a handful of rules, held in small vectors and maps; boxing the
+// larger variants would only add indirection at every match.
+#[allow(clippy::large_enum_variant)]
 #[derive(Serialize, Debug, PartialEq, Clone)]
 #[serde(untagged)]
 pub enum Rule {
@@ -21,13 +25,43 @@ pub enum Rule {
     RustBinary(RustBinary),
     RustTest(RustTest),
     BuildscriptRun(BuildscriptRun),
+    ConfiguredAlias(ConfiguredAlias),
+}
+
+/// Buck2's native `configured_alias`: `actual` configured for `platform`.
+#[derive(Serialize, Debug, PartialEq, Clone)]
+#[serde(rename = "configured_alias")]
+pub struct ConfiguredAlias {
+    pub name: String,
+    pub actual: String,
+    pub platform: String,
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub visibility: Set<String>,
 }
 
 impl Rule {
+    /// The rule's `name`, or `None` for a `load`.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Rule::Load(_) => None,
+            Rule::HttpArchive(r) => Some(&r.name),
+            Rule::FileGroup(r) => Some(&r.name),
+            Rule::GitFetch(r) => Some(&r.name),
+            Rule::CargoManifest(r) => Some(&r.name),
+            Rule::ExportFile(r) => Some(&r.name),
+            Rule::RustLibrary(r) => Some(&r.name),
+            Rule::RustBinary(r) => Some(&r.name),
+            Rule::RustTest(r) => Some(&r.name),
+            Rule::BuildscriptRun(r) => Some(&r.name),
+            Rule::ConfiguredAlias(r) => Some(&r.name),
+        }
+    }
+
     pub fn as_rust_rule_mut(&mut self) -> Option<&mut dyn RustRule> {
         match self {
             Rule::RustLibrary(inner) => Some(inner),
             Rule::RustBinary(inner) => Some(inner),
+            Rule::RustTest(inner) => Some(inner),
             _ => None,
         }
     }
@@ -36,10 +70,11 @@ impl Rule {
 pub trait RustRule {
     fn deps_mut(&mut self) -> &mut Set<String>;
     fn os_deps_mut(&mut self) -> &mut Map<String, Set<String>>;
-    fn rustc_flags_mut(&mut self) -> &mut Set<String>;
+    fn rustc_flags_mut(&mut self) -> &mut Vec<String>;
     fn env_mut(&mut self) -> &mut Map<String, String>;
     fn named_deps_mut(&mut self) -> &mut Map<String, String>;
     fn os_named_deps_mut(&mut self) -> &mut Map<String, Map<String, String>>;
+    fn platform_mut(&mut self) -> &mut PlatformAttrs;
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -75,6 +110,10 @@ pub struct GitFetch {
     pub name: String,
     pub repo: String,
     pub rev: String,
+    /// Paths inside the fetched work tree exposed as `:name[path]` sub-targets
+    /// (the prelude `git_fetch` attribute of the same name).
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub sub_targets: Set<String>,
 }
 
 #[derive(Serialize, Default, Debug, PartialEq, Clone)]
@@ -93,14 +132,24 @@ pub struct ExportFile {
     pub src: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// [`EXPORT_FILES_LABEL`] on the rules an `export_files` fixup writes, so that
+    /// generation recognises them without a record of the earlier fixups.
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub labels: Set<String>,
     pub visibility: Set<String>,
 }
+
+/// The label of an `export_file` rule written for an `export_files` fixup entry.
+pub const EXPORT_FILES_LABEL: &str = "buckal-export-files";
 
 #[derive(Serialize, Default, Debug, PartialEq, Clone)]
 #[serde(rename = "rust_library")]
 pub struct RustLibrary {
     pub name: String,
-    pub srcs: Set<String>,
+    pub srcs: Srcs,
+    /// Extra sources: label -> path inside the crate's sources.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub mapped_srcs: Map<String, String>,
     #[serde(rename = "crate")]
     pub crate_name: String,
     pub crate_root: String,
@@ -115,8 +164,14 @@ pub struct RustLibrary {
     pub env: Map<String, String>,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub features: Set<String>,
-    #[serde(skip_serializing_if = "Set::is_empty")]
-    pub rustc_flags: Set<String>,
+    /// Per-platform attributes for the prelude's `platform` argument
+    /// (`{platform name: {attribute: values}}`), e.g. features one platform adds.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub platform: PlatformAttrs,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Ordered rustc arguments: repeated and multi-argument options (`-C`, `opt-level=2`)
+    /// are meaningful, so this is a list, not a set.
+    pub rustc_flags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proc_macro: Option<bool>,
     #[serde(skip_serializing_if = "Map::is_empty")]
@@ -134,7 +189,10 @@ pub struct RustLibrary {
 #[serde(rename = "rust_binary")]
 pub struct RustBinary {
     pub name: String,
-    pub srcs: Set<String>,
+    pub srcs: Srcs,
+    /// Extra sources: label -> path inside the crate's sources.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub mapped_srcs: Map<String, String>,
     #[serde(rename = "crate")]
     pub crate_name: String,
     pub crate_root: String,
@@ -149,8 +207,14 @@ pub struct RustBinary {
     pub env: Map<String, String>,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub features: Set<String>,
-    #[serde(skip_serializing_if = "Set::is_empty")]
-    pub rustc_flags: Set<String>,
+    /// Per-platform attributes for the prelude's `platform` argument
+    /// (`{platform name: {attribute: values}}`), e.g. features one platform adds.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub platform: PlatformAttrs,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Ordered rustc arguments: repeated and multi-argument options (`-C`, `opt-level=2`)
+    /// are meaningful, so this is a list, not a set.
+    pub rustc_flags: Vec<String>,
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub named_deps: Map<String, String>,
     #[serde(skip_serializing_if = "Map::is_empty")]
@@ -166,23 +230,66 @@ pub struct RustBinary {
 #[serde(rename = "rust_test")]
 pub struct RustTest {
     pub name: String,
-    pub srcs: Set<String>,
+    pub srcs: Srcs,
+    /// Extra sources: label -> path inside the crate's sources.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub mapped_srcs: Map<String, String>,
     #[serde(rename = "crate")]
     pub crate_name: String,
     pub crate_root: String,
     pub edition: String,
-    #[serde(skip_serializing_if = "Set::is_empty")]
-    pub target_compatible_with: Set<String>,
+    #[serde(skip_serializing_if = "TestCompatibility::is_empty")]
+    pub target_compatible_with: TestCompatibility,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub compatible_with: Set<String>,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub exec_compatible_with: Set<String>,
+    /// Test labels (`[fixups.<pkg>] test_labels` and per-test `labels`).
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub labels: Set<String>,
+    /// Arguments after the test binary, which a test runner passes on (`[fixups.<pkg>]
+    /// test_args` and per-test `args`), in order, then those lifted by constraints.
+    #[serde(skip_serializing_if = "TestArgs::is_empty")]
+    pub args: TestArgs,
+    /// Whether Buck may reuse a cached result of the test's execution
+    /// (`[fixups.<pkg>] test_supports_execution_caching`, per-test
+    /// `supports_test_execution_caching`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_test_execution_caching: Option<bool>,
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub env: Map<String, String>,
+    /// Environment for running the test only (not for compiling it).
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub run_env: Map<String, String>,
+    /// How the test executes (`[fixups.<pkg>] test_remote_execution`): a remote test
+    /// execution profile name, or `"disabled"`. Absent: the toolchain's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_execution: Option<String>,
+    /// A dependency providing `RuntimeToolsInfo` (`[fixups.<pkg>] test_runtime_tools`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_tools: Option<String>,
+    /// Files the test reads at run time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resources: Option<Glob>,
+    /// The package's binaries by Cargo binary name, for `CARGO_BIN_EXE_<name>`.
+    /// The prelude derives the compile-time and the absolute run-time values from it;
+    /// the binaries are dependencies of the test through it.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub cargo_bin_exes: Map<String, String>,
+    /// Run-time inputs from outside the package (`[fixups.<pkg>] test_resources`), for
+    /// the prelude to add to `resources` at their project paths.
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub extra_resources: Set<String>,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub features: Set<String>,
-    #[serde(skip_serializing_if = "Set::is_empty")]
-    pub rustc_flags: Set<String>,
+    /// Per-platform attributes for the prelude's `platform` argument
+    /// (`{platform name: {attribute: values}}`), e.g. features one platform adds.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub platform: PlatformAttrs,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Ordered rustc arguments: repeated and multi-argument options (`-C`, `opt-level=2`)
+    /// are meaningful, so this is a list, not a set.
+    pub rustc_flags: Vec<String>,
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub named_deps: Map<String, String>,
     #[serde(skip_serializing_if = "Map::is_empty")]
@@ -206,16 +313,265 @@ pub struct BuildscriptRun {
     pub env_srcs: Set<String>,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub features: Set<String>,
+    /// Per-platform attributes for the prelude's `platform` argument
+    /// (`{platform name: {attribute: values}}`), e.g. features one platform adds.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub platform: PlatformAttrs,
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub target_compatible_with: Set<String>,
+    /// `target_compatible_with` of the per-platform aliases of the build script
+    /// binary that the run makes.
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub buildscript_compatible_with: Set<String>,
     pub version: String,
     pub manifest_dir: String,
+    /// The package's directory relative to the workspace root, where the run
+    /// places the package when it has `workspace_inputs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_path: Option<String>,
+    /// Files outside the package that the build script reads, as
+    /// `{workspace-relative path: source label}`, placed at those paths around the
+    /// package (`[fixups.<pkg>.buildscript.run] inputs`).
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub workspace_inputs: Map<String, String>,
+    /// Pass the build script's `cargo:rustc-link-lib` (`rustc_link_search`:
+    /// `cargo:rustc-link-search`) output on to the crate's linking.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub rustc_link_lib: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub rustc_link_search: bool,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub visibility: Set<String>,
+}
+
+/// The `target_compatible_with` of a `rust_test`: every constraint of `all`, and
+/// one of each group of `any_of` (`[fixups] test_compatible_with` and per-test
+/// `compatible_with`). A group is rendered as nested `select()`s, which are
+/// unambiguous when several of its constraints are present:
+/// `select({A: [], "DEFAULT": select({B: [], "DEFAULT": ["prelude//:none"]})})`.
+#[derive(Default, Debug, PartialEq, Eq, Clone)]
+pub struct TestCompatibility {
+    pub all: Set<String>,
+    pub any_of: Vec<Vec<String>>,
+}
+
+impl TestCompatibility {
+    pub fn is_empty(&self) -> bool {
+        self.all.is_empty() && self.any_of.is_empty()
+    }
+}
+
+impl From<Set<String>> for TestCompatibility {
+    fn from(all: Set<String>) -> Self {
+        Self {
+            all,
+            any_of: Vec::new(),
+        }
+    }
+}
+
+impl std::ops::Deref for TestCompatibility {
+    type Target = Set<String>;
+    fn deref(&self) -> &Set<String> {
+        &self.all
+    }
+}
+
+impl std::ops::DerefMut for TestCompatibility {
+    fn deref_mut(&mut self) -> &mut Set<String> {
+        &mut self.all
+    }
+}
+
+impl Serialize for TestCompatibility {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let groups: Vec<SelectValue> = self
+            .any_of
+            .iter()
+            .map(|group| {
+                SelectValue::unless_any(group, vec![], vec![INCOMPATIBLE_CONSTRAINT.to_owned()])
+            })
+            .collect();
+        concatenation(serializer, &self.all, &groups)
+    }
+}
+
+/// The constraint no platform satisfies.
+pub const INCOMPATIBLE_CONSTRAINT: &str = "prelude//:none";
+
+/// The `args` of a `rust_test`: `plain`, in order, then each group of `lifted`
+/// arguments, which apply unless one of its `lifted_by` constraints is present.
+#[derive(Default, Debug, PartialEq, Eq, Clone)]
+pub struct TestArgs {
+    pub plain: Vec<String>,
+    pub lifted: Vec<crate::config::LiftedArgs>,
+}
+
+impl TestArgs {
+    pub fn is_empty(&self) -> bool {
+        self.plain.is_empty() && self.lifted.is_empty()
+    }
+}
+
+impl From<Vec<String>> for TestArgs {
+    fn from(plain: Vec<String>) -> Self {
+        Self {
+            plain,
+            lifted: Vec::new(),
+        }
+    }
+}
+
+impl std::ops::Deref for TestArgs {
+    type Target = Vec<String>;
+    fn deref(&self) -> &Vec<String> {
+        &self.plain
+    }
+}
+
+impl std::ops::DerefMut for TestArgs {
+    fn deref_mut(&mut self) -> &mut Vec<String> {
+        &mut self.plain
+    }
+}
+
+impl Serialize for TestArgs {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let groups: Vec<SelectValue> = self
+            .lifted
+            .iter()
+            .map(|lifted| SelectValue::unless_any(&lifted.lifted_by, vec![], lifted.args.clone()))
+            .collect();
+        concatenation(serializer, &self.plain, &groups)
+    }
+}
+
+/// `list + select(...) + ...`: `list` alone without selects, the selects alone
+/// with an empty list.
+fn concatenation<S: Serializer, L: Serialize + ?Sized>(
+    serializer: S,
+    list: &L,
+    selects: &[SelectValue],
+) -> Result<S::Ok, S::Error>
+where
+    for<'a> &'a L: IntoIterator,
+{
+    let list_empty = list.into_iter().next().is_none();
+    if selects.is_empty() {
+        return list.serialize(serializer);
+    }
+    let len = selects.len() + usize::from(!list_empty);
+    if len == 1 {
+        return selects[0].serialize(serializer);
+    }
+    let mut plus = serializer.serialize_tuple_struct("+", len)?;
+    if !list_empty {
+        plus.serialize_field(list)?;
+    }
+    for select in selects {
+        plus.serialize_field(select)?;
+    }
+    plus.end()
+}
+
+/// A value that is a string list or a `select()` on one key with a fallback.
+#[derive(Debug, PartialEq, Clone)]
+enum SelectValue {
+    List(Vec<String>),
+    Select {
+        key: String,
+        matched: Vec<String>,
+        otherwise: Box<SelectValue>,
+    },
+}
+
+impl SelectValue {
+    /// `matched` when any of `keys` is present, else `otherwise`, as nested selects
+    /// (one key each, in order).
+    fn unless_any(keys: &[String], matched: Vec<String>, otherwise: Vec<String>) -> Self {
+        keys.iter()
+            .rev()
+            .fold(SelectValue::List(otherwise), |rest, key| {
+                SelectValue::Select {
+                    key: key.clone(),
+                    matched: matched.clone(),
+                    otherwise: Box::new(rest),
+                }
+            })
+    }
+}
+
+impl Serialize for SelectValue {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            SelectValue::List(list) => list.serialize(serializer),
+            SelectValue::Select {
+                key,
+                matched,
+                otherwise,
+            } => {
+                struct Arms<'a>(&'a str, &'a Vec<String>, &'a SelectValue);
+                impl Serialize for Arms<'_> {
+                    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                        use serde::ser::SerializeMap;
+                        let mut map = serializer.serialize_map(Some(2))?;
+                        map.serialize_entry(self.0, self.1)?;
+                        map.serialize_entry("DEFAULT", self.2)?;
+                        map.end()
+                    }
+                }
+                serde_starlark::FunctionCall::new("select", (Arms(key, matched, otherwise),))
+                    .serialize(serializer)
+            }
+        }
+    }
 }
 
 #[derive(Default, Debug, PartialEq, Clone)]
 pub struct Glob {
     pub include: Set<String>,
     pub exclude: Set<String>,
+}
+
+/// The `srcs` of a Rust rule: target labels (e.g. `[":vendor"]`) or a `glob()` of the
+/// package's own files.
+#[derive(Debug, PartialEq, Clone)]
+pub enum Srcs {
+    Labels(Set<String>),
+    Glob(Glob),
+}
+
+impl Default for Srcs {
+    fn default() -> Self {
+        Srcs::Labels(Set::new())
+    }
+}
+
+impl From<Set<String>> for Srcs {
+    fn from(labels: Set<String>) -> Self {
+        Srcs::Labels(labels)
+    }
+}
+
+impl Serialize for Srcs {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Srcs::Labels(labels) => labels.serialize(serializer),
+            Srcs::Glob(glob) => glob.serialize(serializer),
+        }
+    }
+}
+
+/// A `filegroup` whose sources are named: output path to file or label.
+#[derive(Serialize, Default, Debug, PartialEq, Clone)]
+#[serde(rename = "filegroup")]
+pub struct NamedFileGroup {
+    pub name: String,
+    pub srcs: Map<String, String>,
+    pub visibility: Set<String>,
 }
 
 #[derive(Serialize, Default, Debug, PartialEq, Clone)]
@@ -294,6 +650,35 @@ impl Glob {
 }
 
 // Helper to extract string list from AST expression
+fn extract_ordered_string_list(expr: &AstExpr) -> Option<Vec<String>> {
+    if let ExprP::Op(left, _op, right) = &expr.node {
+        return match (
+            extract_ordered_string_list(left),
+            extract_ordered_string_list(right),
+        ) {
+            (Some(mut l), Some(r)) => {
+                l.extend(r);
+                Some(l)
+            }
+            (l, r) => l.or(r),
+        };
+    }
+    if let ExprP::List(items) = &expr.node {
+        return Some(
+            items
+                .iter()
+                .filter_map(|item| match &item.node {
+                    ExprP::Literal(starlark_syntax::syntax::ast::AstLiteral::String(s)) => {
+                        Some(s.node.to_string())
+                    }
+                    _ => None,
+                })
+                .collect(),
+        );
+    }
+    None
+}
+
 fn extract_string_list(expr: &AstExpr) -> Option<Set<String>> {
     // Handle binary operations like: `["item1"] + select({...})` or `select({...}) + ["item2"]`
     // We only extract the literal list part, ignoring dynamic select() regardless of order
@@ -437,6 +822,14 @@ impl RuleKwargs {
         self.args.get(key).and_then(extract_bool)
     }
 
+    /// A string list in its written order, with repeats (literal parts only).
+    fn get_ordered_list(&self, key: &str) -> Vec<String> {
+        self.args
+            .get(key)
+            .and_then(extract_ordered_string_list)
+            .unwrap_or_default()
+    }
+
     fn get_list(&self, key: &str) -> Set<String> {
         self.args
             .get(key)
@@ -465,6 +858,19 @@ impl RuleKwargs {
             .unwrap_or_default()
     }
 
+    fn get_srcs(&self, key: &str) -> Srcs {
+        match self.args.get(key).map(Glob::from_ast_expr) {
+            Some(Ok(glob)) => Srcs::Glob(glob),
+            _ => Srcs::Labels(self.get_list(key)),
+        }
+    }
+
+    fn get_glob_opt(&self, key: &str) -> Option<Glob> {
+        self.args
+            .get(key)
+            .and_then(|expr| Glob::from_ast_expr(expr).ok())
+    }
+
     fn get_glob(&self, key: &str) -> anyhow::Result<Glob> {
         self.args
             .get(key)
@@ -487,7 +893,7 @@ macro_rules! impl_rust_rule {
                 &mut self.os_deps
             }
 
-            fn rustc_flags_mut(&mut self) -> &mut Set<String> {
+            fn rustc_flags_mut(&mut self) -> &mut Vec<String> {
                 &mut self.rustc_flags
             }
 
@@ -501,6 +907,10 @@ macro_rules! impl_rust_rule {
 
             fn os_named_deps_mut(&mut self) -> &mut Map<String, Map<String, String>> {
                 &mut self.os_named_deps
+            }
+
+            fn platform_mut(&mut self) -> &mut PlatformAttrs {
+                &mut self.platform
             }
         }
     };
@@ -517,6 +927,89 @@ where
 {
     for (k, v) in src {
         dst.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+}
+
+/// Split an ordered argument list into argument groups: an option (a token starting
+/// with `-`, or an `@file` argument) together with the value tokens that follow it.
+/// `["-C", "opt-level=2", "-Lnative=x"]` is `[["-C", "opt-level=2"], ["-Lnative=x"]]`.
+/// Leading value tokens with no option form a group of their own.
+pub fn argument_groups(args: &[String]) -> Vec<Vec<String>> {
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    for arg in args {
+        let starts_option = arg.starts_with('-') || arg.starts_with('@');
+        match groups.last_mut() {
+            Some(group) if !starts_option => group.push(arg.clone()),
+            _ => groups.push(vec![arg.clone()]),
+        }
+    }
+    groups
+}
+
+/// The fixup `rustc_flags` generation appends to a package's rules, now and in the
+/// generation that wrote the existing BUCK file, so that `--merge` can tell what that
+/// generation emitted from manual edits.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FixupFlags<'a> {
+    /// The fixup flags this generation appends (the end of each generated rule's
+    /// `rustc_flags`).
+    pub current: &'a [String],
+    /// The fixup flags the previous generation appended, as its cache recorded
+    /// them; `None` when there is no such record (no compatible cache).
+    pub previous: Option<&'a [String]>,
+}
+
+/// What a fixup adds to one rule's set-valued attributes that `--merge` keeps.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FixupSets {
+    pub deps: Set<String>,
+    pub target_compatible_with: Set<String>,
+    pub env: Map<String, String>,
+}
+
+impl FixupSets {
+    /// Remove these contributions from an existing rule's values: what the previous
+    /// generation's fixup added is not a manual edit. (A manual value equal to one
+    /// the fixup added cannot be told from it.)
+    fn strip(
+        &self,
+        deps: &mut Set<String>,
+        target_compatible_with: &mut Set<String>,
+        env: &mut Map<String, String>,
+    ) {
+        deps.retain(|dep| !self.deps.contains(dep));
+        target_compatible_with.retain(|label| !self.target_compatible_with.contains(label));
+        env.retain(|key, value| self.env.get(key) != Some(value));
+    }
+}
+
+/// Merge the ordered argument list of an existing rule (`src`) into a generated one
+/// (`dst`), keeping only the existing rule's manual additions, in their order. The
+/// comparison is by whole argument group (`-C` with its value), never by single
+/// token, so a manual `-C debuginfo=1` survives next to a generated
+/// `-C opt-level=2`.
+///
+/// The existing rule's generated groups are accounted for once each (a multiset),
+/// and every other group is manual. With a record of the previous generation's
+/// fixup flags, the generated groups are those that generation emitted: this one's
+/// without its fixup flags, followed by the previous fixup flags. So a manual group
+/// equal to a generated one, repeated or not, survives, and a changed or removed
+/// fixup's old flags do not. Without a record, they are this generation's groups.
+fn patch_list(dst: &mut Vec<String>, src: &[String], fixup: FixupFlags) {
+    let mut generated = argument_groups(dst);
+    if let Some(previous) = fixup.previous {
+        let current = argument_groups(fixup.current);
+        if generated.ends_with(&current) {
+            generated.truncate(generated.len() - current.len());
+        }
+        generated.extend(argument_groups(previous));
+    }
+    for group in argument_groups(src) {
+        if let Some(pos) = generated.iter().position(|g| *g == group) {
+            generated.remove(pos);
+        } else {
+            dst.extend(group);
+        }
     }
 }
 
@@ -568,7 +1061,12 @@ fn patch_deps_fields(patch_fields: &Set<String>, dst: &mut DepFieldsMut, src: &D
 macro_rules! impl_patch_from {
     ($ty:ident) => {
         impl $ty {
-            fn patch_from(&mut self, other: &Self, patch_fields: &Set<String>) {
+            fn patch_from(
+                &mut self,
+                other: &Self,
+                patch_fields: &Set<String>,
+                fixup_flags: FixupFlags,
+            ) {
                 // Patch target_compatible_with set
                 if patch_fields.contains("target_compatible_with") {
                     patch_set(
@@ -594,7 +1092,7 @@ macro_rules! impl_patch_from {
                 }
                 // Patch rustc_flags set
                 if patch_fields.contains("rustc_flags") {
-                    patch_set(&mut self.rustc_flags, &other.rustc_flags);
+                    patch_list(&mut self.rustc_flags, &other.rustc_flags, fixup_flags);
                 }
                 // Patch visibility set
                 if patch_fields.contains("visibility") {
@@ -626,7 +1124,8 @@ impl_patch_from!(RustTest);
 impl RustLibrary {
     fn from_kwargs(kwargs: &RuleKwargs) -> anyhow::Result<Self> {
         let name = kwargs.get_str("name")?;
-        let srcs = kwargs.get_list("srcs");
+        let srcs = kwargs.get_srcs("srcs");
+        let mapped_srcs = kwargs.get_dict("mapped_srcs");
         let crate_name = kwargs.get_str("crate")?;
         let crate_root = kwargs.get_str("crate_root")?;
         let edition = kwargs.get_str("edition")?;
@@ -635,7 +1134,7 @@ impl RustLibrary {
         let exec_compatible_with = kwargs.get_list("exec_compatible_with");
         let env = kwargs.get_dict("env");
         let features = kwargs.get_list("features");
-        let rustc_flags = kwargs.get_list("rustc_flags");
+        let rustc_flags = kwargs.get_ordered_list("rustc_flags");
         let proc_macro = kwargs.get_bool_opt("proc_macro");
         let named_deps = kwargs.get_dict("named_deps");
         let os_named_deps = kwargs.get_nested_dict("os_named_deps");
@@ -645,6 +1144,7 @@ impl RustLibrary {
         Ok(RustLibrary {
             name,
             srcs,
+            mapped_srcs,
             crate_name,
             crate_root,
             edition,
@@ -653,6 +1153,7 @@ impl RustLibrary {
             exec_compatible_with,
             env,
             features,
+            platform: Map::new(),
             rustc_flags,
             proc_macro,
             named_deps,
@@ -667,7 +1168,8 @@ impl RustLibrary {
 impl RustBinary {
     fn from_kwargs(kwargs: &RuleKwargs) -> anyhow::Result<Self> {
         let name = kwargs.get_str("name")?;
-        let srcs = kwargs.get_list("srcs");
+        let srcs = kwargs.get_srcs("srcs");
+        let mapped_srcs = kwargs.get_dict("mapped_srcs");
         let crate_name = kwargs.get_str("crate")?;
         let crate_root = kwargs.get_str("crate_root")?;
         let edition = kwargs.get_str("edition")?;
@@ -676,7 +1178,7 @@ impl RustBinary {
         let exec_compatible_with = kwargs.get_list("exec_compatible_with");
         let env = kwargs.get_dict("env");
         let features = kwargs.get_list("features");
-        let rustc_flags = kwargs.get_list("rustc_flags");
+        let rustc_flags = kwargs.get_ordered_list("rustc_flags");
         let named_deps = kwargs.get_dict("named_deps");
         let os_named_deps = kwargs.get_nested_dict("os_named_deps");
         let os_deps = kwargs.get_dict_of_lists("os_deps");
@@ -685,6 +1187,7 @@ impl RustBinary {
         Ok(RustBinary {
             name,
             srcs,
+            mapped_srcs,
             crate_name,
             crate_root,
             edition,
@@ -693,6 +1196,7 @@ impl RustBinary {
             exec_compatible_with,
             env,
             features,
+            platform: Map::new(),
             rustc_flags,
             named_deps,
             os_named_deps,
@@ -706,32 +1210,54 @@ impl RustBinary {
 impl RustTest {
     fn from_kwargs(kwargs: &RuleKwargs) -> anyhow::Result<Self> {
         let name = kwargs.get_str("name")?;
-        let srcs = kwargs.get_list("srcs");
+        let srcs = kwargs.get_srcs("srcs");
+        let mapped_srcs = kwargs.get_dict("mapped_srcs");
         let crate_name = kwargs.get_str("crate")?;
         let crate_root = kwargs.get_str("crate_root")?;
         let edition = kwargs.get_str("edition")?;
-        let target_compatible_with = kwargs.get_list("target_compatible_with");
+        let target_compatible_with = kwargs.get_list("target_compatible_with").into();
         let compatible_with = kwargs.get_list("compatible_with");
         let exec_compatible_with = kwargs.get_list("exec_compatible_with");
+        let labels = kwargs.get_list("labels");
+        let args = kwargs.get_ordered_list("args").into();
+        let supports_test_execution_caching =
+            kwargs.get_bool_opt("supports_test_execution_caching");
         let env = kwargs.get_dict("env");
         let features = kwargs.get_list("features");
-        let rustc_flags = kwargs.get_list("rustc_flags");
+        let rustc_flags = kwargs.get_ordered_list("rustc_flags");
         let named_deps = kwargs.get_dict("named_deps");
         let os_named_deps = kwargs.get_nested_dict("os_named_deps");
         let os_deps = kwargs.get_dict_of_lists("os_deps");
         let visibility = kwargs.get_list("visibility");
         let deps = kwargs.get_list("deps");
+        let run_env = kwargs.get_dict("run_env");
+        let remote_execution = kwargs.get_str_opt("remote_execution");
+        let runtime_tools = kwargs.get_str_opt("runtime_tools");
+        let resources = kwargs.get_glob_opt("resources");
+        let cargo_bin_exes = kwargs.get_dict("cargo_bin_exes");
+        let extra_resources = kwargs.get_list("extra_resources");
         Ok(RustTest {
             name,
             srcs,
+            mapped_srcs,
             crate_name,
             crate_root,
             edition,
             target_compatible_with,
             compatible_with,
             exec_compatible_with,
+            labels,
+            args,
+            supports_test_execution_caching,
             env,
+            run_env,
+            remote_execution,
+            runtime_tools,
+            resources,
+            cargo_bin_exes,
+            extra_resources,
             features,
+            platform: Map::new(),
             rustc_flags,
             named_deps,
             os_named_deps,
@@ -752,7 +1278,13 @@ impl BuildscriptRun {
         let features = kwargs.get_list("features");
         let version = kwargs.get_str("version")?;
         let manifest_dir = kwargs.get_str("manifest_dir")?;
+        let package_path = kwargs.get_str_opt("package_path");
+        let workspace_inputs = kwargs.get_dict("workspace_inputs");
+        let rustc_link_lib = kwargs.get_bool_opt("rustc_link_lib").unwrap_or_default();
+        let rustc_link_search = kwargs.get_bool_opt("rustc_link_search").unwrap_or_default();
         let visibility = kwargs.get_list("visibility");
+        let target_compatible_with = kwargs.get_list("target_compatible_with");
+        let buildscript_compatible_with = kwargs.get_list("buildscript_compatible_with");
         Ok(BuildscriptRun {
             name,
             package_name,
@@ -760,8 +1292,15 @@ impl BuildscriptRun {
             env,
             env_srcs,
             features,
+            platform: Map::new(),
+            target_compatible_with,
+            buildscript_compatible_with,
             version,
             manifest_dir,
+            package_path,
+            workspace_inputs,
+            rustc_link_lib,
+            rustc_link_search,
             visibility,
         })
     }
@@ -806,7 +1345,13 @@ impl GitFetch {
         let name = kwargs.get_str("name")?;
         let repo = kwargs.get_str("repo")?;
         let rev = kwargs.get_str("rev")?;
-        Ok(GitFetch { name, repo, rev })
+        let sub_targets = kwargs.get_list("sub_targets");
+        Ok(GitFetch {
+            name,
+            repo,
+            rev,
+            sub_targets,
+        })
     }
 }
 
@@ -837,11 +1382,13 @@ impl ExportFile {
         let name = kwargs.get_str("name")?;
         let src = kwargs.get_str("src")?;
         let mode = kwargs.get_str_opt("mode");
+        let labels = kwargs.get_list("labels");
         let visibility = kwargs.get_list("visibility");
         Ok(ExportFile {
             name,
             src,
             mode,
+            labels,
             visibility,
         })
     }
@@ -907,6 +1454,7 @@ fn rule_map_key(rule: &Rule) -> String {
         Rule::RustBinary(r) => format!("rust_binary[{}]", r.name),
         Rule::RustTest(r) => format!("rust_test[{}]", r.name),
         Rule::BuildscriptRun(r) => format!("buildscript_run[{}]", r.name),
+        Rule::ConfiguredAlias(r) => format!("configured_alias[{}]", r.name),
     }
 }
 
@@ -958,11 +1506,133 @@ pub fn parse_buck_file<T: AsRef<Utf8Path>>(file: T) -> anyhow::Result<Map<String
     Ok(buck_rules)
 }
 
+/// The first line of every BUCK file generation writes in full (third-party
+/// packages).
+pub const GENERATED_HEADER: &str = "# @generated by `cargo buckal`";
+
+/// The first line of a BUCK file of which generation owns only its own rules and
+/// keeps everything else (a first-party package's, and the workspace root's). It
+/// does not say `@generated`, which claims the whole file.
+pub const PARTLY_GENERATED_HEADER: &str = "# Partly generated by `cargo buckal`: it rewrites every rust_library, rust_binary, rust_test, buildscript_run and cargo_manifest rule, its own filegroup and export_file rules and their loads, and keeps all other content.";
+
+/// [`PARTLY_GENERATED_HEADER`] as an earlier generation wrote it.
+const EARLIER_PARTLY_GENERATED_HEADER: &str = "# Partly generated by `cargo buckal`: it rewrites its own rules and their loads, and keeps all other content.";
+
+/// A header line generation writes (now or before) at the start of a BUCK file,
+/// not hand-written content.
+pub fn is_generated_header_line(line: &str) -> bool {
+    let line = line.trim();
+    line == GENERATED_HEADER
+        || line == PARTLY_GENERATED_HEADER
+        || line == EARLIER_PARTLY_GENERATED_HEADER
+        || line == "# Not intended for manual editing."
+}
+
+/// What a top-level statement of a BUCK file is.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TopLevelKind {
+    /// `load("<bzl>", ...)`.
+    Load(String),
+    /// A call of a plain function, e.g. a rule or a macro, with its literal `name`
+    /// argument if it has one.
+    Call {
+        function: String,
+        name: Option<String>,
+    },
+    /// Anything else (an assignment, a `def`, ...).
+    Other,
+}
+
+/// A top-level statement of a BUCK file, as positions in its text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopLevelStatement {
+    /// The statement itself.
+    pub span: std::ops::Range<usize>,
+    /// The statement with the comment lines that lead up to it after the previous
+    /// statement (without blank lines around them, or the generated header).
+    pub with_comments: std::ops::Range<usize>,
+    pub kind: TopLevelKind,
+}
+
+/// The top-level statements of BUCK file text `content`, in order, and the range
+/// of any comments after the last one.
+pub fn top_level_statements(
+    path: &str,
+    content: &str,
+) -> anyhow::Result<(Vec<TopLevelStatement>, Option<std::ops::Range<usize>>)> {
+    let ast = AstModule::parse(path, content.to_owned(), &Dialect::Extended)
+        .map_err(|e| anyhow::anyhow!("Failed to parse BUCK file: {}", e))?;
+    let top: Vec<&AstStmt> = match &ast.statement().node {
+        Stmt::Statements(stmts) => stmts.iter().collect(),
+        _ => vec![ast.statement()],
+    };
+    // The comment lines of `content[from..to]`, without surrounding blank lines and
+    // without the generated header.
+    let comments = |from: usize, to: usize| -> Option<std::ops::Range<usize>> {
+        let mut offset = from;
+        let mut range: Option<std::ops::Range<usize>> = None;
+        for line in content[from..to].split_inclusive('\n') {
+            let trimmed = line.trim();
+            let header = from == 0 && is_generated_header_line(trimmed);
+            if !trimmed.is_empty() && !header {
+                let end = offset + line.trim_end().len();
+                range = Some(range.map_or(offset..end, |r| r.start..end));
+            }
+            offset += line.len();
+        }
+        range
+    };
+    let mut statements = Vec::new();
+    let mut previous_end = 0;
+    for stmt in top {
+        let span = stmt.span.begin().get() as usize..stmt.span.end().get() as usize;
+        let with_comments = match comments(previous_end, span.start) {
+            Some(leading) => leading.start..span.end,
+            None => span.clone(),
+        };
+        let kind = match &stmt.node {
+            Stmt::Load(load) => TopLevelKind::Load(load.module.node.to_string()),
+            Stmt::Expression(expr) => match &expr.node {
+                ExprP::Call(callee, args) => match &callee.node {
+                    ExprP::Identifier(ident) => {
+                        let function = ident.node.ident.clone();
+                        let name = RuleKwargs::from_ast_args(&args.args).get_str_opt("name");
+                        TopLevelKind::Call { function, name }
+                    }
+                    _ => TopLevelKind::Other,
+                },
+                _ => TopLevelKind::Other,
+            },
+            _ => TopLevelKind::Other,
+        };
+        previous_end = span.end;
+        statements.push(TopLevelStatement {
+            span,
+            with_comments,
+            kind,
+        });
+    }
+    let trailing = comments(previous_end, content.len());
+    Ok((statements, trailing))
+}
+
+/// Keep the configured `patch_fields` of the existing rules (manual edits) in the
+/// regenerated ones. `fixup_flags` are the fixup `rustc_flags` this and the
+/// previous generation added to this package's rules, and `previous_sets` (by rule
+/// name, `None` without a record) what the previous generation's fixup added to
+/// their sets; they are not manual edits.
 pub fn patch_buck_rules(
     existing: &Map<String, Rule>,
     to_patch: &mut [Rule],
     patch_fields: &Set<String>,
+    fixup_flags: FixupFlags,
+    previous_sets: Option<&Map<String, FixupSets>>,
 ) {
+    let previous = |name: &str| -> FixupSets {
+        previous_sets
+            .and_then(|sets| sets.get(name).cloned())
+            .unwrap_or_default()
+    };
     fn find_existing<'a>(existing: &'a Map<String, Rule>, rule: &Rule) -> Option<&'a Rule> {
         existing.get(&rule_map_key(rule))
     }
@@ -975,7 +1645,13 @@ pub fn patch_buck_rules(
                     ..RustLibrary::default()
                 });
                 if let Some(Rule::RustLibrary(existing_rule)) = find_existing(existing, &probe) {
-                    new_rule.patch_from(existing_rule, patch_fields);
+                    let mut existing_rule = existing_rule.clone();
+                    previous(&new_rule.name).strip(
+                        &mut existing_rule.deps,
+                        &mut existing_rule.target_compatible_with,
+                        &mut existing_rule.env,
+                    );
+                    new_rule.patch_from(&existing_rule, patch_fields, fixup_flags);
                 }
             }
             Rule::RustBinary(new_rule) => {
@@ -984,7 +1660,13 @@ pub fn patch_buck_rules(
                     ..RustBinary::default()
                 });
                 if let Some(Rule::RustBinary(existing_rule)) = find_existing(existing, &probe) {
-                    new_rule.patch_from(existing_rule, patch_fields);
+                    let mut existing_rule = existing_rule.clone();
+                    previous(&new_rule.name).strip(
+                        &mut existing_rule.deps,
+                        &mut existing_rule.target_compatible_with,
+                        &mut existing_rule.env,
+                    );
+                    new_rule.patch_from(&existing_rule, patch_fields, fixup_flags);
                 }
             }
             Rule::RustTest(new_rule) => {
@@ -993,7 +1675,13 @@ pub fn patch_buck_rules(
                     ..RustTest::default()
                 });
                 if let Some(Rule::RustTest(existing_rule)) = find_existing(existing, &probe) {
-                    new_rule.patch_from(existing_rule, patch_fields);
+                    let mut existing_rule = existing_rule.clone();
+                    previous(&new_rule.name).strip(
+                        &mut existing_rule.deps,
+                        &mut existing_rule.target_compatible_with,
+                        &mut existing_rule.env,
+                    );
+                    new_rule.patch_from(&existing_rule, patch_fields, fixup_flags);
                 }
             }
             Rule::BuildscriptRun(new_rule) => {
@@ -1002,7 +1690,12 @@ pub fn patch_buck_rules(
                     ..BuildscriptRun::default()
                 });
                 if let Some(Rule::BuildscriptRun(existing_rule)) = find_existing(existing, &probe) {
-                    new_rule.patch_from(existing_rule, patch_fields);
+                    let mut existing_rule = existing_rule.clone();
+                    let previous = previous(&new_rule.name);
+                    existing_rule
+                        .env
+                        .retain(|key, value| previous.env.get(key) != Some(value));
+                    new_rule.patch_from(&existing_rule, patch_fields);
                 }
             }
             _ => {}
@@ -1174,12 +1867,13 @@ mod tests {
             }),
             Rule::RustBinary(RustBinary {
                 name: "libra".to_string(),
-                srcs: Set::from([":vendor".to_string()]),
+                srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "libra".to_string(),
                 crate_root: "vendor/src/main.rs".to_string(),
                 edition: "2024".to_string(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1188,12 +1882,13 @@ mod tests {
             }),
             Rule::RustLibrary(RustLibrary {
                 name: "libra-lib".to_string(),
-                srcs: Set::from([":vendor".to_string()]),
+                srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "libra".to_string(),
                 crate_root: "vendor/src/lib.rs".to_string(),
                 edition: "2024".to_string(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1202,12 +1897,13 @@ mod tests {
             }),
             Rule::RustTest(RustTest {
                 name: "unittest".to_string(),
-                srcs: Set::from([":vendor".to_string()]),
+                srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "libra".to_string(),
                 crate_root: "vendor/src/lib.rs".to_string(),
                 edition: "2024".to_string(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1216,13 +1912,14 @@ mod tests {
             }),
             Rule::RustTest(RustTest {
                 name: "ai_agent_test".to_string(),
-                srcs: Set::from([":vendor".to_string()]),
+                srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "ai_agent_test".to_string(),
                 crate_root: "vendor/tests/ai_agent_test.rs".to_string(),
                 edition: "2024".to_string(),
                 env: common_test_env(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1231,13 +1928,14 @@ mod tests {
             }),
             Rule::RustTest(RustTest {
                 name: "ai_chat_agent_test".to_string(),
-                srcs: Set::from([":vendor".to_string()]),
+                srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "ai_chat_agent_test".to_string(),
                 crate_root: "vendor/tests/ai_chat_agent_test.rs".to_string(),
                 edition: "2024".to_string(),
                 env: common_test_env(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1246,13 +1944,14 @@ mod tests {
             }),
             Rule::RustTest(RustTest {
                 name: "ai_dag_tool_loop_test".to_string(),
-                srcs: Set::from([":vendor".to_string()]),
+                srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "ai_dag_tool_loop_test".to_string(),
                 crate_root: "vendor/tests/ai_dag_tool_loop_test.rs".to_string(),
                 edition: "2024".to_string(),
                 env: common_test_env(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1261,13 +1960,14 @@ mod tests {
             }),
             Rule::RustTest(RustTest {
                 name: "ai_storage_flow_test".to_string(),
-                srcs: Set::from([":vendor".to_string()]),
+                srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "ai_storage_flow_test".to_string(),
                 crate_root: "vendor/tests/ai_storage_flow_test.rs".to_string(),
                 edition: "2024".to_string(),
                 env: common_test_env(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1276,13 +1976,14 @@ mod tests {
             }),
             Rule::RustTest(RustTest {
                 name: "cloud_storage_backup_test".to_string(),
-                srcs: Set::from([":vendor".to_string()]),
+                srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "cloud_storage_backup_test".to_string(),
                 crate_root: "vendor/tests/cloud_storage_backup_test.rs".to_string(),
                 edition: "2024".to_string(),
                 env: common_test_env(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1291,13 +1992,14 @@ mod tests {
             }),
             Rule::RustTest(RustTest {
                 name: "command_test".to_string(),
-                srcs: Set::from([":vendor".to_string()]),
+                srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "command_test".to_string(),
                 crate_root: "vendor/tests/command_test.rs".to_string(),
                 edition: "2024".to_string(),
                 env: common_test_env(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1306,13 +2008,14 @@ mod tests {
             }),
             Rule::RustTest(RustTest {
                 name: "e2e_mcp_flow".to_string(),
-                srcs: Set::from([":vendor".to_string()]),
+                srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "e2e_mcp_flow".to_string(),
                 crate_root: "vendor/tests/e2e_mcp_flow.rs".to_string(),
                 edition: "2024".to_string(),
                 env: common_test_env(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1321,13 +2024,14 @@ mod tests {
             }),
             Rule::RustTest(RustTest {
                 name: "intent_flow_test".to_string(),
-                srcs: Set::from([":vendor".to_string()]),
+                srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "intent_flow_test".to_string(),
                 crate_root: "vendor/tests/intent_flow_test.rs".to_string(),
                 edition: "2024".to_string(),
                 env: common_test_env(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1336,13 +2040,14 @@ mod tests {
             }),
             Rule::RustTest(RustTest {
                 name: "mcp_integration_test".to_string(),
-                srcs: Set::from([":vendor".to_string()]),
+                srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "mcp_integration_test".to_string(),
                 crate_root: "vendor/tests/mcp_integration_test.rs".to_string(),
                 edition: "2024".to_string(),
                 env: common_test_env(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1351,13 +2056,14 @@ mod tests {
             }),
             Rule::RustTest(RustTest {
                 name: "storage_r2_test".to_string(),
-                srcs: Set::from([":vendor".to_string()]),
+                srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "storage_r2_test".to_string(),
                 crate_root: "vendor/tests/storage_r2_test.rs".to_string(),
                 edition: "2024".to_string(),
                 env: common_test_env(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1422,7 +2128,8 @@ mod tests {
             }),
             Rule::RustLibrary(RustLibrary {
                 name: "aws-lc-rs".to_string(),
-                srcs: Set::from([":vendor".to_string()]),
+                srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "aws_lc_rs".to_string(),
                 crate_root: "vendor/src/lib.rs".to_string(),
                 edition: "2021".to_string(),
@@ -1438,7 +2145,7 @@ mod tests {
                     "ring-io".to_string(),
                     "ring-sig-verify".to_string(),
                 ]),
-                rustc_flags: Set::from([
+                rustc_flags: Vec::from([
                     "@$(location :build-script-run[rustc_flags])".to_string(),
                     "@$(location :manifest[env_flags])".to_string(),
                 ]),
@@ -1452,7 +2159,8 @@ mod tests {
             }),
             Rule::RustBinary(RustBinary {
                 name: "build-script-build".to_string(),
-                srcs: Set::from([":vendor".to_string()]),
+                srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "build_script_build".to_string(),
                 crate_root: "vendor/build.rs".to_string(),
                 edition: "2021".to_string(),
@@ -1464,7 +2172,7 @@ mod tests {
                     "ring-io".to_string(),
                     "ring-sig-verify".to_string(),
                 ]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 ..Default::default()
             }),
             Rule::BuildscriptRun(BuildscriptRun {
@@ -1528,6 +2236,7 @@ mod tests {
                 name: "vendor".to_string(),
                 repo: "https://github.com/web3infra-foundation/git-internal.git".to_string(),
                 rev: "65b910d7571f36aa231958992e005a7a1c0838e9".to_string(),
+                sub_targets: Set::new(),
             }),
             Rule::CargoManifest(CargoManifest {
                 name: "manifest".to_string(),
@@ -1536,12 +2245,13 @@ mod tests {
             }),
             Rule::RustLibrary(RustLibrary {
                 name: "git-internal".to_string(),
-                srcs: Set::from([":vendor".to_string()]),
+                srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "git_internal".to_string(),
                 crate_root: "vendor/src/lib.rs".to_string(),
                 edition: "2024".to_string(),
                 features: Set::from(["default".to_string(), "diff_mydrs".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 visibility: Set::from(["PUBLIC".to_string()]),
                 deps: Set::from([
                     "//third-party/rust/crates/ahash/0.8.12:ahash".to_string(),
@@ -1689,6 +2399,7 @@ mod tests {
             name: "example_repo".to_string(),
             repo: "https://example.com/repo.git".to_string(),
             rev: "abcdef1234567890".to_string(),
+            sub_targets: Set::new(),
         });
         let actual = rules
             .get(&rule_map_key(&expected))
@@ -1696,6 +2407,27 @@ mod tests {
         assert_eq!(
             actual, &expected,
             "parsed git_fetch rule should match expected"
+        );
+    }
+
+    /// Test that `git_fetch` sub-targets survive a parse and re-serialize round trip.
+    #[test]
+    fn test_parsing_git_fetch_sub_targets() {
+        let path = get_test_file("git_fetch_sub_targets.BUCK");
+        let rules = parse_buck_file(path.clone()).expect("parse should succeed");
+        let expected = Rule::GitFetch(GitFetch {
+            name: "vendor".to_string(),
+            repo: "https://github.com/emchristiansen/rig".to_string(),
+            rev: "6871da91c889479c679951aad12d5f367152b01a".to_string(),
+            sub_targets: Set::from(["Cargo.toml".to_string(), "crates/rig-core".to_string()]),
+        });
+        let actual = rules
+            .get(&rule_map_key(&expected))
+            .expect("git_fetch rule should be present");
+        assert_eq!(actual, &expected);
+        assert_eq!(
+            serde_starlark::to_string(&expected).unwrap(),
+            std::fs::read_to_string(path).unwrap()
         );
     }
 
@@ -1729,6 +2461,7 @@ mod tests {
             name: "workspace".to_string(),
             src: "Cargo.toml".to_string(),
             mode: Some("reference".to_string()),
+            labels: Default::default(),
             visibility: Set::from(["PUBLIC".to_string()]),
         });
         let actual = rules
@@ -1748,7 +2481,8 @@ mod tests {
         assert_eq!(rules.len(), 1);
         let expected = Rule::RustLibrary(RustLibrary {
             name: "example_lib".to_string(),
-            srcs: Set::from(["src/lib.rs".to_string()]),
+            srcs: Set::from(["src/lib.rs".to_string()]).into(),
+            mapped_srcs: Map::new(),
             crate_name: "example_lib".to_string(),
             crate_root: "src/lib.rs".to_string(),
             edition: "2024".to_string(),
@@ -1757,7 +2491,8 @@ mod tests {
             exec_compatible_with: Set::from(["prelude//os/constraints:macos".to_string()]),
             env: Map::from([("RUST_LOG".to_string(), "debug".to_string())]),
             features: Set::from(["default".to_string()]),
-            rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+            platform: Map::new(),
+            rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
             proc_macro: Some(true),
             named_deps: Map::from([("serde".to_string(), ":serde_dep".to_string())]),
             os_named_deps: Map::from([(
@@ -1785,7 +2520,8 @@ mod tests {
         assert_eq!(rules.len(), 1);
         let expected = Rule::RustBinary(RustBinary {
             name: "example_bin".to_string(),
-            srcs: Set::from(["src/main.rs".to_string()]),
+            srcs: Set::from(["src/main.rs".to_string()]).into(),
+            mapped_srcs: Map::new(),
             crate_name: "example_bin".to_string(),
             crate_root: "src/main.rs".to_string(),
             edition: "2024".to_string(),
@@ -1794,7 +2530,8 @@ mod tests {
             exec_compatible_with: Set::from(["prelude//os/constraints:macos".to_string()]),
             env: Map::from([("RUST_LOG".to_string(), "debug".to_string())]),
             features: Set::from(["default".to_string()]),
-            rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+            platform: Map::new(),
+            rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
             deps: Set::from([":dep".to_string()]),
             os_deps: Map::from([("linux".to_string(), Set::from([":linux_dep".to_string()]))]),
             named_deps: Map::from([("serde".to_string(), ":serde_dep".to_string())]),
@@ -1821,16 +2558,28 @@ mod tests {
         assert_eq!(rules.len(), 1);
         let expected = Rule::RustTest(RustTest {
             name: "example_test".to_string(),
-            srcs: Set::from(["src/lib.rs".to_string()]),
+            srcs: Set::from(["src/lib.rs".to_string()]).into(),
+            mapped_srcs: Map::new(),
             crate_name: "example_test".to_string(),
             crate_root: "src/lib.rs".to_string(),
             edition: "2024".to_string(),
-            target_compatible_with: Set::from(["prelude//os/constraints:windows".to_string()]),
+            target_compatible_with: Set::from(["prelude//os/constraints:windows".to_string()])
+                .into(),
             compatible_with: Set::from(["prelude//os/constraints:linux".to_string()]),
             exec_compatible_with: Set::from(["prelude//os/constraints:macos".to_string()]),
+            labels: Set::new(),
+            args: Vec::new().into(),
+            supports_test_execution_caching: None,
             env: Map::from([("RUST_LOG".to_string(), "debug".to_string())]),
+            run_env: Map::new(),
+            remote_execution: None,
+            runtime_tools: None,
+            resources: None,
+            cargo_bin_exes: Map::new(),
+            extra_resources: Set::new(),
             features: Set::from(["default".to_string()]),
-            rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+            platform: Map::new(),
+            rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
             deps: Set::from([":dep".to_string()]),
             os_deps: Map::from([("linux".to_string(), Set::from([":linux_dep".to_string()]))]),
             named_deps: Map::from([("serde".to_string(), ":serde_dep".to_string())]),
@@ -1865,8 +2614,15 @@ mod tests {
                 ":manifest[env_dict]".to_string(),
             ]),
             features: Set::from(["alloc".to_string(), "default".to_string()]),
+            platform: Map::new(),
+            target_compatible_with: Set::new(),
+            buildscript_compatible_with: Set::new(),
             version: "1.2.3".to_string(),
             manifest_dir: ":vendor".to_string(),
+            package_path: None,
+            workspace_inputs: Map::new(),
+            rustc_link_lib: false,
+            rustc_link_search: false,
             visibility: Set::from(["PUBLIC".to_string()]),
         });
         let actual = rules
@@ -1910,31 +2666,34 @@ mod tests {
         let expected_rules = vec![
             Rule::RustLibrary(RustLibrary {
                 name: "with_select".to_string(),
-                srcs: Set::from(["src/lib.rs".to_string()]),
+                srcs: Set::from(["src/lib.rs".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "with_select".to_string(),
                 crate_root: "src/lib.rs".to_string(),
                 edition: "2024".to_string(),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 visibility: Set::from(["PUBLIC".to_string()]),
                 ..Default::default()
             }),
             Rule::RustLibrary(RustLibrary {
                 name: "with_select_reversed".to_string(),
-                srcs: Set::from(["src/lib.rs".to_string()]),
+                srcs: Set::from(["src/lib.rs".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "with_select_reversed".to_string(),
                 crate_root: "src/lib.rs".to_string(),
                 edition: "2024".to_string(),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 visibility: Set::from(["PUBLIC".to_string()]),
                 ..Default::default()
             }),
             Rule::RustLibrary(RustLibrary {
                 name: "merge_both_sides".to_string(),
-                srcs: Set::from(["src/lib.rs".to_string()]),
+                srcs: Set::from(["src/lib.rs".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "merge_both_sides".to_string(),
                 crate_root: "src/lib.rs".to_string(),
                 edition: "2024".to_string(),
-                rustc_flags: Set::from([
+                rustc_flags: Vec::from([
                     "@$(location //third-party/rust/crates/windows:build-script-run[rustc_flags])"
                         .to_string(),
                     "@$(location :manifest[env_flags])".to_string(),
@@ -1961,5 +2720,122 @@ mod tests {
                 key
             );
         }
+    }
+
+    #[test]
+    fn test_patch_list_merges_whole_argument_groups() {
+        let v = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            argument_groups(&v(&[
+                "@f",
+                "-C",
+                "opt-level=2",
+                "-Lnative=x",
+                "-C",
+                "debuginfo=1"
+            ])),
+            [
+                v(&["@f"]),
+                v(&["-C", "opt-level=2"]),
+                v(&["-Lnative=x"]),
+                v(&["-C", "debuginfo=1"])
+            ]
+        );
+
+        let unrecorded = |current| FixupFlags {
+            current,
+            previous: None,
+        };
+        // A manual `-C` group next to a generated one keeps its own `-C`.
+        let mut dst = v(&["@f", "-C", "opt-level=2"]);
+        patch_list(&mut dst, &v(&["-C", "debuginfo=1"]), unrecorded(&[]));
+        assert_eq!(dst, v(&["@f", "-C", "opt-level=2", "-C", "debuginfo=1"]));
+
+        // Groups the previous generation emitted (a changed fixup) are not manual;
+        // a repeated manual group survives once per occurrence beyond the generated.
+        let mut dst = v(&["@f", "-C", "opt-level=3"]);
+        patch_list(
+            &mut dst,
+            &v(&[
+                "@f",
+                "-C",
+                "opt-level=2",
+                "-C",
+                "debuginfo=1",
+                "-C",
+                "debuginfo=1",
+            ]),
+            FixupFlags {
+                current: &v(&["-C", "opt-level=3"]),
+                previous: Some(&v(&["-C", "opt-level=2"])),
+            },
+        );
+        assert_eq!(
+            dst,
+            v(&[
+                "@f",
+                "-C",
+                "opt-level=3",
+                "-C",
+                "debuginfo=1",
+                "-C",
+                "debuginfo=1"
+            ])
+        );
+
+        // R6-DUP-1 (A, B, A): the fixup `-C opt-level=2` is unchanged, and manual
+        // `-C opt-level=3 -C opt-level=2` follow it. The generated group is
+        // accounted for once, so both manual groups survive in order.
+        let fixup = v(&["-C", "opt-level=2"]);
+        let mut dst = v(&["@f", "-C", "opt-level=2"]);
+        patch_list(
+            &mut dst,
+            &v(&[
+                "@f",
+                "-C",
+                "opt-level=2",
+                "-C",
+                "opt-level=3",
+                "-C",
+                "opt-level=2",
+            ]),
+            FixupFlags {
+                current: &fixup,
+                previous: Some(&fixup),
+            },
+        );
+        assert_eq!(
+            dst,
+            v(&[
+                "@f",
+                "-C",
+                "opt-level=2",
+                "-C",
+                "opt-level=3",
+                "-C",
+                "opt-level=2"
+            ])
+        );
+
+        // A removed fixup: its recorded flags are not manual.
+        let mut dst = v(&["@f"]);
+        patch_list(
+            &mut dst,
+            &v(&["@f", "-C", "opt-level=2", "-C", "debuginfo=1"]),
+            FixupFlags {
+                current: &[],
+                previous: Some(&fixup),
+            },
+        );
+        assert_eq!(dst, v(&["@f", "-C", "debuginfo=1"]));
+
+        // Without a record, this generation's groups are the generated ones.
+        let mut dst = v(&["@f", "-C", "opt-level=2"]);
+        patch_list(
+            &mut dst,
+            &v(&["@f", "-C", "opt-level=2", "-C", "opt-level=3"]),
+            unrecorded(&fixup),
+        );
+        assert_eq!(dst, v(&["@f", "-C", "opt-level=2", "-C", "opt-level=3"]));
     }
 }

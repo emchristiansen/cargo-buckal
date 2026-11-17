@@ -20,18 +20,31 @@ pub fn patch_rust_test_target_compatible_with(buck_content: String) -> String {
 
     let mut out = buck_content;
     insert_positions.sort_unstable();
-    for pos in insert_positions.into_iter().rev() {
+    for (pos, insert) in insert_positions.into_iter().rev() {
         if pos >= out.len() {
             continue;
         }
-        let insert = build_insert(&out, pos);
+        let insert = match insert {
+            Insert::Argument => build_insert(&out, pos),
+            Insert::Concatenation => format!(" + {CROSS_SELECT_EXPR}"),
+        };
         out.insert_str(pos, &insert);
     }
 
     out
 }
 
-fn collect_rust_test_insert_positions(stmt: &AstStmt, out: &mut Vec<usize>) {
+/// How a rust_test gets the cross-compilation selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Insert {
+    /// As a new `target_compatible_with` argument, before the closing parenthesis.
+    Argument,
+    /// Concatenated to its own `target_compatible_with` value (e.g. from a fixup),
+    /// at the value's end.
+    Concatenation,
+}
+
+fn collect_rust_test_insert_positions(stmt: &AstStmt, out: &mut Vec<(usize, Insert)>) {
     match &stmt.node {
         Stmt::Statements(stmts) => {
             for s in stmts {
@@ -47,29 +60,26 @@ fn collect_rust_test_insert_positions(stmt: &AstStmt, out: &mut Vec<usize>) {
     }
 }
 
-fn find_rust_test_call(expr: &AstExpr) -> Option<usize> {
+fn find_rust_test_call(expr: &AstExpr) -> Option<(usize, Insert)> {
     if let ExprP::Call(callee, args) = &expr.node
         && let ExprP::Identifier(ident) = &callee.node
         && ident.node.ident == "rust_test"
     {
-        if call_has_arg(&args.args, "target_compatible_with") {
-            return None;
+        if let Some(value) = call_arg(&args.args, "target_compatible_with") {
+            return Some((value.span.end().get() as usize, Insert::Concatenation));
         }
-        return insert_pos_before_closing_paren(expr.span);
+        return insert_pos_before_closing_paren(expr.span).map(|pos| (pos, Insert::Argument));
     }
     None
 }
 
-fn call_has_arg(
-    args: &[starlark_syntax::codemap::Spanned<ArgumentP<AstNoPayload>>],
+fn call_arg<'a>(
+    args: &'a [starlark_syntax::codemap::Spanned<ArgumentP<AstNoPayload>>],
     name: &str,
-) -> bool {
-    args.iter().any(|arg| {
-        if let ArgumentP::Named(name_spanned, _) = &arg.node {
-            name_spanned.node == name
-        } else {
-            false
-        }
+) -> Option<&'a AstExpr> {
+    args.iter().find_map(|arg| match &arg.node {
+        ArgumentP::Named(name_spanned, value) if name_spanned.node == name => Some(value),
+        _ => None,
     })
 }
 

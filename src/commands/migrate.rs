@@ -34,6 +34,11 @@ pub struct MigrateArgs {
     /// Path to Cargo.toml
     #[arg(long, conflicts_with = "init")]
     pub manifest_path: Option<String>,
+
+    /// Accept and record a changed list of host compilations that resolve
+    /// differently per configured platform (otherwise a change stops generation)
+    #[clap(long)]
+    pub accept_host_differences: bool,
 }
 
 pub fn execute(args: &MigrateArgs) {
@@ -112,22 +117,31 @@ pub fn execute(args: &MigrateArgs) {
     // get cargo metadata and generate context
     let mut ctx = BuckalContext::new(args.manifest_path.clone());
     ctx.no_merge = !args.merge;
+    ctx.check_host_platform_differences(args.accept_host_differences);
 
     // Process dep nodes
-    // For migrate, a missing cache means "first run" — use empty so everything is
-    // treated as Added and BUCK files are generated from scratch. A stale-but-
-    // migratable cache (e.g. a v4 snapshot after the v5 path-id bump) is upgraded
-    // in place rather than discarded, so packages dropped from the manifest are
-    // still detected as Removed. This differs from add/remove/update, which use
-    // get_last_cache() to rebuild the prior state from metadata before the edit.
-    let last_cache = if args.no_cache {
-        BuckalCache::new_empty()
-    } else {
-        BuckalCache::load_migrated(&ctx.workspace_root).unwrap_or_else(|_| BuckalCache::new_empty())
-    };
-    let new_cache =
-        BuckalCache::from_resolve(&ctx.resolve, &ctx.workspace_root, &ctx.repo_config.patch);
-    let changes = new_cache.diff(&last_cache, &ctx.workspace_root);
+    // For migrate, a missing/stale cache means "first run" — use empty so everything
+    // is treated as Added and BUCK files are generated from scratch. This differs from
+    // add/remove/update which use get_last_cache() to rebuild from metadata for diffing.
+    // `--no-cache` regenerates everything too.
+    let recorded = BuckalCache::load().ok();
+    let empty = BuckalCache::new_empty();
+    let last_cache = recorded
+        .as_ref()
+        .filter(|_| !args.no_cache)
+        .unwrap_or(&empty);
+    let new_cache = ctx.new_cache();
+    let mut changes = new_cache.diff(last_cache, &ctx.workspace_root);
+    // Which packages to regenerate is one question; what the previous generation
+    // emitted is another. A compatible cache records the fixup flags that generation
+    // added (its flags and fixups), so `--merge` does not take them for manual
+    // edits under `--no-cache` either.
+    changes.previous_fixup_rustc_flags = recorded
+        .as_ref()
+        .and_then(BuckalCache::previous_fixup_record);
+    changes.previous_fixups = recorded
+        .as_ref()
+        .and_then(BuckalCache::previous_fixups_record);
 
     // Apply changes to BUCK files
     changes.apply(&ctx);

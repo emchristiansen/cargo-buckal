@@ -479,6 +479,10 @@ pub fn is_path_source(package_id: &PackageId) -> Result<bool> {
 
 /// Retrieve the last saved BuckalCache from the cache file, or rebuild from metadata if unavailable.
 ///
+/// A rebuilt cache is an unverified inventory: it lets `diff()` detect removals, but
+/// every surviving package is regenerated, since no compatible record says their BUCK
+/// files are current.
+///
 /// `manifest_path` should match the `--manifest-path` argument passed to the command,
 /// so that the fallback cache is built from the correct workspace (not always cwd).
 ///
@@ -494,7 +498,7 @@ pub fn get_last_cache(manifest_path: Option<&str>) -> BuckalCache {
             Ok(root) => root,
             Err(_) => {
                 buckal_warn!("could not locate buck2 root; falling back to empty cache (removal detection disabled)");
-                return BuckalCache::new_empty();
+                return BuckalCache::new_empty().into_unverified_inventory();
             }
         };
         let mut cmd = cargo_metadata::MetadataCommand::new();
@@ -505,7 +509,7 @@ pub fn get_last_cache(manifest_path: Option<&str>) -> BuckalCache {
             Ok(m) => m,
             Err(e) => {
                 buckal_warn!("cargo metadata failed: {}; falling back to empty cache (removal detection disabled)", e);
-                return BuckalCache::new_empty();
+                return BuckalCache::new_empty().into_unverified_inventory();
             }
         };
         let packages_map: std::collections::HashMap<_, _> = metadata
@@ -534,28 +538,26 @@ pub fn get_last_cache(manifest_path: Option<&str>) -> BuckalCache {
                     "dependency cycle in workspace: {}; falling back to empty cache",
                     e
                 );
-                return BuckalCache::new_empty();
+                return BuckalCache::new_empty().into_unverified_inventory();
             }
         };
-        let repo_patch_config = load_repo_patch_config(&metadata.workspace_root);
-        BuckalCache::from_resolve(&resolve, &metadata.workspace_root, &repo_patch_config)
+        let repo_config = load_repo_config(&metadata.workspace_root);
+        BuckalCache::from_resolve_with_config(&resolve, &metadata.workspace_root, &repo_config, &[])
+        .into_unverified_inventory()
     })
 }
 
 /// Load the patch config from `buckal.toml` at the given workspace root,
 /// falling back to defaults if the file is missing or unparsable.
-fn load_repo_patch_config(
+fn load_repo_config(
     workspace_root: &cargo_metadata::camino::Utf8PathBuf,
-) -> crate::config::RepoPatchConfig {
+) -> crate::config::RepoConfig {
     let config_path = workspace_root.join("buckal.toml");
     let content = match std::fs::read_to_string(&config_path) {
         Ok(c) => c,
-        Err(_) => return crate::config::RepoPatchConfig::default(),
+        Err(_) => return crate::config::RepoConfig::default(),
     };
-    match toml::from_str::<crate::config::RepoConfig>(&content) {
-        Ok(c) => c.patch,
-        Err(_) => crate::config::RepoPatchConfig::default(),
-    }
+    toml::from_str::<crate::config::RepoConfig>(&content).unwrap_or_default()
 }
 
 /// Read checksums from Cargo.lock, returning an empty map if the file is missing or unparsable.

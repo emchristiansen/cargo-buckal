@@ -1,22 +1,32 @@
 use std::{collections::BTreeSet as Set, vec};
 
 use cargo_metadata::TargetKind;
-use cargo_metadata::camino::Utf8PathBuf;
+use cargo_metadata::camino::{Utf8Path, Utf8PathBuf};
 use cargo_util_schemas::core::{PackageIdSpec, SourceKind};
 use itertools::Itertools;
 
+use crate::platform_features::{EdgeRole, platform_list_mut};
+
 use crate::{
-    buck::{Load, Rule, RustRule},
-    buckal_error, buckal_note,
+    buck::{ExportFile, GENERATED_HEADER, Load, PARTLY_GENERATED_HEADER, Rule, RustRule},
+    buckal_error, buckal_note, buckal_warn,
     context::BuckalContext,
-    resolve::{BuckalNode, is_lib_like},
-    utils::{UnwrapOrExit, get_vendor_dir},
+    resolve::{BuckalNode, BuckalTarget, NodeKind, is_lib_like},
+    utils::{UnwrapOrExit, get_buck2_root, get_vendor_dir},
 };
 
+use super::includes::{
+    IncludeGap, UnprovidedInclude, in_nested_package, repository_path, unprovided_includes,
+};
+
+use super::deps::{
+    host_variant_name, test_host_variant_name, test_variant_name, wasm_variant_name,
+};
 use super::emit::{
     emit_buildscript_build, emit_buildscript_run, emit_cargo_manifest, emit_filegroup,
     emit_git_fetch, emit_http_archive, emit_rust_binary, emit_rust_library, emit_rust_test,
-    patch_with_buildscript,
+    host_variant_build_target, patch_with_buildscript, test_host_variant_build_target,
+    test_variant_build_target, wasm_variant_build_target,
 };
 
 /// Buckifies a third-party dependency into a list of BUCK rules.
@@ -94,15 +104,70 @@ pub fn buckify_dep_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         buck_rules.push(Rule::BuildscriptRun(buildscript_run));
     }
 
+    buck_rules.extend(host_variant_rules(
+        node,
+        lib_target,
+        &node.name,
+        &manifest_dir,
+        ctx,
+    ));
+    buck_rules.extend(test_variant_rules(
+        node,
+        lib_target,
+        &node.name,
+        &manifest_dir,
+        ctx,
+    ));
+    buck_rules.extend(test_host_variant_rules(
+        node,
+        lib_target,
+        &node.name,
+        &manifest_dir,
+        ctx,
+    ));
+    buck_rules.extend(wasm_variant_rules(
+        node,
+        lib_target,
+        &node.name,
+        &manifest_dir,
+        ctx,
+    ));
+
+    apply_fixups(&mut buck_rules, node, ctx);
+    if ctx
+        .repo_config
+        .fixups
+        .get(&node.name)
+        .is_some_and(|fixup| !fixup.export_files.is_empty())
+    {
+        buckal_error!(
+            "`[fixups.{}] export_files` is only supported for first-party packages",
+            node.name
+        );
+        std::process::exit(1);
+    }
+
     buck_rules
 }
 
 /// Buckifies workspace package into a list of BUCK rules, including rules for all targets (bin, lib, test) and handling build scripts if present.
 pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
+    // Cargo builds a binary only where its `required-features` are on; one that
+    // neither the production nor the test resolution enables is not built at all.
+    let production = node.platform_features.exec_resolution();
+    let tests = node.platform_features.test_resolution();
+    // Cargo builds the binaries and tests of workspace members only: of a path
+    // dependency outside the workspace, only the library.
+    let member = ctx.is_workspace_member(&node.package_id);
     let bin_targets: Vec<_> = node
         .targets
         .iter()
-        .filter(|t| t.kind.contains(&TargetKind::Bin))
+        .filter(|t| member && t.kind.contains(&TargetKind::Bin))
+        .filter(|t| {
+            let per_platform = !ctx.repo_config.feature_platforms.is_empty();
+            features_enable(&production, &t.required_features, per_platform)
+                || features_enable(&tests, &t.required_features, per_platform)
+        })
         .collect();
 
     let lib_targets: Vec<_> = node
@@ -111,25 +176,91 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         .filter(|t| t.kind.iter().any(is_lib_like))
         .collect();
 
+    // Like binaries, Cargo builds an integration test only where the tests'
+    // resolution enables its `required-features`.
     let test_targets: Vec<_> = node
         .targets
         .iter()
-        .filter(|t| t.kind.contains(&TargetKind::Test))
+        .filter(|t| member && t.kind.contains(&TargetKind::Test))
+        .filter(|t| {
+            let per_platform = !ctx.repo_config.feature_platforms.is_empty();
+            features_enable(&tests, &t.required_features, per_platform)
+        })
         .collect();
 
     let mut buck_rules: Vec<Rule> = Vec::new();
 
     let manifest_dir = node.manifest_path.parent().unwrap().to_owned();
 
+    report_unprovided_includes(node, ctx);
+
+    // Binaries and tests are compiled in their own context, which differs from the
+    // library's when the library is host-only (a proc-macro with an integration test).
+    let exec_node = BuckalNode {
+        platform_features: node.platform_features.exec_resolution(),
+        ..node.clone()
+    };
+    // Tests are compiled as Cargo compiles them for `cargo test`: with a separate
+    // test resolution, in the test context.
+    let test_node = BuckalNode {
+        platform_features: node.platform_features.test_resolution(),
+        ..node.clone()
+    };
+    // The library's inline unit tests are compiled in the library's own context: on
+    // the host for a host-only library (a proc-macro), apart from its integration
+    // tests on the target.
+    let unit_test_node = BuckalNode {
+        platform_features: node.platform_features.unit_test_resolution(),
+        ..node.clone()
+    };
+    let has_test_variant = node.platform_features.test_variant.is_some();
+    // Rules compiled in the test context: they use the package's own test variant.
+    let mut test_context_rules: Set<String> = Set::new();
+
     // Pre-compute the library Buck target name for wiring binary → library deps.
     // In Cargo, every binary in a package implicitly depends on the package's library.
-    let lib_buck_name: Option<String> = lib_targets.first().map(|lib_target| {
-        if bin_targets.iter().any(|b| b.name == lib_target.name) {
+    // The name depends on every binary of the manifest, emitted or not: dependents'
+    // labels (`deps::dep_label`) are named from the manifest alone.
+    let lib_rule_name = |lib_target: &BuckalTarget| -> String {
+        if node
+            .targets
+            .iter()
+            .any(|b| b.kind.contains(&TargetKind::Bin) && b.name == lib_target.name)
+        {
             format!("{}-lib", lib_target.name)
         } else {
             lib_target.name.to_owned()
         }
-    });
+    };
+    let lib_buck_name: Option<String> = lib_targets.first().map(|t| lib_rule_name(t));
+    // The library as the package's binaries and tests link it: only a Rust library
+    // (not a cdylib or staticlib alone) can be linked, and Cargo gives them no edge
+    // to any other.
+    let linked_lib_name: Option<String> = lib_targets
+        .first()
+        .filter(|t| {
+            t.kind.iter().any(|k| {
+                matches!(
+                    k,
+                    TargetKind::Lib | TargetKind::RLib | TargetKind::DyLib | TargetKind::ProcMacro
+                )
+            })
+        })
+        .and(lib_buck_name.clone());
+    // The package's own library as its test-context rules (tests, test-only
+    // binaries) use it: the test host variant of a host-only library (a
+    // proc-macro, which the tests' compilations load on the host), else the test
+    // variant, else the library.
+    let test_context_lib = |lib_name: &str| -> String {
+        let resolution = &node.platform_features;
+        if resolution.host_context && resolution.test_host_variant.is_some() {
+            test_host_variant_name(lib_name)
+        } else if has_test_variant {
+            test_variant_name(lib_name)
+        } else {
+            lib_name.to_owned()
+        }
+    };
 
     // emit filegroup rule for vendor
     let filegroup = emit_filegroup();
@@ -138,17 +269,45 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
     let cargo_manifest = emit_cargo_manifest(node, ctx);
     buck_rules.push(Rule::CargoManifest(cargo_manifest));
 
+    // Cargo builds a binary that only the tests' resolution enables (or of a
+    // package only the tests build) as its unit tests, and as an executable only
+    // for its package's integration tests (for `CARGO_BIN_EXE_<name>`): without
+    // one, there is no binary to emit.
+    let integration_tests = !ctx.repo_config.ignore_tests && !test_targets.is_empty();
+    let emitted_bins: Vec<&BuckalTarget> = bin_targets
+        .iter()
+        .copied()
+        .filter(|t| {
+            integration_tests
+                || !node.platform_features.test_context && has_required_features(&exec_node, t)
+        })
+        .collect();
+
     // emit buck rules for bin targets
-    for bin_target in &bin_targets {
+    for bin_target in &emitted_bins {
         let buckal_name = bin_target.name.to_owned();
 
-        let mut rust_binary = emit_rust_binary(node, bin_target, &manifest_dir, &buckal_name, ctx);
+        // A binary whose `required-features` only the tests' resolution enables is
+        // built for the tests.
+        let for_tests = !has_required_features(&exec_node, bin_target)
+            && has_required_features(&test_node, bin_target);
+        let bin_node = if for_tests { &test_node } else { &exec_node };
+        let mut rust_binary =
+            emit_rust_binary(bin_node, bin_target, &manifest_dir, &buckal_name, ctx);
 
         // Cargo allows `main.rs` to use items from `lib.rs` via the crate's own name by default.
         // The binary must always depend on the sibling library, even when names differ
         // (e.g., binary "my-crate" vs library "my_crate").
-        if let Some(lib_name) = &lib_buck_name {
-            rust_binary.deps_mut().insert(format!(":{lib_name}"));
+        if let Some(lib_name) = &linked_lib_name {
+            let lib = if for_tests {
+                test_context_lib(lib_name)
+            } else {
+                lib_name.clone()
+            };
+            rust_binary.deps_mut().insert(format!(":{lib}"));
+        }
+        if for_tests {
+            test_context_rules.insert(buckal_name.clone());
         }
 
         buck_rules.push(Rule::RustBinary(rust_binary));
@@ -156,19 +315,39 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
 
     // emit buck rules for lib targets
     for lib_target in &lib_targets {
-        let buckal_name = if bin_targets.iter().any(|b| b.name == lib_target.name) {
-            format!("{}-lib", lib_target.name)
-        } else {
-            lib_target.name.to_owned()
-        };
+        let buckal_name = lib_rule_name(lib_target);
 
         let rust_library = emit_rust_library(node, lib_target, &manifest_dir, &buckal_name, ctx);
 
         buck_rules.push(Rule::RustLibrary(rust_library));
 
-        if !ctx.repo_config.ignore_tests && lib_target.test {
+        if member && !ctx.repo_config.ignore_tests && lib_target.test {
             // If the library target has inline tests, emit a rust_test rule for it
-            let rust_test = emit_rust_test(node, lib_target, &manifest_dir, "unittest", ctx);
+            let mut rust_test =
+                emit_rust_test(&unit_test_node, lib_target, &manifest_dir, "unittest", ctx);
+            // rustc puts `proc_macro` in the extern prelude only of a crate compiled
+            // as a proc-macro; Cargo passes it to a proc-macro's test harness as well.
+            if lib_target.kind.contains(&TargetKind::ProcMacro) {
+                rust_test.rustc_flags.push("--extern=proc_macro".to_owned());
+            }
+            // A dev-dependency of the package on itself: Cargo links the library,
+            // as the tests build it, into these unit tests under its crate name.
+            if let Some(on) = unit_test_node
+                .platform_features
+                .platforms_with_dep(&node.package_id, EdgeRole::Dev)
+                .filter(|on| !on.is_empty())
+            {
+                let lib = format!(":{}", test_context_lib(&buckal_name));
+                if on == unit_test_node.platform_features.platforms() {
+                    rust_test.deps_mut().insert(lib);
+                } else {
+                    for platform in on {
+                        platform_list_mut(&mut rust_test.platform, platform, "deps")
+                            .insert(lib.clone());
+                    }
+                }
+            }
+            test_context_rules.insert("unittest".to_owned());
 
             buck_rules.push(Rule::RustTest(rust_test));
         }
@@ -184,27 +363,67 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         for test_target in &test_targets {
             let buckal_name = test_target.name.to_owned();
 
-            let mut rust_test = emit_rust_test(node, test_target, &manifest_dir, &buckal_name, ctx);
+            let mut rust_test =
+                emit_rust_test(&test_node, test_target, &manifest_dir, &buckal_name, ctx);
+            test_context_rules.insert(buckal_name.clone());
 
-            let package_name = node.name.replace("-", "_");
-            let mut lib_alias = false;
-            if bin_targets.iter().any(|b| b.name == package_name) {
-                lib_alias = true;
-                rust_test.env_mut().insert(
-                    format!("CARGO_BIN_EXE_{}", package_name),
-                    format!("$(location :{})", package_name),
+            // Cargo gives integration tests `CARGO_BIN_EXE_<name>` for every binary of the
+            // package, named after the binary (hyphens kept). The Buck2 fork's prelude is
+            // the single writer of that environment (compile time and run time); this
+            // only names the binaries.
+            for bin_target in &emitted_bins {
+                rust_test
+                    .cargo_bin_exes
+                    .insert(bin_target.name.clone(), format!(":{}", bin_target.name));
+            }
+
+            // Integration tests may use the package's library under its crate name
+            // (as the tests need it).
+            if let Some(lib_name) = &linked_lib_name {
+                let lib = test_context_lib(lib_name);
+                rust_test.deps_mut().insert(format!(":{lib}"));
+            }
+
+            buck_rules.push(Rule::RustTest(rust_test));
+        }
+    }
+
+    // Cargo also runs the unit tests of each binary target whose `test` is on (the
+    // default) and whose `required-features` the tests' resolution enables: a test
+    // harness over the binary's crate root, compiled in the test context (like the
+    // library's), with the dev-dependencies and the package's library. Cargo gives
+    // it `CARGO_BIN_NAME` but no `CARGO_BIN_EXE_*` (only integration tests and
+    // benches get those).
+    if !ctx.repo_config.ignore_tests {
+        let per_platform = !ctx.repo_config.feature_platforms.is_empty();
+        for bin_target in bin_targets
+            .iter()
+            .filter(|b| b.test && features_enable(&tests, &b.required_features, per_platform))
+        {
+            let buckal_name = bin_unittest_name(&bin_target.name);
+            if buck_rules
+                .iter()
+                .any(|rule| rule.name() == Some(buckal_name.as_str()))
+            {
+                buckal_error!(
+                    "`{}`: the unit tests of binary `{}` would be the rule `{buckal_name}`, which the package already has",
+                    node.name,
+                    bin_target.name
                 );
+                std::process::exit(1);
             }
-            if lib_targets.iter().any(|l| l.name == package_name) {
-                if lib_alias {
-                    rust_test
-                        .deps_mut()
-                        .insert(format!(":{}-lib", package_name));
-                } else {
-                    rust_test.deps_mut().insert(format!(":{}", package_name));
-                }
+            let mut rust_test =
+                emit_rust_test(&test_node, bin_target, &manifest_dir, &buckal_name, ctx);
+            // Cargo sets `CARGO_BIN_NAME` for every compilation of a binary target,
+            // its unit tests included; the rule's name is not the binary's.
+            rust_test
+                .env
+                .insert("CARGO_BIN_NAME".to_owned(), bin_target.name.clone());
+            if let Some(lib_name) = &linked_lib_name {
+                let lib = test_context_lib(lib_name);
+                rust_test.deps_mut().insert(format!(":{lib}"));
             }
-
+            test_context_rules.insert(buckal_name);
             buck_rules.push(Rule::RustTest(rust_test));
         }
     }
@@ -216,10 +435,30 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         .find(|t| t.kind.contains(&TargetKind::CustomBuild));
 
     if let Some(build_target) = custom_build_target {
-        // Patch the rust_library and rust_binary rules to support build scripts
+        // Patch the rust_library and rust_binary rules to support build scripts; rules
+        // in the test context use the test variant's, whose features are the tests'.
+        let test_build = test_variant_build_target(build_target);
+        // A host-only library's unit tests are a host compilation of the tests: they
+        // use the test host variant's build script where there is one.
+        let unit_test_build = (node.platform_features.host_context
+            && node.platform_features.test_host_variant.is_some())
+        .then(|| test_host_variant_build_target(build_target));
         for rule in &mut buck_rules {
+            let for_tests = has_test_variant
+                && rule
+                    .name()
+                    .is_some_and(|name| test_context_rules.contains(name));
+            let unit_test_host = unit_test_build
+                .as_ref()
+                .filter(|_| rule.name() == Some("unittest"));
             if let Some(rust_rule) = rule.as_rust_rule_mut() {
-                patch_with_buildscript(rust_rule, build_target);
+                if let Some(build) = unit_test_host {
+                    patch_with_buildscript(rust_rule, build);
+                } else if for_tests {
+                    patch_with_buildscript(rust_rule, &test_build);
+                } else {
+                    patch_with_buildscript(rust_rule, build_target);
+                }
             }
         }
 
@@ -232,7 +471,961 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         buck_rules.push(Rule::BuildscriptRun(buildscript_run));
     }
 
+    if let (Some(lib_target), Some(lib_name)) = (lib_targets.first(), &lib_buck_name) {
+        buck_rules.extend(host_variant_rules(
+            node,
+            lib_target,
+            lib_name,
+            &manifest_dir,
+            ctx,
+        ));
+        buck_rules.extend(test_variant_rules(
+            node,
+            lib_target,
+            lib_name,
+            &manifest_dir,
+            ctx,
+        ));
+        buck_rules.extend(test_host_variant_rules(
+            node,
+            lib_target,
+            lib_name,
+            &manifest_dir,
+            ctx,
+        ));
+        buck_rules.extend(wasm_variant_rules(
+            node,
+            lib_target,
+            lib_name,
+            &manifest_dir,
+            ctx,
+        ));
+    }
+
+    apply_fixups(&mut buck_rules, node, ctx);
+    if let Err(error) = apply_declared_test_env(&mut buck_rules, node, ctx) {
+        buckal_error!("{:#}", error);
+        std::process::exit(1);
+    }
+    match fixup_export_files(node, &buck_rules, ctx) {
+        Ok(exports) => buck_rules.extend(exports.into_iter().map(Rule::ExportFile)),
+        Err(error) => {
+            buckal_error!("{:#}", error);
+            std::process::exit(1);
+        }
+    }
+    if ctx.repo_config.workspace_manifests {
+        export_manifest_to_workspace_root(node, &mut buck_rules, ctx);
+    }
+
     buck_rules
+}
+
+/// The name under which a first-party package exports its `Cargo.toml` for the
+/// workspace-root `workspace_manifests` filegroup.
+pub(super) const MANIFEST_EXPORT: &str = "Cargo.toml";
+
+/// The visibility pattern of the workspace-root package.
+pub(super) fn workspace_root_package(ctx: &BuckalContext) -> String {
+    let root = get_buck2_root().unwrap_or_exit_ctx("failed to get Buck2 root");
+    let package = ctx
+        .workspace_root
+        .strip_prefix(&root)
+        .unwrap_or_exit_ctx("the workspace root is outside the Buck2 project");
+    format!("//{package}:")
+}
+
+/// Export `node`'s `Cargo.toml` to the workspace-root package (for
+/// `workspace_manifests`), unless the package is the root package itself, widening
+/// an `export_files` export of it if there is one.
+fn export_manifest_to_workspace_root(
+    node: &BuckalNode,
+    rules: &mut Vec<Rule>,
+    ctx: &BuckalContext,
+) {
+    if node.manifest_path.parent() == Some(ctx.workspace_root.as_path()) {
+        return;
+    }
+    let root_package = workspace_root_package(ctx);
+    let existing = rules.iter_mut().find_map(|rule| match rule {
+        Rule::ExportFile(export) if export.name == MANIFEST_EXPORT => Some(export),
+        _ => None,
+    });
+    match existing {
+        Some(export) => {
+            if !export.visibility.contains("PUBLIC") {
+                export.visibility.insert(root_package);
+            }
+        }
+        None => rules.push(Rule::ExportFile(ExportFile {
+            name: MANIFEST_EXPORT.to_owned(),
+            src: "Cargo.toml".to_owned(),
+            mode: Some("reference".to_owned()),
+            labels: Default::default(),
+            visibility: Set::from([root_package]),
+        })),
+    }
+}
+
+/// The `export_file` rules of `[fixups.<package>] export_files` for a first-party
+/// package, refusing a path that is not an existing file of the package itself or
+/// whose rule name another rule of the package already has.
+fn fixup_export_files(
+    node: &BuckalNode,
+    rules: &[Rule],
+    ctx: &BuckalContext,
+) -> anyhow::Result<Vec<ExportFile>> {
+    use cargo_metadata::camino::{Utf8Component, Utf8Path};
+
+    let Some(fixup) = ctx.repo_config.fixups.get(&node.name) else {
+        return Ok(Vec::new());
+    };
+    let package_dir = node.manifest_path.parent().expect("manifest has a parent");
+    let mut taken: Set<&str> = rules.iter().filter_map(Rule::name).collect();
+    if ctx.workspace_inherit && node.manifest_path == ctx.workspace_root.join("Cargo.toml") {
+        // The workspace manifest's own `export_file`, added to this package's BUCK.
+        taken.insert("workspace");
+    }
+    let package = &node.name;
+    fixup
+        .export_files
+        .iter()
+        .map(|entry| {
+            let path = entry.path();
+            let relative = Utf8Path::new(path);
+            let plain = !path.is_empty()
+                && relative
+                    .components()
+                    .all(|c| matches!(c, Utf8Component::Normal(_)));
+            if !plain {
+                anyhow::bail!(
+                    "`[fixups.{package}] export_files`: `{path}` is not a relative path inside the package (no `.`, `..` or leading `/`)"
+                );
+            }
+            let file = package_dir.join(relative);
+            if !file.is_file() {
+                anyhow::bail!(
+                    "`[fixups.{package}] export_files`: `{path}` is not an existing file of the package (`{file}`)"
+                );
+            }
+            if let Some(nested) = relative
+                .ancestors()
+                .skip(1)
+                .filter(|dir| !dir.as_str().is_empty())
+                .find(|dir| package_dir.join(dir).join("BUCK").exists())
+            {
+                anyhow::bail!(
+                    "`[fixups.{package}] export_files`: `{path}` is inside the nested Buck package `{nested}`"
+                );
+            }
+            if !taken.insert(path) {
+                anyhow::bail!(
+                    "`[fixups.{package}] export_files`: `{path}` is listed twice or is already the name of a rule in the package's BUCK file"
+                );
+            }
+            Ok(ExportFile {
+                name: path.to_owned(),
+                src: path.to_owned(),
+                mode: Some("reference".to_owned()),
+                labels: Set::from([crate::buck::EXPORT_FILES_LABEL.to_owned()]),
+                visibility: entry.visibility(),
+            })
+        })
+        .collect()
+}
+
+/// The rules of `node`'s host variant, if it has one: its library `<lib_name>-host`
+/// and, with a build script, `build-script-host-build`/`build-script-host-run`,
+/// compiled with Cargo's host-context resolution. Host-context rules of other
+/// packages (build scripts, proc-macros and what they use) depend on it instead of
+/// the target-context library.
+fn host_variant_rules(
+    node: &BuckalNode,
+    lib_target: &BuckalTarget,
+    lib_name: &str,
+    manifest_dir: &Utf8PathBuf,
+    ctx: &BuckalContext,
+) -> Vec<Rule> {
+    let Some(resolution) = node.platform_features.host_variant_resolution() else {
+        return Vec::new();
+    };
+    let host_node = BuckalNode {
+        platform_features: resolution,
+        ..node.clone()
+    };
+    let mut rules = vec![Rule::RustLibrary(emit_rust_library(
+        &host_node,
+        lib_target,
+        manifest_dir,
+        &host_variant_name(lib_name),
+        ctx,
+    ))];
+    let custom_build_target = node
+        .targets
+        .iter()
+        .find(|t| t.kind.contains(&TargetKind::CustomBuild));
+    if let Some(build_target) = custom_build_target {
+        let host_build = host_variant_build_target(build_target);
+        for rule in &mut rules {
+            if let Some(rust_rule) = rule.as_rust_rule_mut() {
+                patch_with_buildscript(rust_rule, &host_build);
+            }
+        }
+        rules.push(Rule::RustBinary(emit_buildscript_build(
+            &host_build,
+            &host_node,
+            manifest_dir,
+            ctx,
+        )));
+        rules.push(Rule::BuildscriptRun(emit_buildscript_run(
+            &host_node,
+            &host_build,
+            ctx,
+        )));
+    }
+    rules
+}
+
+/// Whether `target`'s `required-features` are on in `node`'s resolution (on some
+/// platform; always without per-platform resolution).
+fn has_required_features(node: &BuckalNode, target: &BuckalTarget) -> bool {
+    features_enable(&node.platform_features, &target.required_features, false)
+}
+
+/// The `rust_test` rule of a binary target's unit tests: `<bin>-unittest`.
+pub(super) fn bin_unittest_name(bin: &str) -> String {
+    format!("{bin}-unittest")
+}
+
+/// Whether `required` features are all on in `resolution` (on some platform).
+/// Without per-platform data they are taken to be, unless `per_platform`
+/// resolution is configured: then Cargo builds nothing of the package.
+fn features_enable(
+    resolution: &crate::platform_features::PlatformResolution,
+    required: &[String],
+    per_platform: bool,
+) -> bool {
+    required.is_empty()
+        || resolution.features.is_empty() && !per_platform
+        || resolution
+            .features
+            .values()
+            .any(|on| required.iter().all(|f| on.contains(f)))
+}
+
+/// The rules of `node`'s test variant, if it has one: its library `<lib_name>-test`
+/// and, with a build script, `build-script-test-build`/`build-script-test-run`,
+/// compiled with the tests' resolution. Test-context rules of the package and of
+/// other packages depend on it instead of the library.
+fn test_variant_rules(
+    node: &BuckalNode,
+    lib_target: &BuckalTarget,
+    lib_name: &str,
+    manifest_dir: &Utf8PathBuf,
+    ctx: &BuckalContext,
+) -> Vec<Rule> {
+    let Some(resolution) = node.platform_features.test_variant_resolution() else {
+        return Vec::new();
+    };
+    variant_rules(
+        node,
+        resolution,
+        lib_target,
+        &test_variant_name(lib_name),
+        &test_variant_build_target,
+        manifest_dir,
+        ctx,
+    )
+}
+
+/// The rules of `node`'s test host variant, if it has one: its library
+/// `<lib_name>-test-host` and, with a build script,
+/// `build-script-test-host-build`/`build-script-test-host-run`, compiled with the
+/// tests' host-context resolution. The tests' build scripts and proc-macros (and
+/// what those use) depend on it.
+fn test_host_variant_rules(
+    node: &BuckalNode,
+    lib_target: &BuckalTarget,
+    lib_name: &str,
+    manifest_dir: &Utf8PathBuf,
+    ctx: &BuckalContext,
+) -> Vec<Rule> {
+    let Some(resolution) = node.platform_features.test_host_variant_resolution() else {
+        return Vec::new();
+    };
+    variant_rules(
+        node,
+        resolution,
+        lib_target,
+        &test_host_variant_name(lib_name),
+        &test_host_variant_build_target,
+        manifest_dir,
+        ctx,
+    )
+}
+
+/// The rules of `node`'s wasm variant, if a `[wasm]` module's own graph compiles
+/// it: `<lib_name>-wasm` (and its build script rules) with that graph's
+/// resolution and the module's profile flags, for the wasm32 platform only. The
+/// module itself also gets `configured_alias(name = "lib-wasm-wasm32")`, configured
+/// for `[wasm] platform`, whose `[cdylib]` is the module.
+fn wasm_variant_rules(
+    node: &BuckalNode,
+    lib_target: &BuckalTarget,
+    lib_name: &str,
+    manifest_dir: &Utf8PathBuf,
+    ctx: &BuckalContext,
+) -> Vec<Rule> {
+    use crate::platform_features::{Edges, PlatformResolution};
+    let mut rules = Vec::new();
+    for (module, wasm) in &node.platform_features.wasm_variants {
+        let on = |set: &Set<String>| {
+            std::collections::BTreeMap::from([(wasm.platform.clone(), set.clone())])
+        };
+        let resolution = PlatformResolution {
+            features: on(&wasm.features),
+            deps: Edges {
+                normal: on(&wasm.normal),
+                build: if wasm.build.is_empty() {
+                    Default::default()
+                } else {
+                    on(&wasm.build)
+                },
+                dev: Default::default(),
+            },
+            host_variant_deps: node.platform_features.host_variant_deps.clone(),
+            wasm_rules: Some(module.clone()),
+            ..Default::default()
+        };
+        let name = wasm_variant_name(lib_name, module);
+        let mut variant = variant_rules(
+            node,
+            resolution,
+            lib_target,
+            &name,
+            &|target| wasm_variant_build_target(target, module),
+            manifest_dir,
+            ctx,
+        );
+        if let Some(Rule::RustLibrary(library)) = variant.first_mut() {
+            library.rustc_flags.extend(wasm.rustc_flags.iter().cloned());
+        }
+        if wasm.root
+            && let Some(platform) = &ctx.repo_config.wasm.platform
+        {
+            variant.push(Rule::ConfiguredAlias(crate::buck::ConfiguredAlias {
+                name: crate::wasm::MODULE_ALIAS.to_owned(),
+                actual: format!(":{name}"),
+                platform: platform.clone(),
+                visibility: Set::from(["PUBLIC".to_owned()]),
+            }));
+        }
+        rules.extend(variant);
+    }
+    rules
+}
+
+/// Give every test of `node` the `[package.metadata.buck2.test-env]` variables its
+/// dependency closure declares (the package itself, its dependencies and
+/// dev-dependencies, and their dependencies): `VAR = { wasm = "<module>" }` becomes
+/// `run_env` `VAR = "$(location //<module dir>:lib-wasm-wasm32[cdylib])"`. A module
+/// that `[wasm] packages` does not build, two declarations of one variable with
+/// different modules, and a variable the test's `run_env` already sets are refused.
+fn apply_declared_test_env(
+    rules: &mut [Rule],
+    node: &BuckalNode,
+    ctx: &BuckalContext,
+) -> anyhow::Result<()> {
+    if ctx.declared_test_env.is_empty() || !rules.iter().any(|r| matches!(r, Rule::RustTest(_))) {
+        return Ok(());
+    }
+    let mut reached = std::collections::BTreeSet::from([node.package_id.clone()]);
+    let mut pending: Vec<&cargo_metadata::PackageId> = Vec::new();
+    for (dep, dep_node) in ctx.resolve.deps_of(&node.package_id) {
+        if dep.dep_kinds.iter().any(|k| {
+            matches!(
+                k.kind,
+                cargo_metadata::DependencyKind::Normal
+                    | cargo_metadata::DependencyKind::Development
+            )
+        }) && reached.insert(dep_node.package_id.clone())
+        {
+            pending.push(&dep_node.package_id);
+        }
+    }
+    // Dev edges kept for the tests only (closing a package cycle).
+    if let Some(&idx) = ctx.resolve.index_map.get(&node.package_id) {
+        for (dep_idx, _) in ctx.resolve.test_only_edges.get(&idx).into_iter().flatten() {
+            let dep_node = &ctx.resolve.dag[*dep_idx];
+            if reached.insert(dep_node.package_id.clone()) {
+                pending.push(&dep_node.package_id);
+            }
+        }
+    }
+    while let Some(id) = pending.pop() {
+        for (dep, dep_node) in ctx.resolve.deps_of(id) {
+            if dep
+                .dep_kinds
+                .iter()
+                .any(|k| matches!(k.kind, cargo_metadata::DependencyKind::Normal))
+                && reached.insert(dep_node.package_id.clone())
+            {
+                pending.push(&dep_node.package_id);
+            }
+        }
+    }
+    let tested = &node.name;
+    let mut values: std::collections::BTreeMap<String, (String, String)> = Default::default();
+    for id in &reached {
+        let Some(declared) = ctx.declared_test_env.get(id) else {
+            continue;
+        };
+        let reader = ctx
+            .resolve
+            .nodes()
+            .find(|n| &n.package_id == id)
+            .map_or(id.repr.clone(), |n| n.name.clone());
+        for (variable, module) in declared {
+            let where_ = format!("`{tested}`: `{variable}`, declared by `{reader}`");
+            let Some(dir) = ctx.wasm_modules.get(module) else {
+                anyhow::bail!("{where_}, names `{module}`, which `[wasm] packages` does not build");
+            };
+            let value = format!("$(location //{dir}:{}[cdylib])", crate::wasm::MODULE_ALIAS);
+            match values.get(variable) {
+                Some((other, by)) if *other != value => {
+                    anyhow::bail!("{where_} and by `{by}` with different modules")
+                }
+                Some(_) => {}
+                None => {
+                    values.insert(variable.clone(), (value, reader.clone()));
+                }
+            }
+        }
+    }
+    for rule in rules {
+        let Rule::RustTest(test) = rule else {
+            continue;
+        };
+        for (variable, (value, reader)) in &values {
+            if test.run_env.contains_key(variable) {
+                anyhow::bail!(
+                    "`{tested}` test `{}`: `{variable}`, declared by `{reader}`, is already in its `run_env`",
+                    test.name
+                );
+            }
+            test.run_env.insert(variable.clone(), value.clone());
+        }
+    }
+    Ok(())
+}
+
+/// A variant `name` of `node`'s library compiled with `resolution`, with its own
+/// build script rules (`build_target_of` the package's) if it has a build script.
+fn variant_rules(
+    node: &BuckalNode,
+    resolution: crate::platform_features::PlatformResolution,
+    lib_target: &BuckalTarget,
+    name: &str,
+    build_target_of: &dyn Fn(&BuckalTarget) -> BuckalTarget,
+    manifest_dir: &Utf8PathBuf,
+    ctx: &BuckalContext,
+) -> Vec<Rule> {
+    let variant_node = BuckalNode {
+        platform_features: resolution,
+        ..node.clone()
+    };
+    let mut rules = vec![Rule::RustLibrary(emit_rust_library(
+        &variant_node,
+        lib_target,
+        manifest_dir,
+        name,
+        ctx,
+    ))];
+    let custom_build_target = node
+        .targets
+        .iter()
+        .find(|t| t.kind.contains(&TargetKind::CustomBuild));
+    if let Some(build_target) = custom_build_target {
+        let variant_build = build_target_of(build_target);
+        for rule in &mut rules {
+            if let Some(rust_rule) = rule.as_rust_rule_mut() {
+                patch_with_buildscript(rust_rule, &variant_build);
+            }
+        }
+        rules.push(Rule::RustBinary(emit_buildscript_build(
+            &variant_build,
+            &variant_node,
+            manifest_dir,
+            ctx,
+        )));
+        rules.push(Rule::BuildscriptRun(emit_buildscript_run(
+            &variant_node,
+            &variant_build,
+            ctx,
+        )));
+    }
+    rules
+}
+
+/// Add the repository's `[fixups.<package>]` configuration to the package's rules.
+fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
+    let Some(fixup) = ctx.repo_config.fixups.get(&node.name) else {
+        return;
+    };
+    let mapped = fixup_mapped_srcs(node, fixup).unwrap_or_else(|error| {
+        buckal_error!("{:#}", error);
+        std::process::exit(1);
+    });
+    // A per-test fixup that names no test would silently not apply (with tests
+    // generated at all).
+    let tests: Set<&str> = rules
+        .iter()
+        .filter_map(|rule| match rule {
+            Rule::RustTest(r) => Some(r.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    if let Some(unknown) = fixup
+        .tests
+        .keys()
+        .find(|name| !ctx.repo_config.ignore_tests && !tests.contains(name.as_str()))
+    {
+        buckal_error!(
+            "`[fixups.{}.tests.{unknown}]` names no test of the package (its tests: {})",
+            node.name,
+            tests.iter().join(", ")
+        );
+        std::process::exit(1);
+    }
+    for (test, t) in &fixup.tests {
+        for key in &t.unset_run_env {
+            let why = if !fixup.test_run_env.contains_key(key) {
+                "the package's `test_run_env` does not set it"
+            } else if t.run_env.contains_key(key) {
+                "this test's `run_env` sets it"
+            } else {
+                continue;
+            };
+            buckal_error!(
+                "`[fixups.{}.tests.{test}] unset_run_env`: `{key}`: {why}",
+                node.name
+            );
+            std::process::exit(1);
+        }
+    }
+    if let Err(error) = check_lifted_args(&node.name, fixup) {
+        buckal_error!("{:#}", error);
+        std::process::exit(1);
+    }
+    if let Err(error) = check_buildscript_fixup(&node.name, &fixup.buildscript) {
+        buckal_error!("{:#}", error);
+        std::process::exit(1);
+    }
+    let run = match &fixup.buildscript.run {
+        Some(crate::config::BuildscriptRunEntry::Table(run)) => run.clone(),
+        _ => Default::default(),
+    };
+    let build_scripts = build_script_names(rules);
+    let workspace_inputs = ctx.buildscript_inputs.get(&node.name);
+    if workspace_inputs.is_some() && build_scripts.is_empty() {
+        buckal_error!(
+            "`[fixups.{}.buildscript.run] inputs`: the package has no build script",
+            node.name
+        );
+        std::process::exit(1);
+    }
+    for rule in rules {
+        let sets = fixup_set_contributions(fixup, rule, &build_scripts);
+        let (env, rustc_flags, mapped_srcs) = match rule {
+            Rule::RustLibrary(r) => {
+                r.deps.extend(sets.deps);
+                r.target_compatible_with.extend(sets.target_compatible_with);
+                (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs)
+            }
+            Rule::RustBinary(r) => {
+                r.deps.extend(sets.deps);
+                r.target_compatible_with.extend(sets.target_compatible_with);
+                (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs)
+            }
+            Rule::RustTest(r) => {
+                r.extra_resources
+                    .extend(fixup.test_resources.iter().cloned());
+                r.run_env.extend(fixup.test_run_env.clone());
+                if let Some(remote_execution) = &fixup.test_remote_execution {
+                    r.remote_execution = Some(remote_execution.clone());
+                }
+                if let Some(runtime_tools) = &fixup.test_runtime_tools {
+                    r.runtime_tools = Some(runtime_tools.clone());
+                }
+                r.labels.extend(fixup.test_labels.iter().cloned());
+                r.target_compatible_with.extend(sets.target_compatible_with);
+                r.args.extend(fixup.test_args.iter().cloned());
+                if !fixup.test_compatible_with.is_empty() {
+                    r.target_compatible_with
+                        .any_of
+                        .push(fixup.test_compatible_with.clone());
+                }
+                r.args.lifted.extend(fixup.test_lifted_args.iter().cloned());
+                if let Some(caching) = fixup.test_supports_execution_caching {
+                    r.supports_test_execution_caching = Some(caching);
+                }
+                if let Some(test) = fixup.tests.get(&r.name) {
+                    if let Some(caching) = test.supports_test_execution_caching {
+                        r.supports_test_execution_caching = Some(caching);
+                    }
+                    r.run_env.extend(test.run_env.clone());
+                    for key in &test.unset_run_env {
+                        r.run_env.remove(key);
+                    }
+                    if let Some(runtime_tools) = &test.runtime_tools {
+                        r.runtime_tools =
+                            (!runtime_tools.is_empty()).then(|| runtime_tools.clone());
+                    }
+                    r.labels.extend(test.labels.iter().cloned());
+                    r.args.extend(test.args.iter().cloned());
+                    if !test.compatible_with.is_empty() {
+                        r.target_compatible_with
+                            .any_of
+                            .push(test.compatible_with.clone());
+                    }
+                    r.args.lifted.extend(test.lifted_args.iter().cloned());
+                }
+                (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs)
+            }
+            Rule::BuildscriptRun(r) => {
+                r.env.extend(sets.env);
+                r.target_compatible_with.extend(sets.target_compatible_with);
+                r.rustc_link_lib |= run.rustc_link_lib;
+                r.rustc_link_search |= run.rustc_link_search;
+                if let Some(inputs) = workspace_inputs {
+                    r.package_path = Some(inputs.package_path.clone());
+                    r.workspace_inputs = inputs.inputs.clone();
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        env.extend(sets.env);
+        rustc_flags.extend(fixup.rustc_flags.iter().cloned());
+        mapped_srcs.extend(mapped.clone());
+    }
+}
+
+/// The names of the build-script binaries among `rules` (those a
+/// `buildscript_run` runs).
+pub(crate) fn build_script_names(rules: &[Rule]) -> Set<String> {
+    rules
+        .iter()
+        .filter_map(|rule| match rule {
+            Rule::BuildscriptRun(r) => r.buildscript_rule.strip_prefix(':').map(str::to_owned),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What `fixup` adds to `rule`'s set-valued attributes that `--merge` keeps
+/// (`deps`, `target_compatible_with`, `env`): the library's `extra_deps`, the
+/// build script binary's `buildscript.build.extra_deps`, the tests' package-wide
+/// and per-test `target_compatible_with`, `env` on the Rust rules and
+/// `buildscript_env` on the build script run. `build_scripts` are the names of the
+/// package's build-script binaries.
+pub(crate) fn fixup_set_contributions(
+    fixup: &crate::config::PackageFixup,
+    rule: &Rule,
+    build_scripts: &Set<String>,
+) -> crate::buck::FixupSets {
+    let mut sets = crate::buck::FixupSets::default();
+    match rule {
+        Rule::RustLibrary(_) => {
+            sets.deps.extend(fixup.extra_deps.iter().cloned());
+            sets.target_compatible_with
+                .extend(fixup.target_compatible_with.iter().cloned());
+            sets.env.extend(fixup.env.clone());
+        }
+        Rule::RustBinary(r) => {
+            if build_scripts.contains(&r.name) {
+                sets.deps
+                    .extend(fixup.buildscript.build.extra_deps.iter().cloned());
+            }
+            sets.target_compatible_with
+                .extend(fixup.target_compatible_with.iter().cloned());
+            sets.env.extend(fixup.env.clone());
+        }
+        Rule::RustTest(r) => {
+            sets.target_compatible_with
+                .extend(fixup.test_target_compatible_with.iter().cloned());
+            if let Some(test) = fixup.tests.get(&r.name) {
+                sets.target_compatible_with
+                    .extend(test.target_compatible_with.iter().cloned());
+            }
+            sets.env.extend(fixup.env.clone());
+        }
+        Rule::BuildscriptRun(_) => {
+            sets.target_compatible_with
+                .extend(fixup.target_compatible_with.iter().cloned());
+            sets.env.extend(fixup.buildscript_env.clone());
+        }
+        _ => {}
+    }
+    sets
+}
+
+/// Refuse a lifted-arguments entry without arguments or without a lifting
+/// constraint, which would apply always or never.
+fn check_lifted_args(package: &str, fixup: &crate::config::PackageFixup) -> anyhow::Result<()> {
+    let entries = fixup
+        .test_lifted_args
+        .iter()
+        .map(|lifted| (format!("`[fixups.{package}] test_lifted_args`"), lifted))
+        .chain(fixup.tests.iter().flat_map(|(test, t)| {
+            t.lifted_args.iter().map(move |lifted| {
+                (
+                    format!("`[fixups.{package}.tests.{test}] lifted_args`"),
+                    lifted,
+                )
+            })
+        }));
+    for (key, lifted) in entries {
+        if lifted.args.is_empty() {
+            anyhow::bail!("{key}: an entry has no `args`");
+        }
+        if lifted.lifted_by.is_empty() {
+            anyhow::bail!(
+                "{key}: an entry has no `lifted_by` (use `args` for arguments that always apply)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Refuse what generation cannot honour in `[fixups.<package>.buildscript]`: not
+/// running the build script, and an `extra_srcs` pattern outside the package.
+fn check_buildscript_fixup(
+    package: &str,
+    buildscript: &crate::config::BuildscriptFixup,
+) -> anyhow::Result<()> {
+    if buildscript.run == Some(crate::config::BuildscriptRunEntry::Run(false)) {
+        anyhow::bail!(
+            "`[fixups.{package}] buildscript.run = false`: generation always runs a package's build script"
+        );
+    }
+    for pattern in &buildscript.build.extra_srcs {
+        let path = Utf8Path::new(pattern);
+        let inside = !pattern.is_empty()
+            && path
+                .components()
+                .all(|c| matches!(c, cargo_metadata::camino::Utf8Component::Normal(_)));
+        if !inside {
+            anyhow::bail!(
+                "`[fixups.{package}.buildscript.build] extra_srcs`: `{pattern}` is not a relative pattern inside the package"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Report compile-time includes of a first-party package that its sources do not
+/// provide and that no `mapped_srcs` fixup declares, suggesting the entries that
+/// would declare them.
+fn report_unprovided_includes(node: &BuckalNode, ctx: &BuckalContext) {
+    let package_dir = node.manifest_path.parent().unwrap();
+    let includes = unprovided_includes(package_dir);
+    if includes.is_empty() {
+        return;
+    }
+    let (_, package) = package_location(node).unwrap_or_exit();
+    let root = get_buck2_root().unwrap_or_exit_ctx("failed to get Buck2 root");
+    // A refused fixup is reported when the fixups are applied.
+    let declared: Set<String> = ctx
+        .repo_config
+        .fixups
+        .get(&node.name)
+        .and_then(|fixup| fixup_mapped_srcs(node, fixup).ok())
+        .map(|mapped| mapped.into_values().collect())
+        .unwrap_or_default();
+    let mut suggestions = Vec::new();
+    let mut unreachable = Vec::new();
+    for include in &includes {
+        match repository_path(&package, &include.resolved) {
+            Ok(path) if declared.contains(path.as_str()) => {}
+            Ok(path) => suggestions.push((include, path)),
+            Err(_) => unreachable.push(include),
+        }
+    }
+    let at = |include: &UnprovidedInclude| format!("`{}` in {}", include.written, include.from);
+    if !suggestions.is_empty() {
+        let nested = suggestions
+            .iter()
+            .filter(|(include, _)| include.kind == IncludeGap::NestedPackage)
+            .count();
+        let examples = suggestions
+            .iter()
+            .take(3)
+            .map(|(include, path)| {
+                format!(
+                    "{} as `\"{}\" = \"{}\"`",
+                    at(include),
+                    export_label_hint(&root, path),
+                    include.resolved
+                )
+            })
+            .join(", ");
+        buckal_warn!(
+            "Package `{}` includes {} file(s) that its sources do not contain ({} from nested Buck packages, {} from outside its directory). Declare each with `mapped_srcs` under `[fixups.{}]` in buckal.toml, as a label exporting the file (e.g. through `export_files` of its package) mapped to the path as included, e.g. {}.",
+            node.name,
+            suggestions.len(),
+            nested,
+            suggestions.len() - nested,
+            node.name,
+            examples
+        );
+    }
+    if !unreachable.is_empty() {
+        buckal_warn!(
+            "Package `{}` includes {} file(s) from outside the repository (e.g. {}), which no build input can provide.",
+            node.name,
+            unreachable.len(),
+            unreachable
+                .iter()
+                .take(3)
+                .map(|include| at(include))
+                .join(", ")
+        );
+    }
+}
+
+/// A label that would export the file at repository path `path`: its name relative
+/// to the nearest enclosing Buck package, a directory with a BUCK file or a Cargo
+/// package (whose BUCK file generation writes).
+fn export_label_hint(root: &Utf8Path, path: &Utf8Path) -> String {
+    let owner = path
+        .ancestors()
+        .skip(1)
+        .find(|dir| {
+            let dir = root.join(dir);
+            dir.join("BUCK").exists() || dir.join("Cargo.toml").exists()
+        })
+        .unwrap_or(Utf8Path::new(""));
+    let name = path.strip_prefix(owner).expect("ancestor of the path");
+    format!("//{owner}:{name}")
+}
+
+/// The package's directory and its repository path: the first-party package
+/// directory, or the vendor directory holding a third-party package's BUCK file.
+fn package_location(node: &BuckalNode) -> anyhow::Result<(Utf8PathBuf, Utf8PathBuf)> {
+    let root = get_buck2_root()?;
+    let dir = if matches!(node.kind, NodeKind::FirstParty { .. }) {
+        node.manifest_path
+            .parent()
+            .expect("manifest has a parent")
+            .to_owned()
+    } else {
+        get_vendor_dir(&node.package_id)?
+    };
+    let package = dir
+        .strip_prefix(&root)
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "package `{}` at `{dir}` is outside the repository `{root}`",
+                node.name
+            )
+        })?
+        .to_owned();
+    Ok((dir, package))
+}
+
+/// The package's `[fixups] mapped_srcs` with destinations as repository paths,
+/// refusing a destination that is absolute, leaves the repository, is the package
+/// directory or above it, repeats, or clashes with the package's own sources or another
+/// destination (the same path, or one a directory prefix of the other).
+fn fixup_mapped_srcs(
+    node: &BuckalNode,
+    fixup: &crate::config::PackageFixup,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    if fixup.mapped_srcs.is_empty() {
+        return Ok(Default::default());
+    }
+    let (package_dir, package) = package_location(node)?;
+    repository_mapped_srcs(&node.name, &fixup.mapped_srcs, &package_dir, &package)
+}
+
+/// `mapped_srcs` written relative to the package at `package_dir` (repository path
+/// `package`), with repository-path destinations; see [`fixup_mapped_srcs`].
+fn repository_mapped_srcs(
+    name: &str,
+    written_srcs: &std::collections::BTreeMap<String, String>,
+    package_dir: &Utf8Path,
+    package: &Utf8Path,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let mut mapped = std::collections::BTreeMap::new();
+    let mut destinations: std::collections::BTreeMap<Utf8PathBuf, &str> = Default::default();
+    for (label, written) in written_srcs {
+        let refuse = |why: String| {
+            anyhow::anyhow!("`[fixups.{name}] mapped_srcs`: `{label}` = `{written}`: {why}")
+        };
+        let destination = repository_path(package, written).map_err(refuse)?;
+        // The package's sources sit below its directory: a destination above it
+        // would have to be both a file and a directory of them.
+        if destination != package && package.starts_with(&destination) {
+            return Err(refuse(format!(
+                "`{destination}` is a directory above the package `{package}`, whose sources are below it"
+            )));
+        }
+        if let Ok(own) = destination.strip_prefix(package) {
+            if own.as_str().is_empty() {
+                return Err(refuse(
+                    "the destination is the package directory".to_owned(),
+                ));
+            }
+            // The package glob provides every file outside nested Buck packages:
+            // the destination may be neither such a file, nor a directory holding
+            // them, nor below such a file.
+            let on_disk = package_dir.join(own);
+            let globbed = !in_nested_package(package_dir, own)
+                && !(on_disk.is_dir() && on_disk.join("BUCK").exists());
+            if globbed && on_disk.is_file() {
+                return Err(refuse(format!(
+                    "`{destination}` is a file of the package's own sources"
+                )));
+            }
+            if globbed && on_disk.is_dir() {
+                return Err(refuse(format!(
+                    "`{destination}` is a directory of the package's own sources"
+                )));
+            }
+            if let Some(file) = own
+                .ancestors()
+                .skip(1)
+                .filter(|dir| !dir.as_str().is_empty())
+                .find(|dir| package_dir.join(dir).is_file())
+            {
+                return Err(refuse(format!(
+                    "`{destination}` is below `{package}/{file}`, a file of the package's own sources"
+                )));
+            }
+        }
+        if let Some(other) = destinations.insert(destination.clone(), label) {
+            return Err(refuse(format!(
+                "`{destination}` is also the destination of `{other}`"
+            )));
+        }
+        mapped.insert(label.clone(), destination.to_string());
+    }
+    // A destination that is a directory prefix of another would need to be both a
+    // file and a directory.
+    for (destination, label) in &destinations {
+        if let Some((prefix, prefix_label)) = destination
+            .ancestors()
+            .skip(1)
+            .find_map(|dir| destinations.get_key_value(dir))
+        {
+            anyhow::bail!(
+                "`[fixups.{name}] mapped_srcs`: `{label}` = `{}`: `{destination}` is below `{prefix}`, the destination of `{prefix_label}`",
+                written_srcs[*label]
+            );
+        }
+    }
+    Ok(mapped)
 }
 
 /// Vendors the package sources to `third-party` and returns the path.
@@ -248,6 +1441,30 @@ pub fn vendor_package(node: &BuckalNode) -> Utf8PathBuf {
 
 /// Generate the content of the BUCK file based on the given rules, including conditional load statements for used rule types.
 pub fn gen_buck_content(rules: &[Rule]) -> String {
+    render_buck_content(rules, &[], &[], GENERATED_HEADER)
+}
+
+/// [`gen_buck_content`], keeping hand-written `loads` (after the generated ones) and
+/// `statements` (after the generated rules) of the file it replaces, verbatim.
+pub fn gen_buck_content_preserving(
+    rules: &[Rule],
+    preserved_loads: &[String],
+    preserved_statements: &[String],
+) -> String {
+    render_buck_content(
+        rules,
+        preserved_loads,
+        preserved_statements,
+        PARTLY_GENERATED_HEADER,
+    )
+}
+
+fn render_buck_content(
+    rules: &[Rule],
+    preserved_loads: &[String],
+    preserved_statements: &[String],
+    header: &str,
+) -> String {
     // Analyze which rule types are present to build conditional load statements
     let mut has_cargo_manifest = false;
     let mut has_rust_library = false;
@@ -305,17 +1522,28 @@ pub fn gen_buck_content(rules: &[Rule]) -> String {
         .map(|r| r.unwrap())
         .join("\n");
 
-    if !loads.is_empty() {
-        let loads_string = loads
+    for statement in preserved_statements {
+        content.push('\n');
+        content.push_str(statement);
+        content.push('\n');
+    }
+
+    if !loads.is_empty() || !preserved_loads.is_empty() {
+        let mut loads_string = loads
             .iter()
             .map(serde_starlark::to_string)
             .map(|r| r.unwrap())
             .join("");
+        for load in preserved_loads {
+            loads_string.push_str(load);
+            loads_string.push('\n');
+        }
         content.insert(0, '\n');
         content.insert_str(0, &loads_string);
     }
 
-    content.insert_str(0, "# @generated by `cargo buckal`\n\n");
+    content.insert_str(0, "\n\n");
+    content.insert_str(0, header);
 
     content
 }
@@ -333,8 +1561,9 @@ mod tests {
         BuckalTarget {
             name: name.to_string(),
             kind: vec![kind],
-            src_path: Utf8PathBuf::from("/tmp/dummy.rs"),
+            src_path: Utf8PathBuf::from("/nonexistent-buckal-test-package/dummy.rs"),
             doctest: true,
+            required_features: Vec::new(),
             test: true,
         }
     }
@@ -347,11 +1576,12 @@ mod tests {
             name: name.to_string(),
             version: "0.1.0".to_string(),
             features: vec![],
+            platform_features: Default::default(),
             kind: NodeKind::FirstParty {
                 relative_path: "".to_string(),
             },
             edition: Edition::E2021,
-            manifest_path: Utf8PathBuf::from("/tmp/Cargo.toml"),
+            manifest_path: Utf8PathBuf::from("/nonexistent-buckal-test-package/Cargo.toml"),
             targets,
             source: None,
             links: None,
@@ -361,6 +1591,7 @@ mod tests {
 
     fn empty_resolve() -> BuckalResolve {
         BuckalResolve {
+            test_only_edges: Default::default(),
             dag: Dag::new(),
             index_map: HashMap::new(),
         }
@@ -374,6 +1605,12 @@ mod tests {
         let node = mock_node("foo", vec![lib, bin]);
 
         let ctx = BuckalContext {
+            workspace_members: None,
+            host_platform_differences: None,
+            host_platform_difference_digests: None,
+            buildscript_inputs: Default::default(),
+            wasm_modules: Default::default(),
+            declared_test_env: Default::default(),
             root: None,
             resolve: empty_resolve(),
             repo_config: RepoConfig {
@@ -408,6 +1645,12 @@ mod tests {
         let node = mock_node("foo", vec![lib, bin, test]);
 
         let ctx = BuckalContext {
+            workspace_members: None,
+            host_platform_differences: None,
+            host_platform_difference_digests: None,
+            buildscript_inputs: Default::default(),
+            wasm_modules: Default::default(),
+            declared_test_env: Default::default(),
             root: None,
             resolve: empty_resolve(),
             repo_config: RepoConfig {
@@ -436,5 +1679,794 @@ mod tests {
         assert!(test_rule.is_some());
         let test_rule = test_rule.unwrap();
         assert!(test_rule.deps.contains(":foo-lib"));
+    }
+
+    fn test_ctx() -> BuckalContext {
+        BuckalContext {
+            workspace_members: None,
+            host_platform_differences: None,
+            host_platform_difference_digests: None,
+            buildscript_inputs: Default::default(),
+            wasm_modules: Default::default(),
+            declared_test_env: Default::default(),
+            root: None,
+            resolve: empty_resolve(),
+            repo_config: RepoConfig {
+                ignore_tests: false,
+                ..RepoConfig::default()
+            },
+            workspace_root: Utf8PathBuf::from("/tmp"),
+            workspace_inherit: false,
+            no_merge: false,
+        }
+    }
+
+    fn find_test<'a>(rules: &'a [Rule], name: &str) -> &'a crate::buck::RustTest {
+        rules
+            .iter()
+            .find_map(|r| match r {
+                Rule::RustTest(t) if t.name == name => Some(t),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no rust_test named {name}"))
+    }
+
+    #[test]
+    fn test_integration_test_names_binaries_and_gets_no_path_env() {
+        // Package `my-tool` whose binaries are not named after the package
+        // (as in a package `observatory_db_feedback_cli` with binary `observatory-feedback`).
+        let lib = mock_target("my_tool", TargetKind::Lib);
+        let bin_a = mock_target("my-cli", TargetKind::Bin);
+        let bin_b = mock_target("helper", TargetKind::Bin);
+        let test = mock_target("cli", TargetKind::Test);
+
+        let node = mock_node("my-tool", vec![lib, bin_a, bin_b, test]);
+        let rules = buckify_root_node(&node, &test_ctx());
+
+        let test_rule = find_test(&rules, "cli");
+        assert!(test_rule.deps.contains(":my_tool"));
+        // The binaries are named for the prelude, which writes CARGO_BIN_EXE_*.
+        assert_eq!(
+            test_rule.cargo_bin_exes,
+            [
+                ("helper".to_owned(), ":helper".to_owned()),
+                ("my-cli".to_owned(), ":my-cli".to_owned()),
+            ]
+            .into()
+        );
+        assert!(
+            !test_rule
+                .env
+                .keys()
+                .any(|k| k.starts_with("CARGO_BIN_EXE_"))
+        );
+        assert!(test_rule.run_env.is_empty());
+        let content = gen_buck_content(&rules);
+        assert!(
+            content.contains("    cargo_bin_exes = {\n        \"helper\": \":helper\",\n        \"my-cli\": \":my-cli\",\n    },\n"),
+            "{content}"
+        );
+
+        // Cargo sets CARGO_BIN_EXE_* for integration tests (and benches) only.
+        let unit = find_test(&rules, "unittest");
+        assert!(unit.cargo_bin_exes.is_empty());
+        assert!(!unit.env.keys().any(|k| k.starts_with("CARGO_BIN_EXE_")));
+    }
+
+    #[test]
+    fn test_buckify_git_dep_in_repository_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let write = |rel: &str, content: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        };
+        write(".cargo-ok", "");
+        write("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+        write(
+            "crates/rig-core/Cargo.toml",
+            "[package]\nname = \"rig-core\"\n",
+        );
+        write("crates/rig-core/src/lib.rs", "");
+        write("crates/rig-core/build.rs", "fn main() {}");
+
+        let rev = "6871da91c889479c679951aad12d5f367152b01a";
+        let manifest_dir = root.join("crates/rig-core");
+        let target = |name: &str, kind: TargetKind, file: &str| BuckalTarget {
+            name: name.to_owned(),
+            kind: vec![kind],
+            src_path: manifest_dir.join(file),
+            doctest: true,
+            required_features: Vec::new(),
+            test: true,
+        };
+        let node = BuckalNode {
+            package_id: PackageId {
+                repr: format!(
+                    "git+https://github.com/emchristiansen/rig?rev={rev}#rig-core@0.42.0"
+                ),
+            },
+            name: "rig-core".to_owned(),
+            version: "0.42.0".to_owned(),
+            features: vec![],
+            platform_features: Default::default(),
+            kind: NodeKind::ThirdParty,
+            edition: Edition::E2021,
+            manifest_path: manifest_dir.join("Cargo.toml"),
+            targets: vec![
+                target("rig_core", TargetKind::Lib, "src/lib.rs"),
+                target("build-script-build", TargetKind::CustomBuild, "build.rs"),
+            ],
+            source: Some(format!(
+                "git+https://github.com/emchristiansen/rig?rev={rev}#{rev}"
+            )),
+            links: None,
+            checksum: None,
+        };
+
+        let rules = buckify_dep_node(&node, &test_ctx());
+
+        let git_fetch = rules
+            .iter()
+            .find_map(|r| match r {
+                Rule::GitFetch(g) => Some(g),
+                _ => None,
+            })
+            .expect("git_fetch");
+        assert_eq!(git_fetch.name, "vendor");
+        assert_eq!(git_fetch.repo, "https://github.com/emchristiansen/rig");
+        assert_eq!(git_fetch.rev, rev);
+        assert_eq!(
+            git_fetch.sub_targets,
+            Set::from(["Cargo.toml".to_owned(), "crates/rig-core".to_owned()])
+        );
+
+        for rule in &rules {
+            match rule {
+                Rule::CargoManifest(m) => {
+                    assert_eq!(m.vendor, ":vendor[crates/rig-core]");
+                    assert_eq!(m.workspace.as_deref(), Some(":vendor[Cargo.toml]"));
+                }
+                Rule::RustLibrary(l) => {
+                    assert_eq!(
+                        l.srcs,
+                        Set::from([":vendor[crates/rig-core]".to_owned()]).into()
+                    );
+                    assert_eq!(l.crate_root, "vendor/crates/rig-core/src/lib.rs");
+                }
+                Rule::RustBinary(b) => {
+                    assert_eq!(
+                        b.srcs,
+                        Set::from([":vendor[crates/rig-core]".to_owned()]).into()
+                    );
+                    assert_eq!(b.crate_root, "vendor/crates/rig-core/build.rs");
+                }
+                Rule::BuildscriptRun(r) => {
+                    assert_eq!(r.manifest_dir, ":vendor[crates/rig-core]");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_fixups_reach_buildscript_run_and_crate_rules() {
+        let manifest_dir = Utf8PathBuf::from("/registry/openssl-sys-0.9.117");
+        let target = |name: &str, kind: TargetKind, file: &str| BuckalTarget {
+            name: name.to_owned(),
+            kind: vec![kind],
+            src_path: manifest_dir.join(file),
+            doctest: true,
+            required_features: Vec::new(),
+            test: true,
+        };
+        let node = BuckalNode {
+            package_id: PackageId {
+                repr: "registry+https://github.com/rust-lang/crates.io-index#openssl-sys@0.9.117"
+                    .to_owned(),
+            },
+            name: "openssl-sys".to_owned(),
+            version: "0.9.117".to_owned(),
+            features: vec![],
+            platform_features: Default::default(),
+            kind: NodeKind::ThirdParty,
+            edition: Edition::E2021,
+            manifest_path: manifest_dir.join("Cargo.toml"),
+            targets: vec![
+                target("openssl_sys", TargetKind::Lib, "src/lib.rs"),
+                target(
+                    "build-script-main",
+                    TargetKind::CustomBuild,
+                    "build/main.rs",
+                ),
+            ],
+            source: Some("registry+https://github.com/rust-lang/crates.io-index".to_owned()),
+            links: Some("openssl".to_owned()),
+            checksum: Some("0".repeat(64)),
+        };
+
+        let mut ctx = test_ctx();
+        ctx.repo_config.fixups.insert(
+            "openssl-sys".to_owned(),
+            crate::config::PackageFixup {
+                buildscript_env: [
+                    ("OPENSSL_NO_VENDOR".to_owned(), "1".to_owned()),
+                    ("OPENSSL_LIB_DIR".to_owned(), "/opt/openssl/lib".to_owned()),
+                ]
+                .into(),
+                env: Default::default(),
+                rustc_flags: vec!["-Lnative=/opt/openssl/lib".to_owned()],
+                mapped_srcs: Default::default(),
+                test_resources: Default::default(),
+                test_remote_execution: None,
+                test_run_env: Default::default(),
+                test_runtime_tools: None,
+                export_files: Default::default(),
+                test_labels: Default::default(),
+                test_target_compatible_with: Default::default(),
+                test_compatible_with: Default::default(),
+                test_lifted_args: Default::default(),
+                test_supports_execution_caching: None,
+                test_args: Default::default(),
+                tests: Default::default(),
+                target_compatible_with: Default::default(),
+                extra_deps: Default::default(),
+                buildscript: Default::default(),
+            },
+        );
+
+        let rules = buckify_dep_node(&node, &ctx);
+
+        let run = rules
+            .iter()
+            .find_map(|r| match r {
+                Rule::BuildscriptRun(r) => Some(r),
+                _ => None,
+            })
+            .expect("buildscript_run");
+        assert_eq!(
+            run.env.get("OPENSSL_NO_VENDOR").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            run.env.get("OPENSSL_LIB_DIR").map(String::as_str),
+            Some("/opt/openssl/lib")
+        );
+
+        let lib = rules
+            .iter()
+            .find_map(|r| match r {
+                Rule::RustLibrary(l) => Some(l),
+                _ => None,
+            })
+            .expect("rust_library");
+        assert!(
+            lib.rustc_flags
+                .contains(&"-Lnative=/opt/openssl/lib".to_owned())
+        );
+        // The generated flags are kept.
+        assert!(
+            lib.rustc_flags
+                .contains(&"@$(location :manifest[env_flags])".to_owned())
+        );
+
+        // Other packages are untouched.
+        let mut other = node.clone();
+        other.name = "libc".to_owned();
+        let other_rules = buckify_dep_node(&other, &ctx);
+        for rule in &other_rules {
+            if let Rule::BuildscriptRun(r) = rule {
+                assert!(r.env.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn test_fixup_rustc_flags_keep_order_and_repeats() {
+        let lib = mock_target("sdk", TargetKind::Lib);
+        let build = mock_target("build-script-build", TargetKind::CustomBuild);
+        let node = mock_node("sdk", vec![lib, build]);
+        let flags: Vec<String> = ["-C", "opt-level=2", "-C", "debuginfo=1"]
+            .map(str::to_owned)
+            .into();
+        let mut ctx = test_ctx();
+        ctx.repo_config.fixups.insert(
+            "sdk".to_owned(),
+            crate::config::PackageFixup {
+                rustc_flags: flags.clone(),
+                ..Default::default()
+            },
+        );
+
+        let rules = buckify_root_node(&node, &ctx);
+        let lib = rules
+            .iter()
+            .find_map(|r| match r {
+                Rule::RustLibrary(l) => Some(l),
+                _ => None,
+            })
+            .expect("rust_library");
+        let mut expected = vec![
+            "@$(location :build-script-run[rustc_flags])".to_owned(),
+            "@$(location :manifest[env_flags])".to_owned(),
+        ];
+        expected.extend(flags.iter().cloned());
+        assert_eq!(lib.rustc_flags, expected);
+
+        // Serialized in that order, with both `-C`.
+        let content = gen_buck_content(&rules);
+        assert!(
+            content.contains(
+                "        \"-C\",\n        \"opt-level=2\",\n        \"-C\",\n        \"debuginfo=1\",\n"
+            ),
+            "{content}"
+        );
+
+        // Read back from the BUCK file in the same order, and a merge with the existing
+        // file neither drops nor duplicates arguments.
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("BUCK")).unwrap();
+        std::fs::write(&path, &content).unwrap();
+        let existing = crate::buck::parse_buck_file(&path).unwrap();
+        let parsed = existing
+            .values()
+            .find_map(|r| match r {
+                Rule::RustLibrary(l) if l.name == "sdk" => Some(l),
+                _ => None,
+            })
+            .expect("parsed rust_library");
+        assert_eq!(parsed.rustc_flags, expected);
+        let mut regenerated = rules.clone();
+        crate::buck::patch_buck_rules(
+            &existing,
+            &mut regenerated,
+            &Set::from(["rustc_flags".to_owned()]),
+            crate::buck::FixupFlags::default(),
+            None,
+        );
+        assert_eq!(gen_buck_content(&regenerated), content);
+    }
+
+    #[test]
+    fn test_fixup_test_resources_reach_tests_only() {
+        let (_dir, node) = first_party_package("conta/wire", &["src/lib.rs", "tests/wire.rs"]);
+        let mut ctx = test_ctx();
+        let label = "//conta/wire/src/generated:files".to_owned();
+        ctx.repo_config.fixups.insert(
+            node.name.clone(),
+            crate::config::PackageFixup {
+                test_resources: vec![label.clone()],
+                ..Default::default()
+            },
+        );
+        let rules = buckify_root_node(&node, &ctx);
+        for test in ["unittest", "wire"] {
+            let t = find_test(&rules, test);
+            assert_eq!(t.extra_resources, Set::from([label.clone()]));
+            // The package's own files stay declared.
+            assert!(t.resources.is_some());
+        }
+        let content = gen_buck_content(&rules);
+        assert!(
+            content.contains("    extra_resources = [\"//conta/wire/src/generated:files\"],\n"),
+            "{content}"
+        );
+        assert_eq!(content.matches("extra_resources").count(), 2, "{content}");
+    }
+
+    #[test]
+    fn test_fixup_test_execution_reaches_every_test_and_nothing_else() {
+        let (_dir, mut node) = first_party_package("pkg", &["src/lib.rs", "tests/wire.rs"]);
+        node.targets.push(BuckalTarget {
+            name: "tool".to_owned(),
+            kind: vec![TargetKind::Bin],
+            src_path: node.manifest_path.parent().unwrap().join("src/main.rs"),
+            doctest: false,
+            required_features: Vec::new(),
+            test: false,
+        });
+        let mut ctx = test_ctx();
+        let plain = gen_buck_content(&buckify_root_node(&node, &ctx));
+        assert!(!plain.contains("remote_execution"), "{plain}");
+        assert!(!plain.contains("run_env"), "{plain}");
+
+        ctx.repo_config.fixups.insert(
+            node.name.clone(),
+            crate::config::PackageFixup {
+                test_remote_execution: Some("fixture_fs_profile".to_owned()),
+                test_run_env: [("FIXTURE_ROOT".to_owned(), "/srv/fixtures".to_owned())].into(),
+                ..Default::default()
+            },
+        );
+        let rules = buckify_root_node(&node, &ctx);
+        for test in ["unittest", "wire"] {
+            let t = find_test(&rules, test);
+            assert_eq!(t.remote_execution.as_deref(), Some("fixture_fs_profile"));
+            assert_eq!(
+                t.run_env,
+                [("FIXTURE_ROOT".to_owned(), "/srv/fixtures".to_owned())].into()
+            );
+            // Compile-time env is untouched: run_env is for running only.
+            assert!(!t.env.contains_key("FIXTURE_ROOT"));
+        }
+        let content = gen_buck_content(&rules);
+        assert!(
+            content.contains("    remote_execution = \"fixture_fs_profile\",\n"),
+            "{content}"
+        );
+        assert!(
+            content.contains(
+                "    run_env = {\n        \"FIXTURE_ROOT\": \"/srv/fixtures\",\n    },\n"
+            ),
+            "{content}"
+        );
+        // Only the two tests carry them; the library and the binary do not.
+        assert_eq!(content.matches("remote_execution").count(), 2, "{content}");
+        assert_eq!(content.matches("run_env").count(), 2, "{content}");
+        // Everything else is as without the fixup.
+        let stripped = content
+            .replace("    remote_execution = \"fixture_fs_profile\",\n", "")
+            .replace(
+                "    run_env = {\n        \"FIXTURE_ROOT\": \"/srv/fixtures\",\n    },\n",
+                "",
+            );
+        assert_eq!(stripped, plain);
+    }
+
+    #[test]
+    fn test_per_platform_features_emit_platform_attribute() {
+        let lib = mock_target("sdk", TargetKind::Lib);
+        let mut node = mock_node("sdk", vec![lib]);
+        // What `cargo metadata` reports: the union, including the wasm-only feature.
+        node.features = vec!["browser".to_owned(), "default".to_owned()];
+        node.platform_features = crate::platform_features::PlatformResolution {
+            features: [
+                ("linux-x86_64".to_owned(), Set::from(["default".to_owned()])),
+                (
+                    "wasm32".to_owned(),
+                    Set::from(["browser".to_owned(), "default".to_owned()]),
+                ),
+            ]
+            .into(),
+            ..Default::default()
+        };
+
+        let rules = buckify_root_node(&node, &test_ctx());
+        let lib_rule = rules
+            .iter()
+            .find_map(|r| match r {
+                Rule::RustLibrary(l) => Some(l),
+                _ => None,
+            })
+            .expect("rust_library");
+        assert_eq!(lib_rule.features, Set::from(["default".to_owned()]));
+        assert_eq!(
+            lib_rule.platform["wasm32"]["features"].as_list(),
+            Some(&Set::from(["browser".to_owned()]))
+        );
+        assert!(!lib_rule.platform.contains_key("linux-x86_64"));
+
+        let unit = find_test(&rules, "unittest");
+        assert_eq!(unit.features, Set::from(["default".to_owned()]));
+
+        let content = gen_buck_content(&rules);
+        assert!(
+            content.contains("    platform = {\n        \"wasm32\": {\n            \"features\": [\"browser\"],\n        },\n    },\n"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn test_without_per_platform_features_output_is_unchanged() {
+        let lib = mock_target("sdk", TargetKind::Lib);
+        let mut node = mock_node("sdk", vec![lib]);
+        node.features = vec!["browser".to_owned(), "default".to_owned()];
+
+        let rules = buckify_root_node(&node, &test_ctx());
+        let content = gen_buck_content(&rules);
+        assert!(!content.contains("platform = "), "{content}");
+        assert!(content.contains("\"browser\""), "{content}");
+    }
+
+    fn first_party_package(relative_path: &str, files: &[&str]) -> (tempfile::TempDir, BuckalNode) {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = Utf8PathBuf::from_path_buf(dir.path().join(relative_path)).unwrap();
+        for file in files {
+            let path = pkg.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let target = |name: &str, kind: TargetKind, file: &str| BuckalTarget {
+            name: name.to_owned(),
+            kind: vec![kind],
+            src_path: pkg.join(file),
+            doctest: true,
+            required_features: Vec::new(),
+            test: true,
+        };
+        let mut node = mock_node(
+            "conta-wire",
+            vec![
+                target("conta_wire", TargetKind::Lib, "src/lib.rs"),
+                target("wire", TargetKind::Test, "tests/wire.rs"),
+            ],
+        );
+        node.kind = NodeKind::FirstParty {
+            relative_path: relative_path.to_owned(),
+        };
+        node.manifest_path = pkg.join("Cargo.toml");
+        (dir, node)
+    }
+
+    #[test]
+    fn test_first_party_sources_compile_at_their_checkout_paths() {
+        let (_dir, node) = first_party_package(
+            "conta/wire",
+            &[
+                "src/lib.rs",
+                "tests/wire.rs",
+                "testdata/snapshots/a__b.snap",
+            ],
+        );
+        let rules = buckify_root_node(&node, &test_ctx());
+        let content = gen_buck_content(&rules);
+
+        let lib = rules
+            .iter()
+            .find_map(|r| match r {
+                Rule::RustLibrary(l) => Some(l),
+                _ => None,
+            })
+            .expect("rust_library");
+        // file!() becomes `conta/wire/src/lib.rs`: the prelude places the sources at
+        // their repository paths and remaps the sources directory away.
+        assert_eq!(lib.crate_root, "src/lib.rs");
+        assert!(
+            content.contains("    srcs = glob([\"**/**\"]),\n"),
+            "{content}"
+        );
+        assert!(!content.contains("crate_root = \"vendor/"), "{content}");
+
+        // cargo_manifest still reads the vendor filegroup.
+        assert!(content.contains("    vendor = \":vendor\",\n"), "{content}");
+
+        for test in ["unittest", "wire"] {
+            let t = find_test(&rules, test);
+            // The runtime CARGO_MANIFEST_DIR is the prelude's to write.
+            assert!(t.run_env.is_empty());
+            assert_eq!(
+                t.resources.as_ref().map(|g| g.include.clone()),
+                Some(Set::from(["**/**".to_owned()]))
+            );
+        }
+        assert_eq!(find_test(&rules, "wire").crate_root, "tests/wire.rs");
+        assert!(
+            content.contains("    resources = glob([\"**/**\"]),\n"),
+            "{content}"
+        );
+        assert!(!content.contains("run_env"), "{content}");
+    }
+
+    #[test]
+    fn test_test_resources_do_not_depend_on_existing_files() {
+        // No snapshot or data file yet: the tests still declare the package's files,
+        // so the first snapshot (or a source file a test reads, e.g. `src/generated`)
+        // is an input without regenerating the BUCK file.
+        let (_dir, node) =
+            first_party_package("conta/inspect/render", &["src/lib.rs", "tests/wire.rs"]);
+        let rules = buckify_root_node(&node, &test_ctx());
+        let before = gen_buck_content(&rules);
+        for test in ["unittest", "wire"] {
+            assert_eq!(
+                find_test(&rules, test)
+                    .resources
+                    .as_ref()
+                    .map(|g| g.include.clone()),
+                Some(Set::from(["**/**".to_owned()]))
+            );
+        }
+        let pkg = node.manifest_path.parent().unwrap().to_owned();
+        std::fs::create_dir_all(pkg.join("src/snapshots")).unwrap();
+        std::fs::write(pkg.join("src/snapshots/x.snap"), "").unwrap();
+        assert_eq!(
+            gen_buck_content(&buckify_root_node(&node, &test_ctx())),
+            before
+        );
+    }
+
+    #[test]
+    fn test_includes_declared_through_repository_mapped_srcs() {
+        // As text/glyph_vocab: `src/internal.rs` includes `../vocab/bpe-52.toml`, and
+        // `vocab/` is its own Buck package that exports the file; `src/types.rs`
+        // includes a file of another package through `../`.
+        let (_dir, node) = first_party_package(
+            "text/glyph_vocab",
+            &[
+                "src/lib.rs",
+                "tests/wire.rs",
+                "vocab/BUCK",
+                "vocab/bpe-52.toml",
+            ],
+        );
+        let pkg = node.manifest_path.parent().unwrap().to_owned();
+        std::fs::write(
+            pkg.join("src/internal.rs"),
+            "pub const A: &str = include_str!(\"../vocab/bpe-52.toml\");",
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("src/types.rs"),
+            "include!(\"../../../callosum/client/src/types/e.rs\");",
+        )
+        .unwrap();
+        assert_eq!(
+            super::super::includes::unprovided_includes(&pkg)
+                .into_iter()
+                .map(|i| (i.resolved, i.kind))
+                .collect::<Vec<_>>(),
+            vec![
+                ("vocab/bpe-52.toml".to_owned(), IncludeGap::NestedPackage),
+                (
+                    "../../callosum/client/src/types/e.rs".to_owned(),
+                    IncludeGap::OutsidePackage
+                ),
+            ]
+        );
+
+        let package = Utf8Path::new("text/glyph_vocab");
+        let written = |entries: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+            entries
+                .iter()
+                .map(|(label, path)| (label.to_string(), path.to_string()))
+                .collect()
+        };
+        let declared = written(&[
+            (
+                "//text/glyph_vocab/vocab:compiler_input/bpe-52.toml",
+                "vocab/bpe-52.toml",
+            ),
+            (
+                "//callosum/client:src/types/e.rs",
+                "../../callosum/client/src/types/e.rs",
+            ),
+        ]);
+        assert_eq!(
+            repository_mapped_srcs("text_glyph_vocab", &declared, &pkg, package).unwrap(),
+            written(&[
+                (
+                    "//text/glyph_vocab/vocab:compiler_input/bpe-52.toml",
+                    "text/glyph_vocab/vocab/bpe-52.toml",
+                ),
+                (
+                    "//callosum/client:src/types/e.rs",
+                    "callosum/client/src/types/e.rs",
+                ),
+            ])
+        );
+
+        for (refused, why) in [
+            (written(&[("//x:a", "/abs/a.rs")]), "is not a relative path"),
+            (
+                written(&[("//x:a", "../../../a.rs")]),
+                "leaves the repository",
+            ),
+            (written(&[("//x:a", ".")]), "is the package directory"),
+            (
+                written(&[("//x:a", "..")]),
+                "`text` is a directory above the package `text/glyph_vocab`",
+            ),
+            (written(&[("//x:a", "src/lib.rs")]), "own sources"),
+            (
+                written(&[("//x:a", "src")]),
+                "is a directory of the package's own sources",
+            ),
+            (
+                written(&[("//x:a", "src/lib.rs/x.rs")]),
+                "a file of the package's own sources",
+            ),
+            (
+                written(&[("//x:a", "../x/a.rs"), ("//x:b", "../x/./a.rs")]),
+                "is also the destination of `//x:a`",
+            ),
+            (
+                written(&[("//x:a", "../x/a"), ("//x:b", "../x/a/b.rs")]),
+                "`text/x/a/b.rs` is below `text/x/a`, the destination of `//x:a`",
+            ),
+        ] {
+            let error = repository_mapped_srcs("text_glyph_vocab", &refused, &pkg, package)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.starts_with("`[fixups.text_glyph_vocab] mapped_srcs`: `//x:")
+                    && error.contains(why),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_host_variant_emits_host_rules() {
+        let lib = mock_target("json", TargetKind::Lib);
+        let build = mock_target("build-script-build", TargetKind::CustomBuild);
+        let mut node = mock_node("json", vec![lib, build]);
+        let linux = |features: &[&str]| {
+            std::collections::BTreeMap::from([(
+                "linux-x86_64".to_owned(),
+                features.iter().map(|f| f.to_string()).collect::<Set<_>>(),
+            )])
+        };
+        node.platform_features = crate::platform_features::PlatformResolution {
+            features: linux(&["std"]),
+            deps: crate::platform_features::Edges {
+                normal: linux(&[]),
+                ..Default::default()
+            },
+            host_variant: Some(crate::platform_features::HostVariant {
+                features: linux(&["preserve_order", "std"]),
+                deps: crate::platform_features::Edges {
+                    normal: linux(&[]),
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        };
+
+        let rules = buckify_root_node(&node, &test_ctx());
+        let library = |name: &str| {
+            rules
+                .iter()
+                .find_map(|r| match r {
+                    Rule::RustLibrary(l) if l.name == name => Some(l),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("rust_library {name}"))
+        };
+        assert_eq!(library("json").features, Set::from(["std".to_owned()]));
+        assert_eq!(
+            library("json").env["OUT_DIR"],
+            "$(location :build-script-run[out_dir])"
+        );
+        let host = library("json-host");
+        assert_eq!(
+            host.features,
+            Set::from(["preserve_order".to_owned(), "std".to_owned()])
+        );
+        assert_eq!(
+            host.env["OUT_DIR"],
+            "$(location :build-script-host-run[out_dir])"
+        );
+        assert!(
+            host.rustc_flags
+                .contains(&"@$(location :build-script-host-run[rustc_flags])".to_owned())
+        );
+        assert!(
+            !host
+                .rustc_flags
+                .contains(&"@$(location :build-script-run[rustc_flags])".to_owned())
+        );
+
+        let run = rules
+            .iter()
+            .find_map(|r| match r {
+                Rule::BuildscriptRun(b) if b.name == "build-script-host-run" => Some(b),
+                _ => None,
+            })
+            .expect("host build script run");
+        assert_eq!(run.buildscript_rule, ":build-script-host-build");
+        assert_eq!(
+            run.features,
+            Set::from(["preserve_order".to_owned(), "std".to_owned()])
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|r| matches!(r, Rule::RustBinary(b) if b.name == "build-script-host-build"))
+        );
+
+        // Without a host variant nothing extra is emitted.
+        node.platform_features.host_variant = None;
+        let rules = buckify_root_node(&node, &test_ctx());
+        assert!(!gen_buck_content(&rules).contains("-host"));
     }
 }

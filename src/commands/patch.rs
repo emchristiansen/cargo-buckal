@@ -9,11 +9,11 @@ use toml_edit::{DocumentMut, InlineTable, Item, Table, Value};
 
 use crate::{
     buckal_log,
-    cache::{BuckalCache, BuckalChange, ChangeType},
+    cache::{BuckalChange, ChangeType},
     config::{RepoConfig, VersionPatch},
     context::BuckalContext,
     resolve::{BuckalNode, NodeKind},
-    utils::{UnwrapOrExit, ensure_prerequisites, section},
+    utils::{UnwrapOrExit, ensure_prerequisites, get_last_cache, section},
 };
 
 #[derive(Parser, Debug)]
@@ -37,13 +37,21 @@ pub fn execute(args: &PatchArgs) {
     ensure_prerequisites().unwrap_or_exit();
 
     let mut ctx = BuckalContext::new(args.manifest_path.clone());
+
+    ctx.check_host_platform_differences(false);
     let selected = select_patch_for_spec(&ctx, &args.package)
         .unwrap_or_exit_ctx("failed to determine dependency patch");
 
     // Compute targeted BUCK changes before persisting to buckal.toml so that
     // a failure here does not leave a partially-written config file.
-    let changes = targeted_patch_changes(&ctx, &selected)
+    let mut changes = targeted_patch_changes(&ctx, &selected)
         .unwrap_or_exit_ctx("failed to compute patched BUCK updates");
+    // The cache saved below certifies every package's rules, so every package whose
+    // rules are not current is regenerated too, not only the patched ones: those
+    // the full diff against the last cache finds (all of them without a compatible
+    // record of generated rules), such as one whose fixup changed since.
+    let last_cache = get_last_cache(args.manifest_path.as_deref());
+    changes.merge(ctx.new_cache().diff(&last_cache, &ctx.workspace_root));
 
     upsert_version_patch(
         &RepoConfig::repo_config_path(),
@@ -68,7 +76,7 @@ pub fn execute(args: &PatchArgs) {
     );
 
     changes.apply(&ctx);
-    BuckalCache::from_resolve(&ctx.resolve, &ctx.workspace_root, &ctx.repo_config.patch).save();
+    ctx.new_cache().save();
 }
 
 fn select_patch_for_spec(ctx: &BuckalContext, spec: &str) -> Result<SelectedPatch> {
@@ -166,7 +174,10 @@ fn targeted_patch_changes(ctx: &BuckalContext, selected: &SelectedPatch) -> Resu
         changes.insert(dependent.package_id.clone(), ChangeType::Changed);
     }
 
-    Ok(BuckalChange { changes })
+    Ok(BuckalChange {
+        changes,
+        ..Default::default()
+    })
 }
 
 fn find_unique_third_party_node<'a>(
@@ -282,6 +293,7 @@ mod tests {
                 name: name.to_string(),
                 version: (*version).to_string(),
                 features: vec![],
+                platform_features: Default::default(),
                 kind: NodeKind::ThirdParty,
                 edition: Edition::E2021,
                 manifest_path: Utf8PathBuf::from(format!("/tmp/{name}/{version}/Cargo.toml")),
@@ -291,6 +303,7 @@ mod tests {
                     src_path: Utf8PathBuf::from(format!("/tmp/{name}/{version}/src/lib.rs")),
                     doctest: true,
                     test: true,
+                    required_features: Vec::new(),
                 }],
                 source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
                 links: None,
@@ -302,8 +315,18 @@ mod tests {
         }
 
         BuckalContext {
+            workspace_members: None,
+            host_platform_differences: None,
+            host_platform_difference_digests: None,
+            buildscript_inputs: Default::default(),
+            wasm_modules: Default::default(),
+            declared_test_env: Default::default(),
             root: None,
-            resolve: BuckalResolve { dag, index_map },
+            resolve: BuckalResolve {
+                dag,
+                index_map,
+                test_only_edges: Default::default(),
+            },
             workspace_root: Utf8PathBuf::from("/tmp/workspace"),
             workspace_inherit: false,
             no_merge: false,

@@ -577,6 +577,12 @@ fn test_patch_redirects_generated_dependency_label() {
     let workspace_root = Utf8PathBuf::from(fixture_dir.to_str().unwrap());
 
     let base_ctx = BuckalContext {
+        workspace_members: None,
+        host_platform_differences: None,
+        host_platform_difference_digests: None,
+        buildscript_inputs: Default::default(),
+        wasm_modules: Default::default(),
+        declared_test_env: Default::default(),
         root: Some(old_crate.package_id.clone()),
         resolve,
         workspace_root,
@@ -604,6 +610,12 @@ fn test_patch_redirects_generated_dependency_label() {
     );
 
     let patched_ctx = BuckalContext {
+        workspace_members: None,
+        host_platform_differences: None,
+        host_platform_difference_digests: None,
+        buildscript_inputs: Default::default(),
+        wasm_modules: Default::default(),
+        declared_test_env: Default::default(),
         repo_config: RepoConfig {
             patch: RepoPatchConfig {
                 version: [(
@@ -796,6 +808,55 @@ fn test_dev_dependency_cycle() {
         err_msg.contains("doc.rust-lang.org/cargo/reference/resolver.html#dev-dependency-cycles"),
         "error should include Cargo docs link, got: {}",
         err_msg
+    );
+}
+
+/// With `lenient`, every package stays, and the cycle-closing dev edge is kept for
+/// the tests only.
+#[test]
+fn test_dev_dependency_cycle_lenient_keeps_all_packages() {
+    let fixture_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dev-dep-cycle");
+    let metadata = MetadataCommand::new()
+        .manifest_path(fixture_dir.join("Cargo.toml"))
+        .exec()
+        .expect("cargo metadata failed");
+    let packages_map: HashMap<PackageId, cargo_metadata::Package> = metadata
+        .packages
+        .iter()
+        .cloned()
+        .map(|p| (p.id.clone(), p))
+        .collect();
+    let nodes_map: HashMap<PackageId, cargo_metadata::Node> = metadata
+        .resolve
+        .clone()
+        .expect("no resolve in metadata")
+        .nodes
+        .into_iter()
+        .map(|n| (n.id.clone(), n))
+        .collect();
+    let root_path = std::path::Path::new(metadata.workspace_root.as_str());
+
+    let resolve =
+        BuckalResolve::from_metadata(&nodes_map, &packages_map, &HashMap::new(), root_path, true)
+            .expect("lenient resolution succeeds");
+
+    assert_eq!(resolve.nodes().count(), packages_map.len());
+    // Every edge is kept: the one that closes the cycle among packages for the
+    // dependent's tests only, apart from the acyclic package graph.
+    let edge_count: usize = resolve
+        .nodes()
+        .map(|n| resolve.deps_of(&n.package_id).len())
+        .sum();
+    let declared: usize = nodes_map.values().map(|n| n.deps.len()).sum();
+    assert_eq!(edge_count, declared);
+    assert_eq!(
+        resolve
+            .test_only_edges
+            .values()
+            .map(Vec::len)
+            .sum::<usize>(),
+        1
     );
 }
 
@@ -1123,4 +1184,131 @@ fn test_dev_dev_cycle_rejected() {
         "error should identify the cycle-forming packages, got: {}",
         err_msg
     );
+}
+
+/// Adding, changing or removing only a package's `[fixups]` changes exactly that
+/// package's fingerprint, so an ordinary cached migration regenerates its rules.
+#[test]
+fn test_fixup_changes_invalidate_only_their_package() {
+    let resolve = resolve_from_fixture("diamond-deps");
+    let ws = cargo_metadata::camino::Utf8PathBuf::from(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/diamond-deps")
+            .to_str()
+            .unwrap(),
+    );
+    let cache = |fixups: &std::collections::BTreeMap<
+        String,
+        cargo_buckal::config::PackageFixup,
+    >| {
+        BuckalCache::from_resolve_with_fixups(&resolve, &ws, &RepoPatchConfig::default(), fixups)
+    };
+    let fixup = |flags: &[&str]| cargo_buckal::config::PackageFixup {
+        rustc_flags: flags.iter().map(|f| f.to_string()).collect(),
+        ..Default::default()
+    };
+    let none = std::collections::BTreeMap::new();
+    let one =
+        std::collections::BTreeMap::from([("itoa".to_owned(), fixup(&["-C", "opt-level=2"]))]);
+    let other =
+        std::collections::BTreeMap::from([("itoa".to_owned(), fixup(&["-C", "opt-level=3"]))]);
+
+    // Without fixups the fingerprints are the plain ones.
+    assert!(
+        cache(&none)
+            .diff(
+                &BuckalCache::from_resolve(&resolve, &ws, &RepoPatchConfig::default()),
+                &ws
+            )
+            .changes
+            .is_empty()
+    );
+    for (from, to) in [(&none, &one), (&one, &other), (&one, &none)] {
+        let changes = cache(to).diff(&cache(from), &ws).changes;
+        let changed: Vec<_> = changes
+            .keys()
+            .filter(|id| id.repr.contains("itoa@"))
+            .collect();
+        assert!(!changed.is_empty(), "an itoa version must be regenerated");
+        assert_eq!(
+            changed.len(),
+            changes.len(),
+            "only itoa changes: {changes:?}"
+        );
+        assert!(changes.values().all(|c| matches!(c, ChangeType::Changed)));
+    }
+}
+
+/// A cache rebuilt from metadata is an inventory, not a record of generated rules:
+/// diffing against it regenerates every surviving package and still finds removals.
+#[test]
+fn test_unverified_inventory_regenerates_every_package() {
+    let resolve = resolve_from_fixture("diamond-deps");
+    let ws = cargo_metadata::camino::Utf8PathBuf::from(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/diamond-deps")
+            .to_str()
+            .unwrap(),
+    );
+    let current = BuckalCache::from_resolve(&resolve, &ws, &RepoPatchConfig::default());
+    let same = BuckalCache::from_resolve(&resolve, &ws, &RepoPatchConfig::default());
+    assert!(current.diff(&same, &ws).changes.is_empty());
+    let inventory = BuckalCache::from_resolve(&resolve, &ws, &RepoPatchConfig::default())
+        .into_unverified_inventory();
+    let changes = current.diff(&inventory, &ws).changes;
+    assert_eq!(changes.len(), resolve.nodes().count());
+    assert!(changes.values().all(|c| matches!(c, ChangeType::Changed)));
+}
+
+/// Which dev edge of a dev-dev cycle is skipped must not depend on `HashMap` order:
+/// rebuilding the maps (each with its own random hash seed) gives the same graph.
+#[test]
+fn test_dev_dependency_cycle_skips_the_same_edge_every_time() {
+    let fixture_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dev-dev-cycle");
+    let metadata = MetadataCommand::new()
+        .manifest_path(fixture_dir.join("Cargo.toml"))
+        .exec()
+        .expect("cargo metadata failed");
+    let root_path = std::path::Path::new(metadata.workspace_root.as_str());
+    let edges = || {
+        let packages_map: HashMap<PackageId, cargo_metadata::Package> = metadata
+            .packages
+            .iter()
+            .cloned()
+            .map(|p| (p.id.clone(), p))
+            .collect();
+        let nodes_map: HashMap<PackageId, cargo_metadata::Node> = metadata
+            .resolve
+            .clone()
+            .expect("no resolve in metadata")
+            .nodes
+            .into_iter()
+            .map(|n| (n.id.clone(), n))
+            .collect();
+        let resolve = BuckalResolve::from_metadata(
+            &nodes_map,
+            &packages_map,
+            &HashMap::new(),
+            root_path,
+            true,
+        )
+        .expect("lenient resolution succeeds");
+        let mut edges: Vec<(String, String)> = resolve
+            .nodes()
+            .flat_map(|node| {
+                resolve
+                    .dependencies(&node.package_id)
+                    .into_iter()
+                    .map(|dep| (node.name.clone(), dep.name.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        edges.sort();
+        edges
+    };
+    let first = edges();
+    for _ in 0..20 {
+        assert_eq!(edges(), first);
+    }
 }
