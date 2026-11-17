@@ -48,7 +48,9 @@ impl BuckalContext {
                 repo_config.test_features.clone(),
             ));
         }
-        let cargo_metadata = metadata_command.exec().unwrap();
+        let cargo_metadata = metadata_command.exec().unwrap_or_exit_ctx(
+            "`cargo metadata` failed (with the configured `test_features`, if any)",
+        );
         let root = cargo_metadata.root_package().map(|p| p.id.clone());
         let packages_map = cargo_metadata
             .packages
@@ -56,7 +58,10 @@ impl BuckalContext {
             .into_iter()
             .map(|p| (p.id.to_owned(), p))
             .collect::<HashMap<_, _>>();
-        let resolve_meta = cargo_metadata.resolve.unwrap();
+        let resolve_meta = cargo_metadata
+            .resolve
+            .ok_or("`cargo metadata` returned no dependency resolve")
+            .unwrap_or_exit();
         let nodes_map = resolve_meta
             .nodes
             .into_iter()

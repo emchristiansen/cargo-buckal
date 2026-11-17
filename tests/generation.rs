@@ -3220,3 +3220,21 @@ fn test_a_library_host_compilations_use_is_not_marked_incompatible_on_a_platform
         "{wonly}"
     );
 }
+
+#[test]
+fn test_a_cargo_metadata_failure_is_an_error_not_a_panic() {
+    // Fable 193510c4 P3: a `test_features` entry no package has makes `cargo
+    // metadata` fail; generation reports it and exits 1, without a panic.
+    let f = fixture();
+    let config = BUCKAL_TOML.split("[fixups.extra]").next().unwrap();
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!("test_features = [\"no_such_feature\"]\n{config}"),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(stderr.contains("cargo metadata"), "{stderr}");
+    assert!(stderr.contains("no_such_feature"), "{stderr}");
+}
