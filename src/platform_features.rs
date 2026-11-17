@@ -638,6 +638,10 @@ fn with_test_resolution(
         .map(|(id, _)| id.repr.clone())
         .collect();
     loop {
+        // A target test variant reaches its dependents' target compilations only:
+        // a build script is a host compilation, which uses a dependency's host or
+        // test host flavour (seeded above through `host_variants`), never its
+        // target test variant.
         let more: Vec<String> = tests
             .iter()
             .filter(|(id, _)| in_both_on_target(id) && !variants.contains(&id.repr))
@@ -645,7 +649,6 @@ fn with_test_resolution(
                 t.deps
                     .normal
                     .values()
-                    .chain(t.deps.build.values())
                     .flatten()
                     .any(|dep| variants.contains(dep))
             })
