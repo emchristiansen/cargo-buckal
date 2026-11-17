@@ -958,6 +958,16 @@ impl Unit {
             })
     }
 
+    /// A unit of the package's library target (in any mode).
+    fn is_lib_target(&self) -> bool {
+        self.target.kind.iter().any(|k| {
+            matches!(
+                k.as_str(),
+                "lib" | "rlib" | "dylib" | "cdylib" | "staticlib" | "proc-macro"
+            )
+        })
+    }
+
     /// The role of this unit's dependencies: tests and examples see dev-dependencies,
     /// the library and binaries normal ones.
     fn edge_role(&self) -> EdgeRole {
@@ -1018,6 +1028,13 @@ pub(crate) fn parse_unit_graph(
         let role = u.edge_role();
         for dep in &u.dependencies {
             let v = unit(dep.index)?;
+            // A dev-dependency of the package on itself: Cargo links the library
+            // (built as the tests resolve it) into the library's own unit-test
+            // harness, under its crate name. Recorded as a dev edge to itself.
+            if v.pkg_id == u.pkg_id && u.mode == "test" && u.is_lib_target() && v.is_lib_build() {
+                deps.dev.insert(u.pkg_id.clone());
+                continue;
+            }
             if v.pkg_id != u.pkg_id {
                 // Another package's `run-custom-build` (its `links` metadata) comes
                 // with a dependency on that package's library, which is recorded.

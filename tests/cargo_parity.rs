@@ -145,6 +145,9 @@ struct Report {
     unattributed: usize,
     /// Lines of packages `cargo build` builds nothing of (`required-features`).
     not_built: usize,
+    /// With tests: `(platform, package)` with a dev-dependency on itself in `cargo
+    /// tree`, each also compared with BUCKAL's dev edge of the package to itself.
+    self_dev_edges: usize,
 }
 
 /// Compare BUCKAL's resolution with `cargo tree`'s: production, or with `tests`
@@ -327,8 +330,85 @@ fn compare(
                     .insert((platform.clone(), id.repr.clone()));
             }
         }
+        if let Some(features) = tests {
+            // The members whose library Cargo links into their own unit tests (a
+            // dev-dependency on themselves), from its unit graph, and BUCKAL's dev
+            // edges of the tests' resolution to the package itself. `cargo tree`
+            // cannot show them: a member printed before as a dependency is shown
+            // again as a root without its children.
+            let cargo_self = self_linked_unit_tests(manifest, triple, features);
+            let buckal_self: BTreeSet<String> = resolved
+                .iter()
+                .filter(|(id, r)| {
+                    r.tests
+                        .as_deref()
+                        .unwrap_or(r)
+                        .deps
+                        .dev
+                        .get(platform)
+                        .is_some_and(|dev| dev.contains(&id.repr))
+                })
+                .map(|(id, _)| id.repr.clone())
+                .collect();
+            report.self_dev_edges += cargo_self.len();
+            for id in cargo_self.symmetric_difference(&buckal_self) {
+                report.mismatches.push(format!(
+                    "{platform}: {id}: library linked into its own unit tests: cargo {}, BUCKAL {}",
+                    cargo_self.contains(id),
+                    buckal_self.contains(id)
+                ));
+            }
+        }
     }
     (report, resolved)
+}
+
+/// The packages whose library unit-test unit depends on their own library in
+/// `cargo test --workspace --no-run --target <triple> --features <features>`'s unit
+/// graph.
+fn self_linked_unit_tests(manifest: &Path, triple: &str, features: &[String]) -> BTreeSet<String> {
+    let mut command = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned()));
+    command.env("RUSTC_BOOTSTRAP", "1").args([
+        "test",
+        "--workspace",
+        "--no-run",
+        "--target",
+        triple,
+    ]);
+    if !features.is_empty() {
+        command.args(["--features", &features.join(",")]);
+    }
+    let output = command
+        .args(["-Z", "unstable-options", "--unit-graph", "--manifest-path"])
+        .arg(manifest)
+        .output()
+        .expect("run cargo test --unit-graph");
+    assert!(
+        output.status.success(),
+        "cargo test --unit-graph: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let graph: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let units = graph["units"].as_array().unwrap();
+    let lib_kind = |u: &serde_json::Value| {
+        u["target"]["kind"].as_array().unwrap().iter().any(|k| {
+            matches!(
+                k.as_str().unwrap(),
+                "lib" | "rlib" | "dylib" | "cdylib" | "staticlib" | "proc-macro"
+            )
+        })
+    };
+    units
+        .iter()
+        .filter(|u| u["mode"] == "test" && lib_kind(u))
+        .filter(|u| {
+            u["dependencies"].as_array().unwrap().iter().any(|d| {
+                let v = &units[d["index"].as_u64().unwrap() as usize];
+                v["pkg_id"] == u["pkg_id"] && v["mode"] == "build" && lib_kind(v)
+            })
+        })
+        .map(|u| u["pkg_id"].as_str().unwrap().to_owned())
+        .collect()
 }
 
 fn write(path: &Path, content: &str) {
@@ -538,8 +618,9 @@ fn test_test_contexts_match_cargo_on_workspace() {
         .filter(|r| r.test_host_variant.is_some())
         .count();
     eprintln!(
-        "tests --features {features:?}: compared {} cargo tree package lines; {} mismatches; {} lines unattributed; {} lines of packages never built; {test_variants} test variants, {test_host_variants} test host variants",
+        "tests --features {features:?}: compared {} cargo tree package lines and {} self dev-dependency edges; {} mismatches; {} lines unattributed; {} lines of packages never built; {test_variants} test variants, {test_host_variants} test host variants",
         report.compared,
+        report.self_dev_edges,
         report.mismatches.len(),
         report.unattributed,
         report.not_built,

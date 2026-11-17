@@ -44,11 +44,14 @@ use crate::resolve::BuckalResolve;
 ///            library only, proc-macro unit tests get `proc_macro`, and a
 ///            host-only library the tests build for the target gets a test
 ///            variant. A version 9 cache certifies rules without these.
+/// Version 11: a package's dev-dependency on itself links its library into its
+///            unit tests (a dev edge of the tests' resolution to itself). A version
+///            10 cache certifies rules without it.
 ///
 /// Migration strategy:
 /// - If found < expected (stale cache from older Buckal): ignore the old cache and rebuild.
 /// - If found > expected (cache from newer Buckal): exit immediately and prompt the user to upgrade.
-const CACHE_VERSION: u32 = 10;
+const CACHE_VERSION: u32 = 11;
 
 /// The oldest cache version whose record of the fixups a generation applied
 /// (`fixup_rustc_flags`, `fixups`) is still read, from a cache whose rules are

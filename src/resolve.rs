@@ -278,16 +278,17 @@ impl BuckalResolve {
                             let parent_name = &dag[parent_idx].name;
                             let child_name = &dag[child_idx].name;
                             if lenient {
-                                // A package's dev-dependency on itself needs no edge:
-                                // its tests compile against its own library, and the
-                                // features the edge enables are in the tests'
-                                // resolution (with per-platform resolution). Any other
+                                // A package's dev-dependency on itself needs no edge in
+                                // the package graph: with per-platform resolution, the
+                                // tests' resolution records it (Cargo's unit graph links
+                                // the library into the unit tests) and the unit tests
+                                // depend on the library as the tests build it. Any other
                                 // cycle-closing dev edge is kept for the dependent's
                                 // tests only: the tests are rules apart from the
                                 // library, so no Buck rule depends on itself through it.
                                 if parent_idx == child_idx {
                                     crate::buckal_note!(
-                                        "Dev-dependency of `{}` on itself needs no edge; with `feature_platforms`, its tests use `{}` with the features it enables.",
+                                        "Dev-dependency of `{}` on itself needs no package edge; with `feature_platforms`, its unit tests link `{}` as the tests build it.",
                                         parent_name,
                                         parent_name
                                     );

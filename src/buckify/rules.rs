@@ -5,6 +5,8 @@ use cargo_metadata::camino::{Utf8Path, Utf8PathBuf};
 use cargo_util_schemas::core::{PackageIdSpec, SourceKind};
 use itertools::Itertools;
 
+use crate::platform_features::{EdgeRole, platform_list_mut};
+
 use crate::{
     buck::{ExportFile, GENERATED_HEADER, Load, PARTLY_GENERATED_HEADER, Rule, RustRule},
     buckal_error, buckal_note, buckal_warn,
@@ -318,6 +320,23 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
             // as a proc-macro; Cargo passes it to a proc-macro's test harness as well.
             if lib_target.kind.contains(&TargetKind::ProcMacro) {
                 rust_test.rustc_flags.push("--extern=proc_macro".to_owned());
+            }
+            // A dev-dependency of the package on itself: Cargo links the library,
+            // as the tests build it, into these unit tests under its crate name.
+            if let Some(on) = unit_test_node
+                .platform_features
+                .platforms_with_dep(&node.package_id, EdgeRole::Dev)
+                .filter(|on| !on.is_empty())
+            {
+                let lib = format!(":{}", test_context_lib(&buckal_name));
+                if on == unit_test_node.platform_features.platforms() {
+                    rust_test.deps_mut().insert(lib);
+                } else {
+                    for platform in on {
+                        platform_list_mut(&mut rust_test.platform, platform, "deps")
+                            .insert(lib.clone());
+                    }
+                }
             }
             test_context_rules.insert("unittest".to_owned());
 
