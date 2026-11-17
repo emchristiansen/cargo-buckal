@@ -659,6 +659,39 @@ fn test_fixup_export_files_through_generation() {
     assert!(!app.contains("\"Cargo.toml\""), "{app}");
     assert_eq!(app.matches("export_file(").count(), 2, "{app}");
 
+    // An entry may narrow the visibility; changing only the visibility regenerates.
+    let narrowed = |visibility: &str| {
+        with(&format!(
+            "\"build.rs\", {{ path = \"src/lib.rs\", visibility = [{visibility}] }}"
+        ))
+    };
+    write(&f.ws.join("buckal.toml"), &narrowed("\"//shared:\""));
+    f.migrate(&[]);
+    let app = f.buck("app");
+    assert!(app.contains(&export("build.rs")), "{app}");
+    assert!(
+        app.contains("export_file(\n    name = \"src/lib.rs\",\n    src = \"src/lib.rs\",\n    mode = \"reference\",\n    visibility = [\"//shared:\"],\n)\n"),
+        "{app}"
+    );
+    write(
+        &f.ws.join("buckal.toml"),
+        &narrowed("\"//shared:\", \"//sdk:\""),
+    );
+    f.migrate(&[]);
+    let app = f.buck("app");
+    assert!(
+        app.contains("    visibility = [\n        \"//sdk:\",\n        \"//shared:\",\n    ],\n"),
+        "{app}"
+    );
+    // A specified empty visibility is private, not `PUBLIC`.
+    write(&f.ws.join("buckal.toml"), &narrowed(""));
+    f.migrate(&[]);
+    let app = f.buck("app");
+    assert!(
+        app.contains("    name = \"src/lib.rs\",\n    src = \"src/lib.rs\",\n    mode = \"reference\",\n    visibility = [],\n"),
+        "{app}"
+    );
+
     // Removing the fixup restores the original BUCK file.
     write(&f.ws.join("buckal.toml"), BUCKAL_TOML);
     f.migrate(&[]);

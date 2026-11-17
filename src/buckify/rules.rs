@@ -311,7 +311,8 @@ fn fixup_export_files(
     fixup
         .export_files
         .iter()
-        .map(|path| {
+        .map(|entry| {
+            let path = entry.path();
             let relative = Utf8Path::new(path);
             let plain = !path.is_empty()
                 && relative
@@ -338,16 +339,16 @@ fn fixup_export_files(
                     "`[fixups.{package}] export_files`: `{path}` is inside the nested Buck package `{nested}`"
                 );
             }
-            if !taken.insert(path.as_str()) {
+            if !taken.insert(path) {
                 anyhow::bail!(
                     "`[fixups.{package}] export_files`: `{path}` is listed twice or is already the name of a rule in the package's BUCK file"
                 );
             }
             Ok(ExportFile {
-                name: path.clone(),
-                src: path.clone(),
+                name: path.to_owned(),
+                src: path.to_owned(),
                 mode: Some("reference".to_owned()),
-                visibility: Set::from(["PUBLIC".to_owned()]),
+                visibility: entry.visibility(),
             })
         })
         .collect()

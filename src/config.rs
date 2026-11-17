@@ -254,9 +254,49 @@ pub struct PackageFixup {
     /// becomes `export_file(name = <path>, src = <path>, mode = "reference")` in the
     /// package's BUCK file, which generation would otherwise rewrite without it. A
     /// path must name an existing file inside the package (not in a nested Buck
-    /// package).
+    /// package). An entry is the path, visible to everything (`PUBLIC`), or
+    /// `{ path = "<path>", visibility = ["<pattern>", ...] }`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub export_files: Vec<String>,
+    pub export_files: Vec<ExportFileEntry>,
+}
+
+/// An entry of `[fixups.<package>] export_files`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ExportFileEntry {
+    /// The path alone, exported with `visibility = ["PUBLIC"]`.
+    Path(String),
+    /// The path with an explicit visibility.
+    Spec(ExportFileSpec),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExportFileSpec {
+    pub path: String,
+    /// The `export_file`'s visibility patterns; `PUBLIC` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<Vec<String>>,
+}
+
+impl ExportFileEntry {
+    pub fn path(&self) -> &str {
+        match self {
+            ExportFileEntry::Path(path) => path,
+            ExportFileEntry::Spec(spec) => &spec.path,
+        }
+    }
+
+    /// The visibility to emit: as specified, else `PUBLIC`.
+    pub fn visibility(&self) -> Set<String> {
+        match self {
+            ExportFileEntry::Spec(ExportFileSpec {
+                visibility: Some(visibility),
+                ..
+            }) => visibility.iter().cloned().collect(),
+            _ => Set::from(["PUBLIC".to_owned()]),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -309,7 +349,7 @@ impl RepoConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::RepoConfig;
+    use super::{ExportFileEntry, RepoConfig, Set};
 
     #[test]
     fn test_repo_config_deserializes_version_patch() {
@@ -391,6 +431,52 @@ mod tests {
                 .get("//text/lexicon:words.txt")
                 .map(String::as_str),
             Some("../lexicon/words.txt")
+        );
+    }
+
+    #[test]
+    fn test_repo_config_deserializes_fixup_export_files() {
+        let config: RepoConfig = toml::from_str(
+            r#"
+                [fixups.ccc]
+                export_files = [
+                    "Cargo.toml",
+                    { path = "data/a.json", visibility = ["//codegen/ccc:", "//conta/durable_turn:"] },
+                    { path = "data/b.json" },
+                ]
+            "#,
+        )
+        .expect("failed to deserialize repo config");
+        let entries = &config.fixups.get("ccc").unwrap().export_files;
+        assert_eq!(
+            entries
+                .iter()
+                .map(ExportFileEntry::path)
+                .collect::<Vec<_>>(),
+            ["Cargo.toml", "data/a.json", "data/b.json"]
+        );
+        let public = Set::from(["PUBLIC".to_owned()]);
+        assert_eq!(entries[0].visibility(), public);
+        assert_eq!(
+            entries[1].visibility(),
+            Set::from([
+                "//codegen/ccc:".to_owned(),
+                "//conta/durable_turn:".to_owned()
+            ])
+        );
+        assert_eq!(entries[2].visibility(), public);
+        // The visibility is part of the fixup's serialization, which the cache
+        // fingerprints.
+        assert_eq!(
+            serde_json::to_string(&entries).unwrap(),
+            r#"["Cargo.toml",{"path":"data/a.json","visibility":["//codegen/ccc:","//conta/durable_turn:"]},{"path":"data/b.json"}]"#
+        );
+        // An unknown key in an entry is refused.
+        assert!(
+            toml::from_str::<RepoConfig>(
+                "[fixups.ccc]\nexport_files = [{ path = \"a\", visibilty = [] }]\n"
+            )
+            .is_err()
         );
     }
 
