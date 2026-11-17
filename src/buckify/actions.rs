@@ -3,8 +3,8 @@ use regex::Regex;
 
 use crate::{
     buck::{
-        GENERATED_HEADER, NamedFileGroup, Rule, TopLevelKind, parse_buck_file, patch_buck_rules,
-        top_level_statements,
+        FixupFlags, GENERATED_HEADER, NamedFileGroup, Rule, TopLevelKind, parse_buck_file,
+        patch_buck_rules, top_level_statements,
     },
     buckal_log,
     buckify::emit::emit_export_file,
@@ -69,12 +69,18 @@ impl BuckalChange {
 
                         // Patch BUCK Rules
                         let buck_path = vendor_dir.join("BUCK");
-                        let previous_flags = self
-                            .previous_fixup_rustc_flags
-                            .get(&node.name)
-                            .map(Vec::as_slice)
-                            .unwrap_or_default();
-                        merge_rules(&buck_path, &mut buck_rules, ctx, previous_flags);
+                        let fixup_flags = FixupFlags {
+                            current: ctx
+                                .repo_config
+                                .fixups
+                                .get(&node.name)
+                                .map(|fixup| fixup.rustc_flags.as_slice())
+                                .unwrap_or_default(),
+                            previous: self.previous_fixup_rustc_flags.as_ref().map(|flags| {
+                                flags.get(&node.name).map(Vec::as_slice).unwrap_or_default()
+                            }),
+                        };
+                        merge_rules(&buck_path, &mut buck_rules, ctx, fixup_flags);
 
                         // Generate the BUCK file, keeping what a first-party package's
                         // BUCK file has beyond the rules generation owns.
@@ -318,7 +324,7 @@ fn merge_rules(
     buck_path: &Utf8Path,
     buck_rules: &mut [Rule],
     ctx: &BuckalContext,
-    previous_rustc_flags: &[String],
+    fixup_flags: FixupFlags,
 ) {
     if buck_path.exists() {
         // Skip merging manual changes if `--no-merge` is set
@@ -329,7 +335,7 @@ fn merge_rules(
                 &existing_rules,
                 buck_rules,
                 &ctx.repo_config.patch_fields,
-                previous_rustc_flags,
+                fixup_flags,
             );
         }
     } else {

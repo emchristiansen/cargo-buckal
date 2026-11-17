@@ -526,6 +526,54 @@ fn test_merge_keeps_manual_flag_groups_and_drops_old_fixup_flags() {
 }
 
 #[test]
+fn test_merge_keeps_ordered_manual_groups_equal_to_generated_ones() {
+    // R6-DUP-1 (A, B, A): the generated fixup `-C opt-level=2` is followed by manual
+    // `-C opt-level=3 -C opt-level=2`, so the effective option is opt-level=2.
+    let f = fixture();
+    let config = |env: &str| {
+        format!(
+            "ignore_tests = false\npatch_fields = [\"rustc_flags\"]\n[fixups.extra]\nrustc_flags = [\"-C\", \"opt-level=2\"]\n{env}"
+        )
+    };
+    let manifest_flag = "@$(location :manifest[env_flags])";
+    write(&f.ws.join("buckal.toml"), &config(""));
+    f.migrate(&[]);
+    let buck = f.buck("extra");
+    assert_eq!(
+        rustc_flags(rule(&buck, "extra")),
+        [manifest_flag, "-C", "opt-level=2"]
+    );
+    let edited = buck.replacen(
+        "\"opt-level=2\"",
+        "\"opt-level=2\", \"-C\", \"opt-level=3\", \"-C\", \"opt-level=2\"",
+        1,
+    );
+    assert_ne!(edited, buck);
+    write(&f.ws.join("extra/BUCK"), &edited);
+
+    // Another fixup field changes, so `extra` is regenerated with the same flags.
+    write(
+        &f.ws.join("buckal.toml"),
+        &config("env = { EXTRA = \"1\" }\n"),
+    );
+    f.migrate(&["--merge"]);
+    let extra = f.buck("extra");
+    assert!(extra.contains("EXTRA"), "{extra}");
+    assert_eq!(
+        rustc_flags(rule(&extra, "extra")),
+        [
+            manifest_flag,
+            "-C",
+            "opt-level=2",
+            "-C",
+            "opt-level=3",
+            "-C",
+            "opt-level=2"
+        ]
+    );
+}
+
+#[test]
 fn test_fixup_test_execution_through_generation() {
     let f = fixture();
     f.migrate(&[]);

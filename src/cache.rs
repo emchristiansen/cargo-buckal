@@ -120,6 +120,10 @@ pub struct BuckalCache {
     /// files may come from another generator version, or from nothing at all.
     #[serde(skip)]
     regenerate_all: bool,
+    /// Loaded from disk: a record of a previous generation, whose fixup flags
+    /// (`fixup_rustc_flags`) are known.
+    #[serde(skip)]
+    recorded: bool,
     /// The fixup `rustc_flags` this generation added, by package name, so that a
     /// later `--merge` can tell them from manual edits once they change or go away.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -209,6 +213,7 @@ impl BuckalCache {
             fingerprints,
             version: CACHE_VERSION,
             regenerate_all: false,
+            recorded: false,
             fixup_rustc_flags,
         }
     }
@@ -218,6 +223,7 @@ impl BuckalCache {
             fingerprints: BTreeMap::new(),
             version: CACHE_VERSION,
             regenerate_all: false,
+            recorded: false,
             fixup_rustc_flags: BTreeMap::new(),
         }
     }
@@ -240,7 +246,7 @@ impl BuckalCache {
             return Err(anyhow!("Cache file does not exist"));
         }
         let content = std::fs::read_to_string(&cache_path)?;
-        let cache = toml::from_str::<BuckalCache>(&content)
+        let mut cache = toml::from_str::<BuckalCache>(&content)
             .map_err(|e| anyhow!("Failed to parse cache file: {}", e))?;
         if cache.version > CACHE_VERSION {
             buckal_error!(
@@ -257,6 +263,7 @@ impl BuckalCache {
                 CACHE_VERSION
             ));
         }
+        cache.recorded = true;
         Ok(cache)
     }
 
@@ -267,9 +274,15 @@ impl BuckalCache {
         std::fs::write(cache_path, format!("{}\n{}", comment, content)).unwrap_or_exit();
     }
 
+    /// The fixup `rustc_flags` of the generation this cache records, if it records
+    /// one (an inventory or an empty cache does not).
+    pub fn previous_fixup_record(&self) -> Option<BTreeMap<String, Vec<String>>> {
+        (self.recorded && !self.regenerate_all).then(|| self.fixup_rustc_flags.clone())
+    }
+
     pub fn diff(&self, other: &BuckalCache, workspace_root: &Utf8PathBuf) -> BuckalChange {
         let mut _diff = BuckalChange {
-            previous_fixup_rustc_flags: other.fixup_rustc_flags.clone(),
+            previous_fixup_rustc_flags: other.previous_fixup_record(),
             ..Default::default()
         };
         for (id, fp) in &self.fingerprints {
@@ -301,8 +314,10 @@ impl BuckalCache {
 #[derive(Debug, Default)]
 pub struct BuckalChange {
     pub changes: BTreeMap<PackageId, ChangeType>,
-    /// The fixup `rustc_flags` the previous generation added, by package name.
-    pub previous_fixup_rustc_flags: BTreeMap<String, Vec<String>>,
+    /// The fixup `rustc_flags` the previous generation added, by package name, when
+    /// a cache records them (`None`: unknown, so `--merge` cannot tell them from
+    /// manual edits).
+    pub previous_fixup_rustc_flags: Option<BTreeMap<String, Vec<String>>>,
 }
 
 impl BuckalChange {
@@ -311,8 +326,8 @@ impl BuckalChange {
         for (id, change) in other.changes {
             self.changes.entry(id).or_insert(change);
         }
-        for (name, flags) in other.previous_fixup_rustc_flags {
-            self.previous_fixup_rustc_flags.entry(name).or_insert(flags);
+        if self.previous_fixup_rustc_flags.is_none() {
+            self.previous_fixup_rustc_flags = other.previous_fixup_rustc_flags;
         }
     }
 }

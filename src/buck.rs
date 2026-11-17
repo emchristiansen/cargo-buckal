@@ -722,17 +722,40 @@ pub fn argument_groups(args: &[String]) -> Vec<Vec<String>> {
     groups
 }
 
+/// The fixup `rustc_flags` generation appends to a package's rules, now and in the
+/// generation that wrote the existing BUCK file, so that `--merge` can tell what that
+/// generation emitted from manual edits.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FixupFlags<'a> {
+    /// The fixup flags this generation appends (the end of each generated rule's
+    /// `rustc_flags`).
+    pub current: &'a [String],
+    /// The fixup flags the previous generation appended, as its cache recorded
+    /// them; `None` when there is no such record (no compatible cache).
+    pub previous: Option<&'a [String]>,
+}
+
 /// Merge the ordered argument list of an existing rule (`src`) into a generated one
-/// (`dst`), keeping only the existing rule's manual additions. The comparison is by
-/// whole argument group (`-C` with its value), never by single token, so a manual
-/// `-C debuginfo=1` survives next to a generated `-C opt-level=2`. The groups of
-/// `dst`, and of `previously_generated` (arguments an earlier generation emitted
-/// that the current one may no longer, e.g. a changed or removed fixup), are not
-/// manual and are not carried over; each accounts for one matching group (a
-/// multiset), so a repeated manual group survives.
-fn patch_list(dst: &mut Vec<String>, src: &[String], previously_generated: &[String]) {
+/// (`dst`), keeping only the existing rule's manual additions, in their order. The
+/// comparison is by whole argument group (`-C` with its value), never by single
+/// token, so a manual `-C debuginfo=1` survives next to a generated
+/// `-C opt-level=2`.
+///
+/// The existing rule's generated groups are accounted for once each (a multiset),
+/// and every other group is manual. With a record of the previous generation's
+/// fixup flags, the generated groups are those that generation emitted: this one's
+/// without its fixup flags, followed by the previous fixup flags. So a manual group
+/// equal to a generated one, repeated or not, survives, and a changed or removed
+/// fixup's old flags do not. Without a record, they are this generation's groups.
+fn patch_list(dst: &mut Vec<String>, src: &[String], fixup: FixupFlags) {
     let mut generated = argument_groups(dst);
-    generated.extend(argument_groups(previously_generated));
+    if let Some(previous) = fixup.previous {
+        let current = argument_groups(fixup.current);
+        if generated.ends_with(&current) {
+            generated.truncate(generated.len() - current.len());
+        }
+        generated.extend(argument_groups(previous));
+    }
     for group in argument_groups(src) {
         if let Some(pos) = generated.iter().position(|g| *g == group) {
             generated.remove(pos);
@@ -794,7 +817,7 @@ macro_rules! impl_patch_from {
                 &mut self,
                 other: &Self,
                 patch_fields: &Set<String>,
-                previous_rustc_flags: &[String],
+                fixup_flags: FixupFlags,
             ) {
                 // Patch target_compatible_with set
                 if patch_fields.contains("target_compatible_with") {
@@ -821,11 +844,7 @@ macro_rules! impl_patch_from {
                 }
                 // Patch rustc_flags set
                 if patch_fields.contains("rustc_flags") {
-                    patch_list(
-                        &mut self.rustc_flags,
-                        &other.rustc_flags,
-                        previous_rustc_flags,
-                    );
+                    patch_list(&mut self.rustc_flags, &other.rustc_flags, fixup_flags);
                 }
                 // Patch visibility set
                 if patch_fields.contains("visibility") {
@@ -1318,14 +1337,13 @@ pub fn top_level_statements(
 }
 
 /// Keep the configured `patch_fields` of the existing rules (manual edits) in the
-/// regenerated ones. `previous_rustc_flags` are the fixup `rustc_flags` an earlier
-/// generation added to this package's rules (recorded in the cache); they are not
-/// manual edits.
+/// regenerated ones. `fixup_flags` are the fixup `rustc_flags` this and the
+/// previous generation added to this package's rules; they are not manual edits.
 pub fn patch_buck_rules(
     existing: &Map<String, Rule>,
     to_patch: &mut [Rule],
     patch_fields: &Set<String>,
-    previous_rustc_flags: &[String],
+    fixup_flags: FixupFlags,
 ) {
     fn find_existing<'a>(existing: &'a Map<String, Rule>, rule: &Rule) -> Option<&'a Rule> {
         existing.get(&rule_map_key(rule))
@@ -1339,7 +1357,7 @@ pub fn patch_buck_rules(
                     ..RustLibrary::default()
                 });
                 if let Some(Rule::RustLibrary(existing_rule)) = find_existing(existing, &probe) {
-                    new_rule.patch_from(existing_rule, patch_fields, previous_rustc_flags);
+                    new_rule.patch_from(existing_rule, patch_fields, fixup_flags);
                 }
             }
             Rule::RustBinary(new_rule) => {
@@ -1348,7 +1366,7 @@ pub fn patch_buck_rules(
                     ..RustBinary::default()
                 });
                 if let Some(Rule::RustBinary(existing_rule)) = find_existing(existing, &probe) {
-                    new_rule.patch_from(existing_rule, patch_fields, previous_rustc_flags);
+                    new_rule.patch_from(existing_rule, patch_fields, fixup_flags);
                 }
             }
             Rule::RustTest(new_rule) => {
@@ -1357,7 +1375,7 @@ pub fn patch_buck_rules(
                     ..RustTest::default()
                 });
                 if let Some(Rule::RustTest(existing_rule)) = find_existing(existing, &probe) {
-                    new_rule.patch_from(existing_rule, patch_fields, previous_rustc_flags);
+                    new_rule.patch_from(existing_rule, patch_fields, fixup_flags);
                 }
             }
             Rule::BuildscriptRun(new_rule) => {
@@ -2406,9 +2424,13 @@ mod tests {
             ]
         );
 
+        let unrecorded = |current| FixupFlags {
+            current,
+            previous: None,
+        };
         // A manual `-C` group next to a generated one keeps its own `-C`.
         let mut dst = v(&["@f", "-C", "opt-level=2"]);
-        patch_list(&mut dst, &v(&["-C", "debuginfo=1"]), &[]);
+        patch_list(&mut dst, &v(&["-C", "debuginfo=1"]), unrecorded(&[]));
         assert_eq!(dst, v(&["@f", "-C", "opt-level=2", "-C", "debuginfo=1"]));
 
         // Groups the previous generation emitted (a changed fixup) are not manual;
@@ -2425,7 +2447,10 @@ mod tests {
                 "-C",
                 "debuginfo=1",
             ]),
-            &v(&["-C", "opt-level=2"]),
+            FixupFlags {
+                current: &v(&["-C", "opt-level=3"]),
+                previous: Some(&v(&["-C", "opt-level=2"])),
+            },
         );
         assert_eq!(
             dst,
@@ -2439,5 +2464,60 @@ mod tests {
                 "debuginfo=1"
             ])
         );
+
+        // R6-DUP-1 (A, B, A): the fixup `-C opt-level=2` is unchanged, and manual
+        // `-C opt-level=3 -C opt-level=2` follow it. The generated group is
+        // accounted for once, so both manual groups survive in order.
+        let fixup = v(&["-C", "opt-level=2"]);
+        let mut dst = v(&["@f", "-C", "opt-level=2"]);
+        patch_list(
+            &mut dst,
+            &v(&[
+                "@f",
+                "-C",
+                "opt-level=2",
+                "-C",
+                "opt-level=3",
+                "-C",
+                "opt-level=2",
+            ]),
+            FixupFlags {
+                current: &fixup,
+                previous: Some(&fixup),
+            },
+        );
+        assert_eq!(
+            dst,
+            v(&[
+                "@f",
+                "-C",
+                "opt-level=2",
+                "-C",
+                "opt-level=3",
+                "-C",
+                "opt-level=2"
+            ])
+        );
+
+        // A removed fixup: its recorded flags are not manual.
+        let mut dst = v(&["@f"]);
+        patch_list(
+            &mut dst,
+            &v(&["@f", "-C", "opt-level=2", "-C", "debuginfo=1"]),
+            FixupFlags {
+                current: &[],
+                previous: Some(&fixup),
+            },
+        );
+        assert_eq!(dst, v(&["@f", "-C", "debuginfo=1"]));
+
+        // Without a record, this generation's groups are the generated ones.
+        let mut dst = v(&["@f", "-C", "opt-level=2"]);
+        patch_list(
+            &mut dst,
+            &v(&["@f", "-C", "opt-level=2", "-C", "opt-level=3"]),
+            unrecorded(&fixup),
+        );
+        assert_eq!(dst, v(&["@f", "-C", "opt-level=2", "-C", "opt-level=3"]));
     }
 }

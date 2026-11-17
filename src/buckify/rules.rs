@@ -1545,7 +1545,7 @@ mod tests {
             &existing,
             &mut regenerated,
             &Set::from(["rustc_flags".to_owned()]),
-            &[],
+            crate::buck::FixupFlags::default(),
         );
         assert_eq!(gen_buck_content(&regenerated), content);
     }
