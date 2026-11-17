@@ -1845,3 +1845,37 @@ fn test_omitted_same_named_binary_keeps_the_library_label() {
         assert_eq!(names.contains(&"foo"), cli_for_tests, "{foo}");
     }
 }
+
+#[test]
+fn test_proc_macro_integration_test_uses_its_test_host_variant() {
+    // FEAT-TEST-HOST-SELF-1 (t_7c72255f): only the test features enable the
+    // proc-macro `pm`'s `testflag`, so Cargo compiles the integration test's `pm`
+    // (on the host) with it and production `pm` without.
+    let f = pm_contexts_fixture(true);
+    let manifest_path = f.ws.join("pm/Cargo.toml");
+    let pm_manifest = std::fs::read_to_string(&manifest_path).unwrap();
+    write(
+        &manifest_path,
+        &format!("{pm_manifest}[features]\ntestflag = []\n"),
+    );
+    write(
+        &f.ws.join("pm/src/lib.rs"),
+        "extern crate proc_macro;\n#[proc_macro]\npub fn sample(_: proc_macro::TokenStream) -> proc_macro::TokenStream {\n    if cfg!(feature = \"testflag\") { \"fn enabled() {}\".parse().unwrap() } else { proc_macro::TokenStream::new() }\n}\n",
+    );
+    write(
+        &f.ws.join("pm/tests/api.rs"),
+        "pm::sample!();\n#[test]\nfn api() {\n    enabled();\n}\n",
+    );
+    let config = BUCKAL_TOML.split("[fixups.extra]").next().unwrap();
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!("test_features = [\"pm/testflag\"]\n{config}"),
+    );
+    f.migrate(&[]);
+    let pm = f.buck("pm");
+    assert!(!rule(&pm, "pm").contains("testflag"), "{pm}");
+    assert!(rule(&pm, "pm-test-host").contains("testflag"), "{pm}");
+    let api = rule(&pm, "api");
+    assert!(top_deps(api).contains(&":pm-test-host"), "{api}");
+    assert!(!top_deps(api).contains(&":pm"), "{api}");
+}

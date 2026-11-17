@@ -213,6 +213,20 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         }
     };
     let lib_buck_name: Option<String> = lib_targets.first().map(|t| lib_rule_name(t));
+    // The package's own library as its test-context rules (tests, test-only
+    // binaries) use it: the test host variant of a host-only library (a
+    // proc-macro, which the tests' compilations load on the host), else the test
+    // variant, else the library.
+    let test_context_lib = |lib_name: &str| -> String {
+        let resolution = &node.platform_features;
+        if resolution.host_context && resolution.test_host_variant.is_some() {
+            test_host_variant_name(lib_name)
+        } else if has_test_variant {
+            test_variant_name(lib_name)
+        } else {
+            lib_name.to_owned()
+        }
+    };
 
     // emit filegroup rule for vendor
     let filegroup = emit_filegroup();
@@ -237,8 +251,8 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         // The binary must always depend on the sibling library, even when names differ
         // (e.g., binary "my-crate" vs library "my_crate").
         if let Some(lib_name) = &lib_buck_name {
-            let lib = if for_tests && has_test_variant {
-                test_variant_name(lib_name)
+            let lib = if for_tests {
+                test_context_lib(lib_name)
             } else {
                 lib_name.clone()
             };
@@ -296,11 +310,7 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
             // Integration tests may use the package's library under its crate name
             // (as the tests need it).
             if let Some(lib_name) = &lib_buck_name {
-                let lib = if has_test_variant {
-                    test_variant_name(lib_name)
-                } else {
-                    lib_name.clone()
-                };
+                let lib = test_context_lib(lib_name);
                 rust_test.deps_mut().insert(format!(":{lib}"));
             }
 
@@ -334,11 +344,7 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
             let mut rust_test =
                 emit_rust_test(&test_node, bin_target, &manifest_dir, &buckal_name, ctx);
             if let Some(lib_name) = &lib_buck_name {
-                let lib = if has_test_variant {
-                    test_variant_name(lib_name)
-                } else {
-                    lib_name.clone()
-                };
+                let lib = test_context_lib(lib_name);
                 rust_test.deps_mut().insert(format!(":{lib}"));
             }
             test_context_rules.insert(buckal_name);
