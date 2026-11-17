@@ -432,12 +432,15 @@ impl BuckalResolve {
         // Per-platform, per-context resolution: features, edges, host context and host
         // variants (BTree order is deterministic). Hashed only when present, so
         // fingerprints of repositories that do not configure it are unchanged.
+        // Dependencies are named by `PackageId::repr`, which holds the absolute path of
+        // a path dependency: canonicalised like the edges below, so that the
+        // fingerprint does not depend on where the workspace is checked out (N12).
         if !node.platform_features.is_empty() {
             hasher.update(b"platform_resolution");
-            hasher.update(
-                &serde_json::to_vec(&node.platform_features)
-                    .expect("a platform resolution serializes to JSON"),
-            );
+            let mut resolution = serde_json::to_value(&node.platform_features)
+                .expect("a platform resolution serializes to JSON");
+            canonicalize_package_ids(&mut resolution, workspace_root);
+            hasher.update(&serde_json::to_vec(&resolution).expect("a JSON value serializes"));
         }
 
         // 4. NodeKind (FirstParty already stores relative_path)
@@ -576,6 +579,34 @@ impl BuckalResolve {
         }
 
         Fingerprint::new(hasher.finalize().into())
+    }
+}
+
+/// Replace the workspace root in every package id of `value` (strings and object
+/// keys) by `($WORKSPACE)`, as [`PackageIdExt::canonicalize`] does.
+fn canonicalize_package_ids(value: &mut serde_json::Value, workspace_root: &Utf8PathBuf) {
+    let canonical = |text: &str| {
+        PackageId {
+            repr: text.to_owned(),
+        }
+        .canonicalize(workspace_root)
+        .repr
+    };
+    match value {
+        serde_json::Value::String(text) => *text = canonical(text),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                canonicalize_package_ids(item, workspace_root);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let entries = std::mem::take(map);
+            for (key, mut item) in entries {
+                canonicalize_package_ids(&mut item, workspace_root);
+                map.insert(canonical(&key), item);
+            }
+        }
+        _ => {}
     }
 }
 

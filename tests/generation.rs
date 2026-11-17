@@ -3793,3 +3793,38 @@ fn test_supports_test_execution_caching_through_generation() {
     f.migrate(&[]);
     assert_eq!(f.buck("app"), before);
 }
+
+#[test]
+fn test_fingerprints_do_not_depend_on_the_checkout_path() {
+    // Fable N12 (f36): `a` depends on `b` by path, with two configured platforms.
+    // The platform resolution names `b` by its package id, which holds the absolute
+    // path; generated at two paths, the whole `buckal.snap` must be identical.
+    let at = |f: &Fixture| {
+        write(
+            &f.ws.join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = [\"a\", \"b\"]\n",
+        );
+        write(
+            &f.ws.join("a/Cargo.toml"),
+            &manifest("a", "[dependencies]\nb = { path = \"../b\" }\n"),
+        );
+        write(&f.ws.join("a/src/lib.rs"), "");
+        write(&f.ws.join("b/Cargo.toml"), &manifest("b", ""));
+        write(&f.ws.join("b/src/lib.rs"), "");
+        write(
+            &f.ws.join("buckal.toml"),
+            BUCKAL_TOML.split("[fixups.extra]").next().unwrap(),
+        );
+        f.migrate(&[]);
+        (
+            std::fs::read_to_string(f.ws.join("buckal.snap")).unwrap(),
+            f.buck("a"),
+        )
+    };
+    let (one, two) = (fixture(), fixture());
+    assert_ne!(one.ws, two.ws);
+    let (snap_one, a_one) = at(&one);
+    let (snap_two, a_two) = at(&two);
+    assert_eq!(a_one, a_two);
+    assert_eq!(snap_one, snap_two);
+}
