@@ -219,6 +219,11 @@ pub struct PlatformResolution {
     /// configures for the execution platform, use these rules.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub host_uses_plain_rules: bool,
+    /// With `host_uses_plain_rules`: what those host compilations need, per
+    /// platform on which Cargo plans them (the ordinary build's and the tests'),
+    /// for comparison with the plain rules' resolution on the execution platform.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plain_host_needs: Vec<HostVariant>,
 }
 
 /// The resolution of one more compilation context of a package: the host variant of
@@ -369,8 +374,15 @@ pub type PlatformFeatures = HashMap<PackageId, PlatformResolution>;
 /// configures a host compilation in the execution platform, though, so its
 /// `platform` attribute selects the execution platform's entry, whatever the
 /// target: the other platforms' host resolutions are not what Buck builds.
+///
+/// A plain rule that host compilations use is recorded, with `execution` (the
+/// configured name of the execution platform), when what a host compilation needs
+/// on some platform differs from the plain rule's resolution on the execution
+/// platform, which Buck builds for it (Fable N7); without `execution`, whenever
+/// the plain rule's resolution differs between platforms.
 pub fn host_resolutions_differing_by_platform(
     resolutions: &PlatformFeatures,
+    execution: Option<&str>,
 ) -> Vec<(PackageId, &'static str)> {
     let differs = |features: &FeaturesByPlatform, deps: &Edges| {
         let mut platforms = features.keys();
@@ -395,8 +407,24 @@ pub fn host_resolutions_differing_by_platform(
             // Host compilations use the plain rules, which Buck configures for the
             // execution platform whatever the target (no per-platform marking
             // either, N6).
-            if !r.host_context && r.host_uses_plain_rules && differs(&r.features, &r.deps) {
-                hosts.push((id.clone(), PLAIN_HOST_USE));
+            if !r.host_context && r.host_uses_plain_rules {
+                let recorded = match execution {
+                    Some(execution) => r.plain_host_needs.iter().any(|need| {
+                        need.features.iter().any(|(platform, features)| {
+                            let edges = |deps: &Edges, on: &str| {
+                                [EdgeRole::Normal, EdgeRole::Build].map(|role| {
+                                    deps.role(role).get(on).cloned().unwrap_or_default()
+                                })
+                            };
+                            r.features.get(execution) != Some(features)
+                                || edges(&need.deps, platform) != edges(&r.deps, execution)
+                        })
+                    }),
+                    None => differs(&r.features, &r.deps),
+                };
+                if recorded {
+                    hosts.push((id.clone(), PLAIN_HOST_USE));
+                }
             }
             if let Some(host) = &r.host_variant
                 && differs(&host.features, &host.deps)
@@ -729,6 +757,12 @@ fn with_test_resolution(
                 // the ordinary build, their host compilations use its plain rules.
                 if !m.host_context && m.host_variant.is_none() && tests_host_built.contains(&id) {
                     m.host_uses_plain_rules = true;
+                    // Unless they get a test host variant, which they then use.
+                    if !host_variants.contains(&id.repr) {
+                        m.plain_host_needs
+                            .extend(t.plain_host_needs.iter().cloned());
+                        m.plain_host_needs.extend(t.host_variant.iter().cloned());
+                    }
                 }
                 if variants.contains(&id.repr) {
                     m.test_variant = Some(HostVariant {
@@ -818,6 +852,14 @@ fn combine_contexts(
         let resolution = match (t, h) {
             (Some(t), h) if lib_on_target || !lib_on_host => PlatformResolution {
                 host_uses_plain_rules: h.is_some() && !variants.contains(&id.repr),
+                plain_host_needs: h
+                    .iter()
+                    .filter(|_| !variants.contains(&id.repr))
+                    .map(|h| HostVariant {
+                        features: h.features.clone(),
+                        deps: h.deps.clone(),
+                    })
+                    .collect(),
                 host_variant: h
                     .filter(|_| variants.contains(&id.repr))
                     .map(|h| HostVariant {

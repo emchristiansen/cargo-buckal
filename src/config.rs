@@ -200,6 +200,28 @@ pub struct RepoConfig {
     /// and binaries whose `required-features` only the tests enable, use.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub test_features: Vec<String>,
+    /// `[platforms]`: roles of the configured `feature_platforms`.
+    #[serde(skip_serializing_if = "PlatformsConfig::is_empty")]
+    pub platforms: PlatformsConfig,
+}
+
+/// `[platforms]` of `buckal.toml`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PlatformsConfig {
+    /// The `feature_platforms` name of the execution platform, which Buck
+    /// configures host compilations for (e.g. `"linux-x86_64"`). With it, the
+    /// recorded host differences include a plain rule that host compilations use
+    /// only where its resolution on this platform differs from what they need;
+    /// without it, wherever its resolution differs between platforms.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<String>,
+}
+
+impl PlatformsConfig {
+    pub fn is_empty(&self) -> bool {
+        self.execution.is_none()
+    }
 }
 
 impl RepoConfig {
@@ -226,6 +248,7 @@ impl Default for RepoConfig {
             skip_dev_dependency_cycles: false,
             workspace_manifests: false,
             test_features: Vec::new(),
+            platforms: PlatformsConfig::default(),
         }
     }
 }

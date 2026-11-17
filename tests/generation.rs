@@ -3542,3 +3542,150 @@ fn test_a_plain_rule_host_compilations_use_is_recorded_when_it_differs_by_platfo
         "{snap}"
     );
 }
+
+/// Fable N7 with `[platforms] execution`: `buckal.toml` with both configured
+/// platforms and linux as the execution platform.
+fn execution_platform_toml() -> String {
+    format!(
+        "{}\n[platforms]\nexecution = \"linux-x86_64\"\n",
+        BUCKAL_TOML.split("[fixups.extra]").next().unwrap()
+    )
+}
+
+#[test]
+fn test_with_the_execution_platform_a_plain_rule_host_use_differing_from_it_is_recorded() {
+    // f28's shape: `pm`'s host compilation of `w` is planned on wasm32 with `f`,
+    // while Buck builds plain `:w` with the execution platform's (linux) resolution,
+    // which lacks `f`.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\nexclude = [\"pm\", \"w\"]\n",
+    );
+    write(
+        &f.ws.join("app/Cargo.toml"),
+        &manifest(
+            "app",
+            "[dependencies]\nw = { path = \"../w\" }\n\
+             [target.'cfg(target_arch = \"wasm32\")'.dependencies]\nw = { path = \"../w\", features = [\"f\"] }\npm = { path = \"../pm\" }\n",
+        ),
+    );
+    write(&f.ws.join("app/src/lib.rs"), "");
+    write(
+        &f.ws.join("pm/Cargo.toml"),
+        &manifest(
+            "pm",
+            "[workspace]\n[lib]\nproc-macro = true\n[dependencies]\nw = { path = \"../w\", features = [\"f\"] }\n",
+        ),
+    );
+    write(&f.ws.join("pm/src/lib.rs"), "");
+    write(
+        &f.ws.join("w/Cargo.toml"),
+        &manifest("w", "[workspace]\n[features]\nf = []\n"),
+    );
+    write(&f.ws.join("w/src/lib.rs"), "");
+    write(&f.ws.join("buckal.toml"), &execution_platform_toml());
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        !f.buck("w").contains("name = \"w-host\""),
+        "{}",
+        f.buck("w")
+    );
+    assert!(
+        stderr.contains("resolve differently per configured platform: w v0.1.0 (plain rule used by host compilations)"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn test_with_the_execution_platform_a_plain_rule_differing_only_elsewhere_is_not_recorded() {
+    // rustls-native-certs' shape: `r` has a `cfg(unix)` dependency `probe`, so its
+    // plain rule differs between linux and wasm32. Its only host compilation, for
+    // the proc-macro `pm` that `app` uses on linux, needs exactly its linux
+    // resolution, which is the execution platform's: nothing to record. Without
+    // `[platforms] execution` the guard stays conservative and records it.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\nexclude = [\"r\", \"probe\", \"pm\"]\n",
+    );
+    write(
+        &f.ws.join("app/Cargo.toml"),
+        &manifest(
+            "app",
+            "[dependencies]\nr = { path = \"../r\" }\n\
+             [target.'cfg(not(target_arch = \"wasm32\"))'.dependencies]\npm = { path = \"../pm\" }\n",
+        ),
+    );
+    write(&f.ws.join("app/src/lib.rs"), "");
+    write(
+        &f.ws.join("pm/Cargo.toml"),
+        &manifest(
+            "pm",
+            "[workspace]\n[lib]\nproc-macro = true\n[dependencies]\nr = { path = \"../r\" }\n",
+        ),
+    );
+    write(&f.ws.join("pm/src/lib.rs"), "");
+    write(
+        &f.ws.join("r/Cargo.toml"),
+        &manifest(
+            "r",
+            "[workspace]\n[target.'cfg(unix)'.dependencies]\nprobe = { path = \"../probe\" }\n",
+        ),
+    );
+    write(&f.ws.join("r/src/lib.rs"), "");
+    write(
+        &f.ws.join("probe/Cargo.toml"),
+        &manifest("probe", "[workspace]\n"),
+    );
+    write(&f.ws.join("probe/src/lib.rs"), "");
+    write(&f.ws.join("buckal.toml"), &execution_platform_toml());
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    // The shape: no `-host` variant, `pm` uses plain `:r`, linux-only `probe`.
+    let r = f.buck("r");
+    assert!(
+        top_deps(rule(&f.buck("pm"), "pm")).contains(&"//r:r"),
+        "{}",
+        f.buck("pm")
+    );
+    assert!(!r.contains("name = \"r-host\""), "{r}");
+    assert!(
+        r.contains("\"linux-x86_64\": {\n            \"deps\": [\"//probe:probe\"]"),
+        "{r}"
+    );
+    assert!(!stderr.contains("resolve differently"), "{stderr}");
+    let snap = std::fs::read_to_string(f.ws.join("buckal.snap")).unwrap();
+    assert!(snap.contains("host_platform_differences = []"), "{snap}");
+
+    // Without the execution platform: the conservative record.
+    write(
+        &f.ws.join("buckal.toml"),
+        BUCKAL_TOML.split("[fixups.extra]").next().unwrap(),
+    );
+    let output = f.output(&["migrate", "--accept-host-differences"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("r v0.1.0 (plain rule used by host compilations)"),
+        "{stderr}"
+    );
+
+    // An execution platform that is not configured is refused.
+    write(
+        &f.ws.join("buckal.toml"),
+        &execution_platform_toml().replace("execution = \"linux-x86_64\"", "execution = \"linux\""),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "`[platforms] execution = \"linux\"` names no platform of `feature_platforms`"
+        ),
+        "{stderr}"
+    );
+}

@@ -124,7 +124,22 @@ impl BuckalContext {
                 &repo_config.test_features,
             )
             .unwrap_or_exit_ctx("failed to resolve per-platform features");
-            let differing = host_resolutions_differing_by_platform(&per_platform);
+            let execution = repo_config.platforms.execution.as_deref();
+            if let Some(execution) = execution
+                && !repo_config.feature_platforms.contains_key(execution)
+            {
+                buckal_error!(format!(
+                    "`[platforms] execution = \"{execution}\"` names no platform of `feature_platforms` ({})",
+                    repo_config
+                        .feature_platforms
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                std::process::exit(1);
+            }
+            let differing = host_resolutions_differing_by_platform(&per_platform, execution);
             let entries: Vec<(String, String)> = differing
                 .iter()
                 .map(|(id, suffix)| {
