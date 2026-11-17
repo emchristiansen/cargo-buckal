@@ -1023,34 +1023,42 @@ mod tests {
             assert!(t.run_env.is_empty());
             assert_eq!(
                 t.resources.as_ref().map(|g| g.include.clone()),
-                Some(Set::from(["**/*.snap".to_owned()]))
+                Some(Set::from(["**/**".to_owned()]))
             );
         }
         assert_eq!(find_test(&rules, "wire").crate_root, "tests/wire.rs");
         assert!(
-            content.contains("    resources = glob([\"**/*.snap\"]),\n"),
+            content.contains("    resources = glob([\"**/**\"]),\n"),
             "{content}"
         );
         assert!(!content.contains("run_env"), "{content}");
     }
 
     #[test]
-    fn test_snapshot_resources_only_when_the_package_has_snapshots() {
-        let (_dir, node) = first_party_package(
-            "conta/inspect/render",
-            &[
-                "src/lib.rs",
-                "tests/wire.rs",
-                // In a nested Buck package, which the package glob does not enter.
-                "vocab/BUCK",
-                "vocab/x.snap",
-                // Build output and hidden directories are not sources.
-                "target/debug/y.snap",
-                ".jj/z.snap",
-            ],
-        );
+    fn test_test_resources_do_not_depend_on_existing_files() {
+        // No snapshot or data file yet: the tests still declare the package's files,
+        // so the first snapshot (or a source file a test reads, e.g. `src/generated`)
+        // is an input without regenerating the BUCK file.
+        let (_dir, node) =
+            first_party_package("conta/inspect/render", &["src/lib.rs", "tests/wire.rs"]);
         let rules = buckify_root_node(&node, &test_ctx());
-        assert_eq!(find_test(&rules, "unittest").resources, None);
+        let before = gen_buck_content(&rules);
+        for test in ["unittest", "wire"] {
+            assert_eq!(
+                find_test(&rules, test)
+                    .resources
+                    .as_ref()
+                    .map(|g| g.include.clone()),
+                Some(Set::from(["**/**".to_owned()]))
+            );
+        }
+        let pkg = node.manifest_path.parent().unwrap().to_owned();
+        std::fs::create_dir_all(pkg.join("src/snapshots")).unwrap();
+        std::fs::write(pkg.join("src/snapshots/x.snap"), "").unwrap();
+        assert_eq!(
+            gen_buck_content(&buckify_root_node(&node, &test_ctx())),
+            before
+        );
     }
 
     #[test]

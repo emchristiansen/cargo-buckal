@@ -155,13 +155,16 @@ pub(super) fn emit_rust_test(
     // relative to) is not emitted here: the Buck2 fork's prelude is the single writer of
     // a test's path-valued runtime environment.
     if matches!(node.kind, NodeKind::FirstParty { .. }) {
-        // Snapshot files (insta) are read at run time from their checkout paths.
-        if has_snapshot_files(manifest_dir) {
-            rust_test.resources = Some(Glob {
-                include: Set::from([SNAPSHOT_GLOB.to_owned()]),
-                ..Default::default()
-            });
-        }
+        // A Cargo test runs inside the checkout and may read any file of its package
+        // at run time: insta snapshots, test data, even its own sources (e.g. a test
+        // that lists `src/generated`). Declare the package's files as resources, so
+        // they are inputs of the test at their project paths. This does not depend on
+        // what exists at generation time, so adding the first snapshot (or data file)
+        // needs no regeneration.
+        rust_test.resources = Some(Glob {
+            include: Set::from([PACKAGE_FILES_GLOB.to_owned()]),
+            ..Default::default()
+        });
     }
 
     if let Some(platforms) = lookup_platforms(&node.name) {
@@ -171,27 +174,8 @@ pub(super) fn emit_rust_test(
     rust_test
 }
 
-/// Snapshot files a test reads at run time, relative to its package.
-const SNAPSHOT_GLOB: &str = "**/*.snap";
-
-/// Whether the package directory holds snapshot files that `SNAPSHOT_GLOB` would
-/// match: below it, outside `target/` and hidden directories, and not inside a nested
-/// Buck package (a directory with its own BUCK file), which a glob does not enter.
-fn has_snapshot_files(manifest_dir: &Utf8Path) -> bool {
-    walkdir::WalkDir::new(manifest_dir)
-        .into_iter()
-        .filter_entry(|entry| {
-            if entry.depth() == 0 || !entry.file_type().is_dir() {
-                return true;
-            }
-            let name = entry.file_name().to_string_lossy();
-            !(name == "target" || name.starts_with('.') || entry.path().join("BUCK").exists())
-        })
-        .filter_map(Result::ok)
-        .any(|entry| {
-            entry.file_type().is_file() && entry.path().extension().is_some_and(|ext| ext == "snap")
-        })
-}
+/// The files of a package, relative to it (a glob does not enter nested Buck packages).
+const PACKAGE_FILES_GLOB: &str = "**/**";
 
 /// Emit `buildscript_build` rule for the given build target
 pub(super) fn emit_buildscript_build(
