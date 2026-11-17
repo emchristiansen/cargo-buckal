@@ -136,6 +136,13 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
 
     report_unprovided_includes(node, ctx);
 
+    // Binaries and tests are compiled in their own context, which differs from the
+    // library's when the library is host-only (a proc-macro with an integration test).
+    let exec_node = BuckalNode {
+        platform_features: node.platform_features.exec_resolution(),
+        ..node.clone()
+    };
+
     // Pre-compute the library Buck target name for wiring binary → library deps.
     // In Cargo, every binary in a package implicitly depends on the package's library.
     let lib_buck_name: Option<String> = lib_targets.first().map(|lib_target| {
@@ -157,7 +164,8 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
     for bin_target in &bin_targets {
         let buckal_name = bin_target.name.to_owned();
 
-        let mut rust_binary = emit_rust_binary(node, bin_target, &manifest_dir, &buckal_name, ctx);
+        let mut rust_binary =
+            emit_rust_binary(&exec_node, bin_target, &manifest_dir, &buckal_name, ctx);
 
         // Cargo allows `main.rs` to use items from `lib.rs` via the crate's own name by default.
         // The binary must always depend on the sibling library, even when names differ
@@ -183,7 +191,7 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
 
         if !ctx.repo_config.ignore_tests && lib_target.test {
             // If the library target has inline tests, emit a rust_test rule for it
-            let rust_test = emit_rust_test(node, lib_target, &manifest_dir, "unittest", ctx);
+            let rust_test = emit_rust_test(&exec_node, lib_target, &manifest_dir, "unittest", ctx);
 
             buck_rules.push(Rule::RustTest(rust_test));
         }
@@ -199,7 +207,8 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         for test_target in &test_targets {
             let buckal_name = test_target.name.to_owned();
 
-            let mut rust_test = emit_rust_test(node, test_target, &manifest_dir, &buckal_name, ctx);
+            let mut rust_test =
+                emit_rust_test(&exec_node, test_target, &manifest_dir, &buckal_name, ctx);
 
             // Cargo gives integration tests `CARGO_BIN_EXE_<name>` for every binary of the
             // package, named after the binary (hyphens kept). The Buck2 fork's prelude is

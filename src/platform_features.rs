@@ -28,7 +28,7 @@
 //! with host-context features, so its output cannot be split into the two
 //! contexts reliably.)
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -174,9 +174,17 @@ pub struct PlatformResolution {
     /// this package (build scripts, host-only rules, its own host variant) use it.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub host_variant_deps: BTreeSet<String>,
+    /// The target-context resolution of the package's executables (binaries and
+    /// tests), when its library is built for the host only: a proc-macro's
+    /// integration test runs on the target, while the proc-macro itself (and so the
+    /// package's main resolution above) is a host compilation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_context: Option<HostVariant>,
 }
 
-/// The host-context resolution of a package that also builds for the target.
+/// The resolution of one more compilation context of a package: the host variant of
+/// a library also built for the target, or the target context of the executables of
+/// a package whose library is host-only.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostVariant {
     pub features: FeaturesByPlatform,
@@ -217,7 +225,25 @@ impl PlatformResolution {
             host_context: true,
             host_variant: None,
             host_variant_deps: self.host_variant_deps.clone(),
+            exec_context: None,
         })
+    }
+
+    /// The resolution that the package's binaries and tests are compiled with: the
+    /// target context when the library itself is host-only and the executables are
+    /// not, else the package's main resolution.
+    pub fn exec_resolution(&self) -> PlatformResolution {
+        match &self.exec_context {
+            None => self.clone(),
+            Some(exec) => PlatformResolution {
+                features: exec.features.clone(),
+                deps: exec.deps.clone(),
+                host_context: false,
+                host_variant: None,
+                host_variant_deps: self.host_variant_deps.clone(),
+                exec_context: None,
+            },
+        }
     }
 }
 
@@ -229,6 +255,8 @@ pub type PlatformFeatures = HashMap<PackageId, PlatformResolution>;
 struct ContextResolution {
     features: FeaturesByPlatform,
     deps: Edges,
+    /// The package's library is compiled in this context (on some platform).
+    has_lib: bool,
 }
 
 impl ContextResolution {
@@ -256,7 +284,9 @@ pub fn resolve_platform_features(
         for (context, into) in [(parsed.target, &mut target), (parsed.host, &mut host)] {
             for (id, features) in context.features {
                 let deps = context.deps.get(&id).cloned().unwrap_or_default();
+                let has_lib = context.libs.contains(&id);
                 let entry = into.entry(id).or_default();
+                entry.has_lib |= has_lib;
                 entry.features.insert(platform.clone(), features);
                 for role in [EdgeRole::Normal, EdgeRole::Build, EdgeRole::Dev] {
                     let on = deps.role(role);
@@ -294,15 +324,17 @@ fn combine_contexts(
         .iter()
         .filter_map(|(id, t)| {
             let h = host.get(id)?;
-            (!t.is_empty() && !h.is_empty() && differs(t, h)).then(|| id.repr.clone())
+            (t.has_lib && h.has_lib && differs(t, h)).then(|| id.repr.clone())
         })
         .collect();
     loop {
         let more: Vec<String> = target
-            .keys()
-            .filter(|id| !variants.contains(&id.repr))
+            .iter()
+            .filter(|(id, t)| t.has_lib && !variants.contains(&id.repr))
+            .map(|(id, _)| id)
             .filter(|id| {
                 host.get(*id)
+                    .filter(|h| h.has_lib)
                     .is_some_and(|h| h.deps.all().any(|dep| variants.contains(dep)))
             })
             .map(|id| id.repr.clone())
@@ -325,8 +357,15 @@ fn combine_contexts(
             .filter(|dep| variants.contains(*dep))
             .cloned()
             .collect();
+        // The library's own context decides the package's main resolution: the target
+        // where the library is built for the target, the host where it is built for the
+        // host only (a proc-macro, or a library used only by build scripts and
+        // proc-macros). Executables compiled in the other context (a proc-macro's
+        // integration test, on the target) keep that context's resolution apart.
+        let lib_on_target = t.as_ref().is_some_and(|t| t.has_lib);
+        let lib_on_host = h.as_ref().is_some_and(|h| h.has_lib);
         let resolution = match (t, h) {
-            (Some(t), h) => PlatformResolution {
+            (Some(t), h) if lib_on_target || !lib_on_host => PlatformResolution {
                 host_variant: h
                     .filter(|_| variants.contains(&id.repr))
                     .map(|h| HostVariant {
@@ -337,15 +376,35 @@ fn combine_contexts(
                 deps: t.deps,
                 host_context: false,
                 host_variant_deps,
+                exec_context: None,
             },
-            (None, Some(h)) => PlatformResolution {
-                features: h.features,
-                deps: h.deps,
-                host_context: true,
-                host_variant: None,
-                host_variant_deps,
-            },
+            (t, Some(h)) => {
+                let exec_context = t.map(|t| {
+                    // A host-only library's unit tests run on the host and its
+                    // integration tests on the target: the tests see both dev edges.
+                    let mut deps = t.deps;
+                    for (platform, on) in &h.deps.dev {
+                        deps.dev
+                            .entry(platform.clone())
+                            .or_default()
+                            .extend(on.iter().cloned());
+                    }
+                    HostVariant {
+                        features: t.features,
+                        deps,
+                    }
+                });
+                PlatformResolution {
+                    features: h.features,
+                    deps: h.deps,
+                    host_context: true,
+                    host_variant: None,
+                    host_variant_deps,
+                    exec_context,
+                }
+            }
             (None, None) => continue,
+            (Some(_), None) => unreachable!("handled by the first arm"),
         };
         result.insert(id, resolution);
     }
@@ -416,6 +475,8 @@ pub(crate) struct ContextTree {
     /// Dependencies (`PackageId::repr`) of the package's units in this context, by
     /// role. Build dependencies are host-context packages.
     pub deps: HashMap<PackageId, RoleDeps>,
+    /// Packages whose library (or proc-macro) is compiled in this context.
+    pub libs: HashSet<PackageId>,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -459,6 +520,17 @@ impl Unit {
     /// `run-custom-build` unit, which does carry the context.
     fn is_build_script_compile(&self) -> bool {
         self.mode != "run-custom-build" && self.target.kind.iter().any(|k| k == "custom-build")
+    }
+
+    /// Compiling the package's library or proc-macro (not its tests or executables).
+    fn is_lib_build(&self) -> bool {
+        self.mode == "build"
+            && self.target.kind.iter().any(|k| {
+                matches!(
+                    k.as_str(),
+                    "lib" | "rlib" | "dylib" | "cdylib" | "staticlib" | "proc-macro"
+                )
+            })
     }
 
     /// The role of this unit's dependencies: tests and examples see dev-dependencies,
@@ -514,6 +586,9 @@ pub(crate) fn parse_unit_graph(
             .entry(id.clone())
             .or_default()
             .extend(u.features.iter().cloned());
+        if u.is_lib_build() {
+            context.libs.insert(id.clone());
+        }
         let deps = context.deps.entry(id).or_default();
         let role = u.edge_role();
         for dep in &u.dependencies {
@@ -882,6 +957,7 @@ fixtures = { path = "../fixtures", features = ["test_lib"] }
                 )]),
                 ..Default::default()
             },
+            has_lib: true,
         };
         // `mid` resolves the same in both contexts, but depends on `json`, which does not.
         let target = HashMap::from([

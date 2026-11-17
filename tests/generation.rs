@@ -14,6 +14,28 @@ struct Fixture {
     home: PathBuf,
 }
 
+/// A fixture that keeps another one's directory alive (its stand-in `buck2`).
+struct Kept {
+    fixture: Fixture,
+    _keepalive: Fixture,
+}
+
+impl std::ops::Deref for Kept {
+    type Target = Fixture;
+    fn deref(&self) -> &Fixture {
+        &self.fixture
+    }
+}
+
+impl Fixture {
+    fn with_keepalive(self, other: Fixture) -> Kept {
+        Kept {
+            fixture: self,
+            _keepalive: other,
+        }
+    }
+}
+
 fn write(path: &Path, content: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, content).unwrap();
@@ -295,4 +317,111 @@ fn test_first_snapshot_needs_no_regeneration() {
     write(&f.ws.join("app/src/snapshots/app__first.snap"), "---\n");
     f.migrate(&[]);
     assert_eq!(f.buck("app"), before);
+}
+
+/// A workspace proc-macro with an integration test and a dev-dependency:
+/// `app -> pm (proc-macro) -> shared`, where pm really uses shared, and
+/// `pm/tests/api.rs` uses `devonly`.
+fn proc_macro_fixture(with_integration_test: bool) -> Kept {
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("ws");
+    let home = dir.path().join("home");
+    write(
+        &ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"pm\", \"shared\", \"devonly\"]\n",
+    );
+    write(
+        &ws.join("app/Cargo.toml"),
+        &manifest("app", "[dependencies]\npm = { path = \"../pm\" }\n"),
+    );
+    write(&ws.join("app/src/lib.rs"), "pm::sample!();\n");
+    write(
+        &ws.join("pm/Cargo.toml"),
+        &manifest(
+            "pm",
+            "[lib]\nproc-macro = true\n[dependencies]\nshared = { path = \"../shared\" }\n[dev-dependencies]\ndevonly = { path = \"../devonly\" }\n",
+        ),
+    );
+    write(
+        &ws.join("pm/src/lib.rs"),
+        "extern crate proc_macro;\n#[proc_macro]\npub fn sample(_: proc_macro::TokenStream) -> proc_macro::TokenStream {\n    let _ = shared::value();\n    proc_macro::TokenStream::new()\n}\n",
+    );
+    if with_integration_test {
+        write(
+            &ws.join("pm/tests/api.rs"),
+            "#[test]\nfn api() { assert_eq!(devonly::one(), 1); }\n",
+        );
+    }
+    write(&ws.join("shared/Cargo.toml"), &manifest("shared", ""));
+    write(
+        &ws.join("shared/src/lib.rs"),
+        "pub fn value() -> u32 { 1 }\n",
+    );
+    write(&ws.join("devonly/Cargo.toml"), &manifest("devonly", ""));
+    write(
+        &ws.join("devonly/src/lib.rs"),
+        "pub fn one() -> u32 { 1 }\n",
+    );
+    write(&ws.join(".buckconfig"), "[cells]\nroot = .\n");
+    write(
+        &ws.join("buckal.toml"),
+        BUCKAL_TOML.split("[fixups.extra]").next().unwrap(),
+    );
+    let base = fixture();
+    // Reuse the stand-in buck2 and HOME of a regular fixture.
+    std::fs::create_dir_all(&home).unwrap();
+    copy_dir(&base.home, &home);
+    Fixture {
+        _dir: dir,
+        ws,
+        home,
+    }
+    .with_keepalive(base)
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    for entry in walk(from) {
+        let rel = entry.strip_prefix(from).unwrap();
+        write(&to.join(rel), &std::fs::read_to_string(&entry).unwrap());
+    }
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}
+
+#[test]
+fn test_proc_macro_with_integration_test_through_generation() {
+    for with_integration_test in [true, false] {
+        let f = proc_macro_fixture(with_integration_test);
+        f.migrate(&[]);
+        let pm = f.buck("pm");
+
+        // The proc-macro library is the host compilation, with its real dependency;
+        // there is no separate host variant, so every consumer reaches this rule.
+        let lib = rule(&pm, "pm");
+        assert!(lib.contains("    proc_macro = True,"), "{lib}");
+        assert!(lib.contains("\"//shared:shared\""), "{lib}");
+        assert!(!pm.contains("name = \"pm-host\""), "{pm}");
+        let app = f.buck("app");
+        assert!(rule(&app, "app").contains("\"//pm:pm\""), "{app}");
+
+        if with_integration_test {
+            // The integration test keeps its own target-context edges (the
+            // dev-dependency) and reaches the same proc-macro rule.
+            let api = rule(&pm, "api");
+            assert!(api.contains("\":pm\""), "{api}");
+            assert!(api.contains("\"//devonly:devonly\""), "{api}");
+            assert!(api.contains("\"//shared:shared\""), "{api}");
+        }
+    }
 }
