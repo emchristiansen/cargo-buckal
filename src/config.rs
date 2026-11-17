@@ -245,6 +245,14 @@ pub struct PackageFixup {
     /// `runtime_tools` of every test target of the package.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_runtime_tools: Option<String>,
+    /// Files of a first-party package to export to other packages, as paths relative
+    /// to the package directory (e.g. a manifest another package's test reads). Each
+    /// becomes `export_file(name = <path>, src = <path>, mode = "reference")` in the
+    /// package's BUCK file, which generation would otherwise rewrite without it. A
+    /// path must name an existing file inside the package (not in a nested Buck
+    /// package).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub export_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

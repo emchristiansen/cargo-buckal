@@ -6,7 +6,7 @@ use cargo_util_schemas::core::{PackageIdSpec, SourceKind};
 use itertools::Itertools;
 
 use crate::{
-    buck::{Load, Rule, RustRule},
+    buck::{ExportFile, Load, Rule, RustRule},
     buckal_error, buckal_note, buckal_warn,
     context::BuckalContext,
     resolve::{BuckalNode, BuckalTarget, is_lib_like},
@@ -106,6 +106,18 @@ pub fn buckify_dep_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
     ));
 
     apply_fixups(&mut buck_rules, node, ctx);
+    if ctx
+        .repo_config
+        .fixups
+        .get(&node.name)
+        .is_some_and(|fixup| !fixup.export_files.is_empty())
+    {
+        buckal_error!(
+            "`[fixups.{}] export_files` is only supported for first-party packages",
+            node.name
+        );
+        std::process::exit(1);
+    }
 
     buck_rules
 }
@@ -263,8 +275,80 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
     }
 
     apply_fixups(&mut buck_rules, node, ctx);
+    match fixup_export_files(node, &buck_rules, ctx) {
+        Ok(exports) => buck_rules.extend(exports.into_iter().map(Rule::ExportFile)),
+        Err(error) => {
+            buckal_error!("{:#}", error);
+            std::process::exit(1);
+        }
+    }
 
     buck_rules
+}
+
+/// The `export_file` rules of `[fixups.<package>] export_files` for a first-party
+/// package, refusing a path that is not an existing file of the package itself or
+/// whose rule name another rule of the package already has.
+fn fixup_export_files(
+    node: &BuckalNode,
+    rules: &[Rule],
+    ctx: &BuckalContext,
+) -> anyhow::Result<Vec<ExportFile>> {
+    use cargo_metadata::camino::{Utf8Component, Utf8Path};
+
+    let Some(fixup) = ctx.repo_config.fixups.get(&node.name) else {
+        return Ok(Vec::new());
+    };
+    let package_dir = node.manifest_path.parent().expect("manifest has a parent");
+    let mut taken: Set<&str> = rules.iter().filter_map(Rule::name).collect();
+    if ctx.workspace_inherit && node.manifest_path == ctx.workspace_root.join("Cargo.toml") {
+        // The workspace manifest's own `export_file`, added to this package's BUCK.
+        taken.insert("workspace");
+    }
+    let package = &node.name;
+    fixup
+        .export_files
+        .iter()
+        .map(|path| {
+            let relative = Utf8Path::new(path);
+            let plain = !path.is_empty()
+                && relative
+                    .components()
+                    .all(|c| matches!(c, Utf8Component::Normal(_)));
+            if !plain {
+                anyhow::bail!(
+                    "`[fixups.{package}] export_files`: `{path}` is not a relative path inside the package (no `.`, `..` or leading `/`)"
+                );
+            }
+            let file = package_dir.join(relative);
+            if !file.is_file() {
+                anyhow::bail!(
+                    "`[fixups.{package}] export_files`: `{path}` is not an existing file of the package (`{file}`)"
+                );
+            }
+            if let Some(nested) = relative
+                .ancestors()
+                .skip(1)
+                .filter(|dir| !dir.as_str().is_empty())
+                .find(|dir| package_dir.join(dir).join("BUCK").exists())
+            {
+                anyhow::bail!(
+                    "`[fixups.{package}] export_files`: `{path}` is inside the nested Buck package `{nested}`"
+                );
+            }
+            if !taken.insert(path.as_str()) {
+                anyhow::bail!(
+                    "`[fixups.{package}] export_files`: `{path}` is listed twice or is already the name of a rule in the package's BUCK file"
+                );
+            }
+            Ok(ExportFile {
+                name: path.clone(),
+                src: path.clone(),
+                mode: Some("reference".to_owned()),
+                visibility: Set::from(["PUBLIC".to_owned()]),
+            })
+        })
+        .collect()
 }
 
 /// The rules of `node`'s host variant, if it has one: its library `<lib_name>-host`
@@ -812,6 +896,7 @@ mod tests {
                 test_remote_execution: None,
                 test_run_env: Default::default(),
                 test_runtime_tools: None,
+                export_files: Default::default(),
             },
         );
 

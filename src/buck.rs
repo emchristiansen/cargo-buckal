@@ -25,6 +25,22 @@ pub enum Rule {
 }
 
 impl Rule {
+    /// The rule's `name`, or `None` for a `load`.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Rule::Load(_) => None,
+            Rule::HttpArchive(r) => Some(&r.name),
+            Rule::FileGroup(r) => Some(&r.name),
+            Rule::GitFetch(r) => Some(&r.name),
+            Rule::CargoManifest(r) => Some(&r.name),
+            Rule::ExportFile(r) => Some(&r.name),
+            Rule::RustLibrary(r) => Some(&r.name),
+            Rule::RustBinary(r) => Some(&r.name),
+            Rule::RustTest(r) => Some(&r.name),
+            Rule::BuildscriptRun(r) => Some(&r.name),
+        }
+    }
+
     pub fn as_rust_rule_mut(&mut self) -> Option<&mut dyn RustRule> {
         match self {
             Rule::RustLibrary(inner) => Some(inner),

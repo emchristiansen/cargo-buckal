@@ -157,20 +157,7 @@ impl Fixture {
     }
 
     fn run(&self, args: &[&str]) {
-        let cargo_home = std::env::var_os("CARGO_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cargo")
-            });
-        let output = Command::new(env!("CARGO_BIN_EXE_cargo-buckal"))
-            .arg("buckal")
-            .args(args)
-            .current_dir(&self.ws)
-            .env("HOME", &self.home)
-            .env("CARGO_HOME", cargo_home)
-            .env("CARGO_NET_OFFLINE", "true")
-            .output()
-            .expect("run cargo-buckal");
+        let output = self.output(args);
         assert!(
             output.status.success(),
             "cargo buckal {args:?} exited with {}\nstdout:\n{}\nstderr:\n{}",
@@ -178,6 +165,23 @@ impl Fixture {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn output(&self, args: &[&str]) -> std::process::Output {
+        let cargo_home = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cargo")
+            });
+        Command::new(env!("CARGO_BIN_EXE_cargo-buckal"))
+            .arg("buckal")
+            .args(args)
+            .current_dir(&self.ws)
+            .env("HOME", &self.home)
+            .env("CARGO_HOME", cargo_home)
+            .env("CARGO_NET_OFFLINE", "true")
+            .output()
+            .expect("run cargo-buckal")
     }
 
     fn buck(&self, package: &str) -> String {
@@ -609,4 +613,78 @@ fn test_fixup_test_runtime_tools_through_generation() {
     write(&f.ws.join("buckal.toml"), BUCKAL_TOML);
     f.migrate(&[]);
     assert_eq!(f.buck("app"), app_before);
+}
+
+#[test]
+fn test_fixup_export_files_through_generation() {
+    let f = fixture();
+    f.migrate(&[]);
+    let app_before = f.buck("app");
+    let shared_before = f.buck("shared");
+    assert!(!app_before.contains("export_file("), "{app_before}");
+    let export = |path: &str| {
+        format!(
+            "export_file(\n    name = \"{path}\",\n    src = \"{path}\",\n    mode = \"reference\",\n    visibility = [\"PUBLIC\"],\n)\n"
+        )
+    };
+    let with = |paths: &str| format!("{BUCKAL_TOML}\n[fixups.app]\nexport_files = [{paths}]\n");
+
+    // Adding the fixup: an ordinary (cached) migrate exports the file from `app`'s
+    // BUCK file, and nothing else changes.
+    write(&f.ws.join("buckal.toml"), &with("\"Cargo.toml\""));
+    f.migrate(&[]);
+    let app = f.buck("app");
+    assert!(app.contains(&export("Cargo.toml")), "{app}");
+    assert_eq!(app.matches("export_file(").count(), 1, "{app}");
+    assert_eq!(
+        app.replace(&export("Cargo.toml"), "").trim_end(),
+        app_before.trim_end()
+    );
+    assert_eq!(f.buck("shared"), shared_before);
+
+    // The exports are read back from the existing BUCK file and survive a migrate
+    // that has nothing to regenerate.
+    f.migrate(&[]);
+    assert_eq!(f.buck("app"), app);
+
+    // Changing the paths regenerates with exactly the new exports.
+    write(
+        &f.ws.join("buckal.toml"),
+        &with("\"build.rs\", \"src/lib.rs\""),
+    );
+    f.migrate(&[]);
+    let app = f.buck("app");
+    assert!(app.contains(&export("build.rs")), "{app}");
+    assert!(app.contains(&export("src/lib.rs")), "{app}");
+    assert!(!app.contains("\"Cargo.toml\""), "{app}");
+    assert_eq!(app.matches("export_file(").count(), 2, "{app}");
+
+    // Removing the fixup restores the original BUCK file.
+    write(&f.ws.join("buckal.toml"), BUCKAL_TOML);
+    f.migrate(&[]);
+    assert_eq!(f.buck("app"), app_before);
+
+    // A path outside the package, a missing file, a file of a nested Buck package
+    // and a duplicate are refused, naming the package and the path.
+    write(&f.ws.join("app/nested/BUCK"), "");
+    write(&f.ws.join("app/nested/data.txt"), "");
+    for (paths, path) in [
+        ("\"../shared/Cargo.toml\"", "../shared/Cargo.toml"),
+        ("\"./Cargo.toml\"", "./Cargo.toml"),
+        ("\"/etc/hostname\"", "/etc/hostname"),
+        ("\"missing.txt\"", "missing.txt"),
+        ("\"src\"", "src"),
+        ("\"nested/data.txt\"", "nested/data.txt"),
+        ("\"build.rs\", \"build.rs\"", "build.rs"),
+    ] {
+        write(&f.ws.join("buckal.toml"), &with(paths));
+        let output = f.output(&["migrate"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{paths} was accepted:\n{stderr}");
+        assert!(
+            stderr.contains(&format!("`[fixups.app] export_files`: `{path}`")),
+            "{paths}:\n{stderr}"
+        );
+        assert_eq!(f.buck("app"), app_before, "{paths}");
+    }
 }
