@@ -351,12 +351,18 @@ impl PlatformResolution {
     }
 }
 
+/// The kind of [`host_resolutions_differing_by_platform`] entry for a library
+/// whose plain rules host compilations use.
+pub const PLAIN_HOST_USE: &str = "plain";
+
 /// Per-platform resolution per package.
 pub type PlatformFeatures = HashMap<PackageId, PlatformResolution>;
 
 /// Host compilations whose resolution differs between the configured platforms
-/// they are built for: `(package, rule suffix)`, the suffix naming the host
-/// compilation (`""` for a host-only package's own rules, `-host`, `-test-host`).
+/// they are built for: `(package, kind)`, the kind naming the host compilation
+/// (`""` for a host-only package's own rules, `-host`, `-test-host`, or
+/// [`PLAIN_HOST_USE`] for a library's plain rules that host compilations use for
+/// want of a host variant, Fable N7).
 ///
 /// Cargo plans a separate host compilation per target (each target's unit graph
 /// unifies the host's features apart), and BUCKAL keys them by platform. Buck
@@ -385,6 +391,12 @@ pub fn host_resolutions_differing_by_platform(
             let mut hosts = Vec::new();
             if r.host_context && differs(&r.features, &r.deps) {
                 hosts.push((id.clone(), ""));
+            }
+            // Host compilations use the plain rules, which Buck configures for the
+            // execution platform whatever the target (no per-platform marking
+            // either, N6).
+            if !r.host_context && r.host_uses_plain_rules && differs(&r.features, &r.deps) {
+                hosts.push((id.clone(), PLAIN_HOST_USE));
             }
             if let Some(host) = &r.host_variant
                 && differs(&host.features, &host.deps)

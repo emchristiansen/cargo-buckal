@@ -9,7 +9,7 @@ use crate::{
     cache::BuckalCache,
     config::RepoConfig,
     platform_features::{
-        EdgeRole, host_resolutions_differing_by_platform, resolve_platform_features,
+        EdgeRole, PLAIN_HOST_USE, host_resolutions_differing_by_platform, resolve_platform_features,
     },
     resolve::{BuckalNode, BuckalResolve, NodeKind},
     utils::{UnwrapOrExit, get_buck2_root},
@@ -32,7 +32,7 @@ pub struct BuckalContext {
     /// for one.
     pub workspace_members: Option<std::collections::BTreeSet<PackageId>>,
     /// Host compilations that resolve differently per configured platform, as
-    /// `<name> v<version> (<host-only | variant -host | variant -test-host>)`,
+    /// `<name> v<version> (<host-only | variant -host | variant -test-host | plain rule used by host compilations>)`,
     /// sorted; `None` without `feature_platforms`. The emission record keeps it,
     /// and a change stops the next generation unless it is accepted.
     pub host_platform_differences: Option<Vec<String>>,
@@ -132,14 +132,11 @@ impl BuckalContext {
                         .get(id)
                         .map(|p| format!("{} v{}", p.name, p.version))
                         .unwrap_or_else(|| id.repr.clone());
-                    let entry = format!(
-                        "{name} ({}{suffix})",
-                        if suffix.is_empty() {
-                            "host-only"
-                        } else {
-                            "variant "
-                        }
-                    );
+                    let entry = match *suffix {
+                        "" => format!("{name} (host-only)"),
+                        PLAIN_HOST_USE => format!("{name} (plain rule used by host compilations)"),
+                        _ => format!("{name} (variant {suffix})"),
+                    };
                     let resolution = &per_platform[id];
                     let (features, deps) = match *suffix {
                         "-host" => resolution

@@ -3480,3 +3480,65 @@ fn test_buildscript_run_inputs_through_generation() {
     assert_eq!(f.buck("shared"), shared_before);
     assert_eq!(f.buck("sdk"), sdk_before);
 }
+
+#[test]
+fn test_a_plain_rule_host_compilations_use_is_recorded_when_it_differs_by_platform() {
+    // Fable N7 (fixture f28): `app` uses `w` everywhere and, on wasm32, `w` with `f`
+    // and the proc-macro `pm`, which needs `w` with `f`. On wasm32 Cargo's host `w`
+    // equals its target `w`, so no `-host` variant is emitted and `pm` uses plain
+    // `:w`, whose resolution differs between linux and wasm32. Buck builds `pm`'s
+    // `w` with the execution platform's resolution (no `f`), so the guard must
+    // record it. `pm` and `w` are excluded path dependencies, like f28's registry
+    // packages: as members, `cargo build --workspace` would build `pm` (and `w`
+    // with `f`) on linux too.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\nexclude = [\"pm\", \"w\"]\n",
+    );
+    write(
+        &f.ws.join("app/Cargo.toml"),
+        &manifest(
+            "app",
+            "[dependencies]\nw = { path = \"../w\" }\n\
+             [target.'cfg(target_arch = \"wasm32\")'.dependencies]\nw = { path = \"../w\", features = [\"f\"] }\npm = { path = \"../pm\" }\n",
+        ),
+    );
+    write(&f.ws.join("app/src/lib.rs"), "");
+    write(
+        &f.ws.join("pm/Cargo.toml"),
+        &manifest(
+            "pm",
+            "[workspace]\n[lib]\nproc-macro = true\n[dependencies]\nw = { path = \"../w\", features = [\"f\"] }\n",
+        ),
+    );
+    write(&f.ws.join("pm/src/lib.rs"), "");
+    write(
+        &f.ws.join("w/Cargo.toml"),
+        &manifest("w", "[workspace]\n[features]\nf = []\n"),
+    );
+    write(&f.ws.join("w/src/lib.rs"), "");
+    write(
+        &f.ws.join("buckal.toml"),
+        BUCKAL_TOML.split("[fixups.extra]").next().unwrap(),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    // The shape is f28's: plain `:w` for `pm`, `f` on wasm32 only.
+    let w = f.buck("w");
+    assert!(!w.contains("name = \"w-host\""), "{w}");
+    assert!(
+        w.contains("\"wasm32\": {\n            \"features\": [\"f\"]"),
+        "{w}"
+    );
+    assert!(
+        stderr.contains("resolve differently per configured platform: w v0.1.0 (plain rule used by host compilations)"),
+        "{stderr}"
+    );
+    let snap = std::fs::read_to_string(f.ws.join("buckal.snap")).unwrap();
+    assert!(
+        snap.contains("w v0.1.0 (plain rule used by host compilations)"),
+        "{snap}"
+    );
+}
