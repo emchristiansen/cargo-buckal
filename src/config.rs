@@ -228,6 +228,18 @@ pub struct PackageFixup {
     /// their project paths.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub test_resources: Vec<String>,
+    /// How the package's tests execute: the name of a profile on the remote test
+    /// execution toolchain, or `"disabled"`. Emitted as the `remote_execution` of
+    /// every test target of the package. For tests that need a worker capability
+    /// that other tests do not, such as a particular fixture filesystem.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_remote_execution: Option<String>,
+    /// Environment for running the package's tests, not for compiling them. Added to
+    /// the `run_env` of every test target of the package. For values that the
+    /// execution profile promises the test, such as the path of a worker-provided
+    /// fixture root.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub test_run_env: Map<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -351,6 +363,42 @@ mod tests {
                 .get("//text/glyph_vocab/vocab:compiler_input/bpe-52.toml")
                 .map(String::as_str),
             Some("vocab/bpe-52.toml")
+        );
+    }
+
+    #[test]
+    fn test_repo_config_deserializes_fixup_test_execution() {
+        let config: RepoConfig = toml::from_str(
+            r#"
+                [fixups.fixture_user]
+                test_remote_execution = "fixture_fs_profile"
+                test_run_env = { FIXTURE_ROOT = "/srv/fixtures" }
+            "#,
+        )
+        .expect("failed to deserialize repo config");
+
+        let fixup = config.fixups.get("fixture_user").expect("missing fixup");
+        assert_eq!(
+            fixup.test_remote_execution.as_deref(),
+            Some("fixture_fs_profile")
+        );
+        assert_eq!(
+            fixup.test_run_env.get("FIXTURE_ROOT").map(String::as_str),
+            Some("/srv/fixtures")
+        );
+        // Run-time environment is not compile-time environment.
+        assert!(fixup.env.is_empty());
+
+        // Unset, they are absent from the fixup and from its serialization (which the
+        // cache fingerprints), so existing fixups keep their fingerprints.
+        let other: RepoConfig =
+            toml::from_str("[fixups.other]\nenv = { A = \"1\" }\n").expect("deserialize");
+        let other = other.fixups.get("other").unwrap();
+        assert_eq!(other.test_remote_execution, None);
+        assert!(other.test_run_env.is_empty());
+        assert_eq!(
+            serde_json::to_string(other).unwrap(),
+            r#"{"env":{"A":"1"}}"#
         );
     }
 

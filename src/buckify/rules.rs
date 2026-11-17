@@ -331,6 +331,10 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
             Rule::RustTest(r) => {
                 r.extra_resources
                     .extend(fixup.test_resources.iter().cloned());
+                r.run_env.extend(fixup.test_run_env.clone());
+                if let Some(remote_execution) = &fixup.test_remote_execution {
+                    r.remote_execution = Some(remote_execution.clone());
+                }
                 (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs)
             }
             Rule::BuildscriptRun(r) => {
@@ -802,6 +806,8 @@ mod tests {
                 rustc_flags: vec!["-Lnative=/opt/openssl/lib".to_owned()],
                 mapped_srcs: Default::default(),
                 test_resources: Default::default(),
+                test_remote_execution: None,
+                test_run_env: Default::default(),
             },
         );
 
@@ -941,6 +947,64 @@ mod tests {
             "{content}"
         );
         assert_eq!(content.matches("extra_resources").count(), 2, "{content}");
+    }
+
+    #[test]
+    fn test_fixup_test_execution_reaches_every_test_and_nothing_else() {
+        let (_dir, mut node) = first_party_package("pkg", &["src/lib.rs", "tests/wire.rs"]);
+        node.targets.push(BuckalTarget {
+            name: "tool".to_owned(),
+            kind: vec![TargetKind::Bin],
+            src_path: node.manifest_path.parent().unwrap().join("src/main.rs"),
+            doctest: false,
+            test: false,
+        });
+        let mut ctx = test_ctx();
+        let plain = gen_buck_content(&buckify_root_node(&node, &ctx));
+        assert!(!plain.contains("remote_execution"), "{plain}");
+        assert!(!plain.contains("run_env"), "{plain}");
+
+        ctx.repo_config.fixups.insert(
+            node.name.clone(),
+            crate::config::PackageFixup {
+                test_remote_execution: Some("fixture_fs_profile".to_owned()),
+                test_run_env: [("FIXTURE_ROOT".to_owned(), "/srv/fixtures".to_owned())].into(),
+                ..Default::default()
+            },
+        );
+        let rules = buckify_root_node(&node, &ctx);
+        for test in ["unittest", "wire"] {
+            let t = find_test(&rules, test);
+            assert_eq!(t.remote_execution.as_deref(), Some("fixture_fs_profile"));
+            assert_eq!(
+                t.run_env,
+                [("FIXTURE_ROOT".to_owned(), "/srv/fixtures".to_owned())].into()
+            );
+            // Compile-time env is untouched: run_env is for running only.
+            assert!(!t.env.contains_key("FIXTURE_ROOT"));
+        }
+        let content = gen_buck_content(&rules);
+        assert!(
+            content.contains("    remote_execution = \"fixture_fs_profile\",\n"),
+            "{content}"
+        );
+        assert!(
+            content.contains(
+                "    run_env = {\n        \"FIXTURE_ROOT\": \"/srv/fixtures\",\n    },\n"
+            ),
+            "{content}"
+        );
+        // Only the two tests carry them; the library and the binary do not.
+        assert_eq!(content.matches("remote_execution").count(), 2, "{content}");
+        assert_eq!(content.matches("run_env").count(), 2, "{content}");
+        // Everything else is as without the fixup.
+        let stripped = content
+            .replace("    remote_execution = \"fixture_fs_profile\",\n", "")
+            .replace(
+                "    run_env = {\n        \"FIXTURE_ROOT\": \"/srv/fixtures\",\n    },\n",
+                "",
+            );
+        assert_eq!(stripped, plain);
     }
 
     #[test]

@@ -519,3 +519,52 @@ fn test_merge_keeps_manual_flag_groups_and_drops_old_fixup_flags() {
         [manifest_flag, "-C", "debuginfo=1"]
     );
 }
+
+#[test]
+fn test_fixup_test_execution_through_generation() {
+    let f = fixture();
+    f.migrate(&[]);
+    let app_before = f.buck("app");
+    let shared_before = f.buck("shared");
+    assert!(!app_before.contains("remote_execution"), "{app_before}");
+
+    // Adding the fixup to an existing configuration: an ordinary (cached) migrate
+    // gives every test of `app` the profile and run-time environment.
+    let with = |profile: &str| {
+        format!(
+            "{BUCKAL_TOML}\n[fixups.app]\ntest_remote_execution = \"{profile}\"\n\
+             test_run_env = {{ FIXTURE_ROOT = \"/srv/fixtures\" }}\n"
+        )
+    };
+    write(&f.ws.join("buckal.toml"), &with("fixture_fs_profile"));
+    f.migrate(&[]);
+    let app = f.buck("app");
+    let test = rule(&app, "unittest");
+    assert!(
+        test.contains("    remote_execution = \"fixture_fs_profile\",\n"),
+        "{test}"
+    );
+    assert!(
+        test.contains("    run_env = {\n        \"FIXTURE_ROOT\": \"/srv/fixtures\",\n    },\n"),
+        "{test}"
+    );
+    // Only tests: the library and the build script rules are unchanged.
+    assert_eq!(rule(&app, "app"), rule(&app_before, "app"));
+    assert_eq!(app.matches("remote_execution").count(), 1, "{app}");
+    assert_eq!(app.matches("run_env").count(), 1, "{app}");
+    // Only this package.
+    assert_eq!(f.buck("shared"), shared_before);
+
+    // Changing only the profile regenerates; removing the fixup restores the rules.
+    write(&f.ws.join("buckal.toml"), &with("other_profile"));
+    f.migrate(&[]);
+    let app = f.buck("app");
+    assert!(
+        app.contains("remote_execution = \"other_profile\""),
+        "{app}"
+    );
+    assert!(!app.contains("fixture_fs_profile"), "{app}");
+    write(&f.ws.join("buckal.toml"), BUCKAL_TOML);
+    f.migrate(&[]);
+    assert_eq!(f.buck("app"), app_before);
+}
