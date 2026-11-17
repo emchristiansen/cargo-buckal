@@ -192,16 +192,10 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
 
             let mut rust_test = emit_rust_test(node, test_target, &manifest_dir, &buckal_name, ctx);
 
-            // Cargo provides `CARGO_BIN_EXE_<name>` to integration tests for every binary
-            // target of the package, keyed by the binary's own name (hyphens kept).
-            // The prelude's rust_test applies `env` both when compiling and when running
-            // the test, so this serves `env!` and `std::env::var` alike.
-            for bin_target in &bin_targets {
-                rust_test.env_mut().insert(
-                    format!("CARGO_BIN_EXE_{}", bin_target.name),
-                    format!("$(location :{})", bin_target.name),
-                );
-            }
+            // `CARGO_BIN_EXE_<name>` is not emitted here: the runtime path environment of a
+            // test has a single writer, the Buck2 fork's prelude, which resolves it to an
+            // absolute path when the test runs. A `$(location)` in `env` would be both
+            // relative and baked into `env!` at compile time.
 
             // Integration tests may use the package's library under its crate name.
             if let Some(lib_name) = &lib_buck_name {
@@ -534,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn test_integration_test_gets_cargo_bin_exe_for_every_binary() {
+    fn test_integration_test_depends_on_library_and_gets_no_path_env() {
         // Package `my-tool` whose binaries are not named after the package
         // (as in a package `observatory_db_feedback_cli` with binary `observatory-feedback`).
         let lib = mock_target("my_tool", TargetKind::Lib);
@@ -544,58 +538,19 @@ mod tests {
 
         let node = mock_node("my-tool", vec![lib, bin_a, bin_b, test]);
         let rules = buckify_root_node(&node, &test_ctx());
+
         let test_rule = find_test(&rules, "cli");
-
-        assert_eq!(
-            test_rule
-                .env
-                .get("CARGO_BIN_EXE_my-cli")
-                .map(String::as_str),
-            Some("$(location :my-cli)")
-        );
-        assert_eq!(
-            test_rule
-                .env
-                .get("CARGO_BIN_EXE_helper")
-                .map(String::as_str),
-            Some("$(location :helper)")
-        );
         assert!(test_rule.deps.contains(":my_tool"));
-    }
-
-    #[test]
-    fn test_integration_test_cargo_bin_exe_keeps_hyphenated_package_binary_name() {
-        // The binary takes the package's hyphenated name; Cargo names the variable
-        // after the binary, not after the underscored crate name.
-        let lib = mock_target("my_tool", TargetKind::Lib);
-        let bin = mock_target("my-tool", TargetKind::Bin);
-        let test = mock_target("cli", TargetKind::Test);
-
-        let node = mock_node("my-tool", vec![lib, bin, test]);
-        let rules = buckify_root_node(&node, &test_ctx());
-        let test_rule = find_test(&rules, "cli");
-
-        assert_eq!(
-            test_rule
+        // CARGO_BIN_EXE_* is the prelude's to write at run time, not a `$(location)` here.
+        assert!(
+            !test_rule
                 .env
-                .get("CARGO_BIN_EXE_my-tool")
-                .map(String::as_str),
-            Some("$(location :my-tool)")
+                .keys()
+                .any(|k| k.starts_with("CARGO_BIN_EXE_"))
         );
-        assert!(!test_rule.env.contains_key("CARGO_BIN_EXE_my_tool"));
-        assert!(test_rule.deps.contains(":my_tool"));
-    }
+        assert!(test_rule.run_env.is_empty());
 
-    #[test]
-    fn test_unit_test_gets_no_cargo_bin_exe() {
-        // Cargo sets CARGO_BIN_EXE_* for integration tests and benches only.
-        let lib = mock_target("my_tool", TargetKind::Lib);
-        let bin = mock_target("my-tool", TargetKind::Bin);
-
-        let node = mock_node("my-tool", vec![lib, bin]);
-        let rules = buckify_root_node(&node, &test_ctx());
         let unit = find_test(&rules, "unittest");
-
         assert!(!unit.env.keys().any(|k| k.starts_with("CARGO_BIN_EXE_")));
     }
 
@@ -903,10 +858,8 @@ mod tests {
 
         for test in ["unittest", "wire"] {
             let t = find_test(&rules, test);
-            assert_eq!(
-                t.run_env.get("CARGO_MANIFEST_DIR").map(String::as_str),
-                Some("conta/wire")
-            );
+            // The runtime CARGO_MANIFEST_DIR is the prelude's to write.
+            assert!(t.run_env.is_empty());
             assert_eq!(
                 t.resources.as_ref().map(|g| g.include.clone()),
                 Some(Set::from(["**/*.snap".to_owned()]))
@@ -917,12 +870,7 @@ mod tests {
             content.contains("    resources = glob([\"**/*.snap\"]),\n"),
             "{content}"
         );
-        assert!(
-            content.contains(
-                "    run_env = {\n        \"CARGO_MANIFEST_DIR\": \"conta/wire\",\n    },\n"
-            ),
-            "{content}"
-        );
+        assert!(!content.contains("run_env"), "{content}");
     }
 
     #[test]
@@ -942,13 +890,6 @@ mod tests {
         );
         let rules = buckify_root_node(&node, &test_ctx());
         assert_eq!(find_test(&rules, "unittest").resources, None);
-        assert_eq!(
-            find_test(&rules, "unittest")
-                .run_env
-                .get("CARGO_MANIFEST_DIR")
-                .map(String::as_str),
-            Some("conta/inspect/render")
-        );
     }
 
     #[test]

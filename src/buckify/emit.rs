@@ -151,18 +151,10 @@ pub(super) fn emit_rust_test(
     set_deps(&mut rust_test, node, CargoTargetKind::Test, ctx)
         .unwrap_or_exit_ctx(format!("failed to set dependencies for '{}'", buckal_name));
 
-    if let NodeKind::FirstParty { relative_path } = &node.kind {
-        // The crate root that `file!()` paths are relative to, for the test's run time.
-        // Project-relative, as the sources are compiled at their checkout paths.
-        let crate_root = if relative_path.is_empty() {
-            ".".to_owned()
-        } else {
-            normalize_path_for_buck(relative_path)
-        };
-        rust_test
-            .run_env
-            .insert("CARGO_MANIFEST_DIR".to_owned(), crate_root);
-
+    // The runtime `CARGO_MANIFEST_DIR` (the package directory that `file!()` paths are
+    // relative to) is not emitted here: the Buck2 fork's prelude is the single writer of
+    // a test's path-valued runtime environment.
+    if matches!(node.kind, NodeKind::FirstParty { .. }) {
         // Snapshot files (insta) are read at run time from their checkout paths.
         if has_snapshot_files(manifest_dir) {
             rust_test.resources = Some(Glob {
