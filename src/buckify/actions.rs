@@ -6,7 +6,7 @@ use crate::{
         FixupFlags, GENERATED_HEADER, NamedFileGroup, PARTLY_GENERATED_HEADER, Rule, TopLevelKind,
         parse_buck_file, patch_buck_rules, top_level_statements,
     },
-    buckal_log,
+    buckal_error, buckal_log,
     buckify::emit::emit_export_file,
     cache::{BuckalChange, ChangeType},
     context::BuckalContext,
@@ -87,8 +87,21 @@ impl BuckalChange {
                         let mut buck_content = if is_third_party_pkg {
                             gen_buck_content(&buck_rules)
                         } else {
-                            let (loads, statements) = hand_written(&buck_path);
-                            gen_buck_content_preserving(&buck_rules, &loads, &statements)
+                            let hand = hand_written(&buck_path);
+                            // The workspace-root rules spliced into this file later.
+                            let reserved = if vendor_dir == ctx.workspace_root {
+                                root_owned_names(ctx)
+                            } else {
+                                Vec::new()
+                            };
+                            if let Err(error) = check_namespace(&buck_rules, &hand.calls, &reserved)
+                            {
+                                buckal_error!(format!(
+                                    "{buck_path}: {error}; it is left unchanged"
+                                ));
+                                std::process::exit(1);
+                            }
+                            gen_buck_content_preserving(&buck_rules, &hand.loads, &hand.statements)
                         };
                         if !is_third_party_pkg {
                             buck_content =
@@ -152,6 +165,25 @@ impl BuckalChange {
         if buck_path.exists() {
             let existing = std::fs::read_to_string(&buck_path)
                 .unwrap_or_exit_ctx(format!("Failed to read {}", buck_path));
+            let (statements, _) = top_level_statements(buck_path.as_str(), &existing)
+                .unwrap_or_exit_ctx(format!("Failed to parse {}", buck_path));
+            for (function, name, _) in &owned {
+                if let Some(other) = statements
+                    .iter()
+                    .find_map(|statement| match &statement.kind {
+                        TopLevelKind::Call {
+                            function: f,
+                            name: Some(n),
+                        } if n == name && f != function => Some(f),
+                        _ => None,
+                    })
+                {
+                    buckal_error!(format!(
+                        "{buck_path}: generation owns the target `{name}` (`{function}`) here, but `{other}(name = \"{name}\")` declares it too; rename it. The file is left unchanged"
+                    ));
+                    std::process::exit(1);
+                }
+            }
             let rules: Vec<_> = owned
                 .iter()
                 .map(|(function, name, text)| (*function, *name, text.trim_end()))
@@ -247,7 +279,7 @@ const GENERATED_RULE_KINDS: [&str; 9] = [
 /// every other top-level statement that is not a call of a generated rule kind,
 /// each with the comments leading up to it, verbatim. Comments after the last
 /// statement are kept as a statement of their own.
-fn hand_written(buck_path: &Utf8Path) -> (Vec<String>, Vec<String>) {
+fn hand_written(buck_path: &Utf8Path) -> HandWritten {
     let Ok(content) = std::fs::read_to_string(buck_path) else {
         return Default::default();
     };
@@ -255,20 +287,80 @@ fn hand_written(buck_path: &Utf8Path) -> (Vec<String>, Vec<String>) {
         .unwrap_or_exit_ctx(format!(
             "Failed to parse {buck_path}, whose hand-written content generation would replace"
         ));
-    let mut loads = Vec::new();
-    let mut kept = Vec::new();
+    let mut hand = HandWritten::default();
     for statement in statements {
         let text = content[statement.with_comments.clone()].to_owned();
         match &statement.kind {
             TopLevelKind::Load(bzl) if bzl.starts_with("@buckal//") => {}
-            TopLevelKind::Load(_) => loads.push(text),
+            TopLevelKind::Load(_) => hand.loads.push(text),
             TopLevelKind::Call { function, .. }
                 if GENERATED_RULE_KINDS.contains(&function.as_str()) => {}
-            _ => kept.push(text),
+            kind => {
+                if let TopLevelKind::Call {
+                    function,
+                    name: Some(name),
+                } = kind
+                {
+                    hand.calls.push((function.clone(), name.clone()));
+                }
+                hand.statements.push(text);
+            }
         }
     }
-    kept.extend(trailing.map(|range| content[range].to_owned()));
-    (loads, kept)
+    hand.statements
+        .extend(trailing.map(|range| content[range].to_owned()));
+    hand
+}
+
+/// What [`hand_written`] keeps of a BUCK file.
+#[derive(Debug, Default)]
+struct HandWritten {
+    loads: Vec<String>,
+    statements: Vec<String>,
+    /// The kept top-level calls with a literal `name`, as `(function, name)`:
+    /// targets the file declares beside the generated rules.
+    calls: Vec<(String, String)>,
+}
+
+/// The rules generation splices into the workspace-root BUCK file, as
+/// `(function, name)`.
+fn root_owned_names(ctx: &BuckalContext) -> Vec<(&'static str, &'static str)> {
+    if ctx.repo_config.workspace_manifests {
+        vec![("filegroup", WORKSPACE_MANIFESTS)]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Refuse a BUCK file that would declare a target name twice: a generated rule
+/// and a kept hand-written call, or either and a rule spliced in later
+/// (`reserved`, as `(function, name)`).
+fn check_namespace(
+    rules: &[Rule],
+    calls: &[(String, String)],
+    reserved: &[(&str, &str)],
+) -> Result<(), String> {
+    let generated: Vec<&str> = rules.iter().filter_map(Rule::name).collect();
+    for (function, name) in calls {
+        if generated.contains(&name.as_str()) {
+            return Err(format!(
+                "the hand-written `{function}(name = \"{name}\")` declares the target `{name}`, which generation also emits; rename it (or the generating fixup)"
+            ));
+        }
+    }
+    for (function, name) in reserved {
+        if generated.contains(name) {
+            return Err(format!(
+                "generation emits a rule named `{name}` here and also owns `{function}(name = \"{name}\")` in this file"
+            ));
+        }
+        if let Some((other, _)) = calls.iter().find(|(f, n)| n == name && f != function) {
+            return Err(format!(
+                "generation owns `{function}(name = \"{name}\")` in this file, but the hand-written `{other}(name = \"{name}\")` declares it too; rename it"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `content` of a BUCK file that generation does not own as a whole, without the

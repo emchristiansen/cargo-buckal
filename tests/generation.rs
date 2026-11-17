@@ -1879,3 +1879,83 @@ fn test_proc_macro_integration_test_uses_its_test_host_variant() {
     assert!(top_deps(api).contains(&":pm-test-host"), "{api}");
     assert!(!top_deps(api).contains(&":pm"), "{api}");
 }
+
+/// Run `migrate`, which must refuse (mentioning `needle`) and leave `files` (paths
+/// relative to the workspace) byte-identical.
+fn assert_refused_unchanged(f: &Fixture, files: &[&str], needle: &str) {
+    let before: Vec<String> = files
+        .iter()
+        .map(|p| std::fs::read_to_string(f.ws.join(p)).unwrap())
+        .collect();
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains(needle), "{stderr}");
+    for (path, before) in files.iter().zip(before) {
+        assert_eq!(
+            std::fs::read_to_string(f.ws.join(path)).unwrap(),
+            before,
+            "{path}"
+        );
+    }
+}
+
+#[test]
+fn test_export_files_refuse_names_the_package_already_declares() {
+    // EXP-1 (t_7c72255f): a kept hand-written macro call declares `data.txt`.
+    let f = fixture();
+    f.migrate(&[]);
+    let app = f.buck("app");
+    write(
+        &f.ws.join("app/BUCK"),
+        &format!("{app}\nload(\"//:custom.bzl\", \"custom\")\n\ncustom(name = \"data.txt\")\n"),
+    );
+    write(
+        &f.ws.join("custom.bzl"),
+        "def custom(name):\n    native.filegroup(name = name, srcs = [])\n",
+    );
+    write(&f.ws.join("app/data.txt"), "data\n");
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!("{BUCKAL_TOML}\n[fixups.app]\nexport_files = [\"data.txt\"]\n"),
+    );
+    assert_refused_unchanged(&f, &["app/BUCK"], "data.txt");
+
+    // A file named like the generated library.
+    write(&f.ws.join("app/BUCK"), &app);
+    write(&f.ws.join("app/app"), "data\n");
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!("{BUCKAL_TOML}\n[fixups.app]\nexport_files = [\"app\"]\n"),
+    );
+    assert_refused_unchanged(&f, &["app/BUCK"], "app");
+}
+
+#[test]
+fn test_workspace_manifests_refuses_a_root_target_of_that_name() {
+    // WM-1 (t_7c72255f): a root package whose library is `workspace_manifests`.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[package]\nname = \"workspace_manifests\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\nresolver = \"2\"\nmembers = [\"extra\"]\n",
+    );
+    write(&f.ws.join("src/lib.rs"), "");
+    write(&f.ws.join("BUCK"), "# A hand-written root package file.\n");
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!("workspace_manifests = true\n{BUCKAL_TOML}"),
+    );
+    assert_refused_unchanged(&f, &["BUCK"], "workspace_manifests");
+
+    // A hand-written macro of that name in a virtual workspace's root BUCK file.
+    let f = fixture();
+    write(
+        &f.ws.join("BUCK"),
+        "load(\"//:inputs.bzl\", \"declare_source_tree_inputs\")\n\ndeclare_source_tree_inputs(name = \"workspace_manifests\")\n",
+    );
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!("workspace_manifests = true\n{BUCKAL_TOML}"),
+    );
+    assert_refused_unchanged(&f, &["BUCK"], "workspace_manifests");
+}
