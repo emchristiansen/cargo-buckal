@@ -3998,3 +3998,53 @@ fn test_wasm_modules_from_their_own_graph_through_generation() {
         "{stderr}"
     );
 }
+
+#[test]
+fn test_per_test_unset_run_env_through_generation() {
+    // N14: a single test can drop a key of the package's `test_run_env` (an empty
+    // string stays a value).
+    let f = fixture();
+    write(&f.ws.join("app/tests/it.rs"), "");
+    let with = |test: &str| {
+        format!(
+            "{BUCKAL_TOML}\n[fixups.app.test_run_env]\nA = \"pkg\"\nB = \"pkg\"\n\n[fixups.app.tests.it]\n{test}\n"
+        )
+    };
+    write(
+        &f.ws.join("buckal.toml"),
+        &with("unset_run_env = [\"B\"]\nrun_env = { C = \"\" }"),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let app = f.buck("app");
+    assert!(
+        rule(&app, "it")
+            .contains("    run_env = {\n        \"A\": \"pkg\",\n        \"C\": \"\",\n    },\n"),
+        "{app}"
+    );
+    assert!(
+        rule(&app, "unittest").contains(
+            "    run_env = {\n        \"A\": \"pkg\",\n        \"B\": \"pkg\",\n    },\n"
+        ),
+        "{app}"
+    );
+    // Removing a key the package does not set, or one the test sets, is refused.
+    for (test, why) in [
+        (
+            "unset_run_env = [\"Z\"]",
+            "`[fixups.app.tests.it] unset_run_env`: `Z`: the package's `test_run_env` does not set it",
+        ),
+        (
+            "unset_run_env = [\"A\"]\nrun_env = { A = \"it\" }",
+            "`[fixups.app.tests.it] unset_run_env`: `A`: this test's `run_env` sets it",
+        ),
+    ] {
+        write(&f.ws.join("buckal.toml"), &with(test));
+        let output = f.output(&["migrate"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{test}:\n{stderr}");
+        assert!(stderr.contains(why), "{test}:\n{stderr}");
+        assert_eq!(f.buck("app"), app, "{test}");
+    }
+}

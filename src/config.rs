@@ -502,6 +502,11 @@ pub struct TestFixup {
     /// set here extends it, or overrides the package's value.
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub run_env: Map<String, String>,
+    /// Keys of the package's `test_run_env` this test does not get (an empty string
+    /// is a value, so removal is a list of its own). A key the package does not set,
+    /// or that this test's `run_env` sets, is refused.
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub unset_run_env: Set<String>,
     /// `RuntimeToolsInfo` label of this test, instead of the package's
     /// `test_runtime_tools`; `""` gives this test none.
     #[serde(skip_serializing_if = "Option::is_none")]

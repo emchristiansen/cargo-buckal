@@ -997,6 +997,22 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
         );
         std::process::exit(1);
     }
+    for (test, t) in &fixup.tests {
+        for key in &t.unset_run_env {
+            let why = if !fixup.test_run_env.contains_key(key) {
+                "the package's `test_run_env` does not set it"
+            } else if t.run_env.contains_key(key) {
+                "this test's `run_env` sets it"
+            } else {
+                continue;
+            };
+            buckal_error!(
+                "`[fixups.{}.tests.{test}] unset_run_env`: `{key}`: {why}",
+                node.name
+            );
+            std::process::exit(1);
+        }
+    }
     if let Err(error) = check_lifted_args(&node.name, fixup) {
         buckal_error!("{:#}", error);
         std::process::exit(1);
@@ -1058,6 +1074,9 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
                         r.supports_test_execution_caching = Some(caching);
                     }
                     r.run_env.extend(test.run_env.clone());
+                    for key in &test.unset_run_env {
+                        r.run_env.remove(key);
+                    }
                     if let Some(runtime_tools) = &test.runtime_tools {
                         r.runtime_tools =
                             (!runtime_tools.is_empty()).then(|| runtime_tools.clone());
