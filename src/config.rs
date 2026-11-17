@@ -209,6 +209,12 @@ pub struct PackageFixup {
     /// Extra rustc flags for the package's crates (library, binaries, tests).
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub rustc_flags: Set<String>,
+    /// Extra compile inputs for the package's crates, as the prelude's `mapped_srcs`:
+    /// a label (e.g. an `export_file` of a nested package) to its path inside the
+    /// crate's sources, relative to the package directory. For files that
+    /// `include_str!`/`include_bytes!` reads but the package glob does not provide.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub mapped_srcs: Map<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -311,6 +317,28 @@ mod tests {
         );
         assert!(fixup.env.is_empty());
         assert!(fixup.rustc_flags.contains("-Lnative=/opt/openssl/lib"));
+    }
+
+    #[test]
+    fn test_repo_config_deserializes_fixup_mapped_srcs() {
+        let config: RepoConfig = toml::from_str(
+            r#"
+                [fixups.text_glyph_vocab.mapped_srcs]
+                "//text/glyph_vocab/vocab:compiler_input/bpe-52.toml" = "vocab/bpe-52.toml"
+            "#,
+        )
+        .expect("failed to deserialize repo config");
+        let fixup = config
+            .fixups
+            .get("text_glyph_vocab")
+            .expect("missing fixup");
+        assert_eq!(
+            fixup
+                .mapped_srcs
+                .get("//text/glyph_vocab/vocab:compiler_input/bpe-52.toml")
+                .map(String::as_str),
+            Some("vocab/bpe-52.toml")
+        );
     }
 
     #[test]

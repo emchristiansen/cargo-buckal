@@ -7,11 +7,13 @@ use itertools::Itertools;
 
 use crate::{
     buck::{Load, Rule, RustRule},
-    buckal_error, buckal_note,
+    buckal_error, buckal_note, buckal_warn,
     context::BuckalContext,
     resolve::{BuckalNode, is_lib_like},
     utils::{UnwrapOrExit, get_vendor_dir},
 };
+
+use super::includes::{IncludeGap, UnprovidedInclude, unprovided_includes};
 
 use super::emit::{
     emit_buildscript_build, emit_buildscript_run, emit_cargo_manifest, emit_filegroup,
@@ -122,6 +124,8 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
     let mut buck_rules: Vec<Rule> = Vec::new();
 
     let manifest_dir = node.manifest_path.parent().unwrap().to_owned();
+
+    report_unprovided_includes(node, ctx);
 
     // Pre-compute the library Buck target name for wiring binary → library deps.
     // In Cargo, every binary in a package implicitly depends on the package's library.
@@ -242,10 +246,10 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
         return;
     };
     for rule in rules {
-        let (env, rustc_flags) = match rule {
-            Rule::RustLibrary(r) => (&mut r.env, &mut r.rustc_flags),
-            Rule::RustBinary(r) => (&mut r.env, &mut r.rustc_flags),
-            Rule::RustTest(r) => (&mut r.env, &mut r.rustc_flags),
+        let (env, rustc_flags, mapped_srcs) = match rule {
+            Rule::RustLibrary(r) => (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs),
+            Rule::RustBinary(r) => (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs),
+            Rule::RustTest(r) => (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs),
             Rule::BuildscriptRun(r) => {
                 r.env.extend(fixup.buildscript_env.clone());
                 continue;
@@ -254,6 +258,50 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
         };
         env.extend(fixup.env.clone());
         rustc_flags.extend(fixup.rustc_flags.iter().cloned());
+        mapped_srcs.extend(fixup.mapped_srcs.clone());
+    }
+}
+
+/// Report compile-time includes of a first-party package that its sources do not
+/// provide and that no `mapped_srcs` fixup declares.
+fn report_unprovided_includes(node: &BuckalNode, ctx: &BuckalContext) {
+    let package_dir = node.manifest_path.parent().unwrap();
+    let declared: Set<&str> = ctx
+        .repo_config
+        .fixups
+        .get(&node.name)
+        .map(|fixup| fixup.mapped_srcs.values().map(String::as_str).collect())
+        .unwrap_or_default();
+    let missing: Vec<_> = unprovided_includes(package_dir)
+        .into_iter()
+        .filter(|include| !declared.contains(include.resolved.as_str()))
+        .collect();
+    let (nested, outside): (Vec<_>, Vec<_>) = missing
+        .iter()
+        .partition(|include| include.kind == IncludeGap::NestedPackage);
+    let sample = |includes: &[&UnprovidedInclude]| {
+        includes
+            .iter()
+            .take(3)
+            .map(|i| format!("`{}` in {}", i.written, i.from))
+            .join(", ")
+    };
+    if !nested.is_empty() {
+        buckal_warn!(
+            "Package `{}` includes {} file(s) from a nested Buck package, which its sources do not contain (e.g. {}). Declare them with `mapped_srcs` under `[fixups.{}]` in buckal.toml.",
+            node.name,
+            nested.len(),
+            sample(&nested),
+            node.name
+        );
+    }
+    if !outside.is_empty() {
+        buckal_warn!(
+            "Package `{}` includes {} file(s) from outside its directory (e.g. {}); a crate compiled from its package cannot reach them.",
+            node.name,
+            outside.len(),
+            sample(&outside)
+        );
     }
 }
 
@@ -693,6 +741,7 @@ mod tests {
                 .into(),
                 env: Default::default(),
                 rustc_flags: Set::from(["-Lnative=/opt/openssl/lib".to_owned()]),
+                mapped_srcs: Default::default(),
             },
         );
 
@@ -899,6 +948,68 @@ mod tests {
                 .get("CARGO_MANIFEST_DIR")
                 .map(String::as_str),
             Some("conta/inspect/render")
+        );
+    }
+
+    #[test]
+    fn test_nested_package_include_declared_through_mapped_srcs() {
+        // As text/glyph_vocab: `src/internal/sources.rs` includes `../../vocab/bpe-52.toml`,
+        // and `vocab/` is its own Buck package that exports the file.
+        let (_dir, mut node) = first_party_package(
+            "text/glyph_vocab",
+            &[
+                "src/lib.rs",
+                "tests/wire.rs",
+                "vocab/BUCK",
+                "vocab/bpe-52.toml",
+            ],
+        );
+        let pkg = node.manifest_path.parent().unwrap().to_owned();
+        std::fs::write(
+            pkg.join("src/internal.rs"),
+            "pub const A: &str = include_str!(\"../vocab/bpe-52.toml\");",
+        )
+        .unwrap();
+        node.name = "text_glyph_vocab".to_owned();
+        assert_eq!(
+            super::super::includes::unprovided_includes(&pkg)
+                .into_iter()
+                .map(|i| (i.resolved, i.kind))
+                .collect::<Vec<_>>(),
+            vec![("vocab/bpe-52.toml".to_owned(), IncludeGap::NestedPackage)]
+        );
+
+        let mut ctx = test_ctx();
+        ctx.repo_config.fixups.insert(
+            "text_glyph_vocab".to_owned(),
+            crate::config::PackageFixup {
+                mapped_srcs: [(
+                    "//text/glyph_vocab/vocab:compiler_input/bpe-52.toml".to_owned(),
+                    "vocab/bpe-52.toml".to_owned(),
+                )]
+                .into(),
+                ..Default::default()
+            },
+        );
+
+        let rules = buckify_root_node(&node, &ctx);
+        for rule in &rules {
+            let mapped = match rule {
+                Rule::RustLibrary(r) => &r.mapped_srcs,
+                Rule::RustTest(r) => &r.mapped_srcs,
+                _ => continue,
+            };
+            assert_eq!(
+                mapped
+                    .get("//text/glyph_vocab/vocab:compiler_input/bpe-52.toml")
+                    .map(String::as_str),
+                Some("vocab/bpe-52.toml")
+            );
+        }
+        let content = gen_buck_content(&rules);
+        assert!(
+            content.contains("    mapped_srcs = {\n        \"//text/glyph_vocab/vocab:compiler_input/bpe-52.toml\": \"vocab/bpe-52.toml\",\n    },\n"),
+            "{content}"
         );
     }
 }

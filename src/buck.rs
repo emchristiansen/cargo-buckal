@@ -106,6 +106,9 @@ pub struct ExportFile {
 pub struct RustLibrary {
     pub name: String,
     pub srcs: Srcs,
+    /// Extra sources: label -> path inside the crate's sources.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub mapped_srcs: Map<String, String>,
     #[serde(rename = "crate")]
     pub crate_name: String,
     pub crate_root: String,
@@ -144,6 +147,9 @@ pub struct RustLibrary {
 pub struct RustBinary {
     pub name: String,
     pub srcs: Srcs,
+    /// Extra sources: label -> path inside the crate's sources.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub mapped_srcs: Map<String, String>,
     #[serde(rename = "crate")]
     pub crate_name: String,
     pub crate_root: String,
@@ -180,6 +186,9 @@ pub struct RustBinary {
 pub struct RustTest {
     pub name: String,
     pub srcs: Srcs,
+    /// Extra sources: label -> path inside the crate's sources.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub mapped_srcs: Map<String, String>,
     #[serde(rename = "crate")]
     pub crate_name: String,
     pub crate_root: String,
@@ -699,6 +708,7 @@ impl RustLibrary {
     fn from_kwargs(kwargs: &RuleKwargs) -> anyhow::Result<Self> {
         let name = kwargs.get_str("name")?;
         let srcs = kwargs.get_srcs("srcs");
+        let mapped_srcs = kwargs.get_dict("mapped_srcs");
         let crate_name = kwargs.get_str("crate")?;
         let crate_root = kwargs.get_str("crate_root")?;
         let edition = kwargs.get_str("edition")?;
@@ -717,6 +727,7 @@ impl RustLibrary {
         Ok(RustLibrary {
             name,
             srcs,
+            mapped_srcs,
             crate_name,
             crate_root,
             edition,
@@ -741,6 +752,7 @@ impl RustBinary {
     fn from_kwargs(kwargs: &RuleKwargs) -> anyhow::Result<Self> {
         let name = kwargs.get_str("name")?;
         let srcs = kwargs.get_srcs("srcs");
+        let mapped_srcs = kwargs.get_dict("mapped_srcs");
         let crate_name = kwargs.get_str("crate")?;
         let crate_root = kwargs.get_str("crate_root")?;
         let edition = kwargs.get_str("edition")?;
@@ -758,6 +770,7 @@ impl RustBinary {
         Ok(RustBinary {
             name,
             srcs,
+            mapped_srcs,
             crate_name,
             crate_root,
             edition,
@@ -781,6 +794,7 @@ impl RustTest {
     fn from_kwargs(kwargs: &RuleKwargs) -> anyhow::Result<Self> {
         let name = kwargs.get_str("name")?;
         let srcs = kwargs.get_srcs("srcs");
+        let mapped_srcs = kwargs.get_dict("mapped_srcs");
         let crate_name = kwargs.get_str("crate")?;
         let crate_root = kwargs.get_str("crate_root")?;
         let edition = kwargs.get_str("edition")?;
@@ -800,6 +814,7 @@ impl RustTest {
         Ok(RustTest {
             name,
             srcs,
+            mapped_srcs,
             crate_name,
             crate_root,
             edition,
@@ -1261,6 +1276,7 @@ mod tests {
             Rule::RustBinary(RustBinary {
                 name: "libra".to_string(),
                 srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "libra".to_string(),
                 crate_root: "vendor/src/main.rs".to_string(),
                 edition: "2024".to_string(),
@@ -1275,6 +1291,7 @@ mod tests {
             Rule::RustLibrary(RustLibrary {
                 name: "libra-lib".to_string(),
                 srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "libra".to_string(),
                 crate_root: "vendor/src/lib.rs".to_string(),
                 edition: "2024".to_string(),
@@ -1289,6 +1306,7 @@ mod tests {
             Rule::RustTest(RustTest {
                 name: "unittest".to_string(),
                 srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "libra".to_string(),
                 crate_root: "vendor/src/lib.rs".to_string(),
                 edition: "2024".to_string(),
@@ -1303,6 +1321,7 @@ mod tests {
             Rule::RustTest(RustTest {
                 name: "ai_agent_test".to_string(),
                 srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "ai_agent_test".to_string(),
                 crate_root: "vendor/tests/ai_agent_test.rs".to_string(),
                 edition: "2024".to_string(),
@@ -1318,6 +1337,7 @@ mod tests {
             Rule::RustTest(RustTest {
                 name: "ai_chat_agent_test".to_string(),
                 srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "ai_chat_agent_test".to_string(),
                 crate_root: "vendor/tests/ai_chat_agent_test.rs".to_string(),
                 edition: "2024".to_string(),
@@ -1333,6 +1353,7 @@ mod tests {
             Rule::RustTest(RustTest {
                 name: "ai_dag_tool_loop_test".to_string(),
                 srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "ai_dag_tool_loop_test".to_string(),
                 crate_root: "vendor/tests/ai_dag_tool_loop_test.rs".to_string(),
                 edition: "2024".to_string(),
@@ -1348,6 +1369,7 @@ mod tests {
             Rule::RustTest(RustTest {
                 name: "ai_storage_flow_test".to_string(),
                 srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "ai_storage_flow_test".to_string(),
                 crate_root: "vendor/tests/ai_storage_flow_test.rs".to_string(),
                 edition: "2024".to_string(),
@@ -1363,6 +1385,7 @@ mod tests {
             Rule::RustTest(RustTest {
                 name: "cloud_storage_backup_test".to_string(),
                 srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "cloud_storage_backup_test".to_string(),
                 crate_root: "vendor/tests/cloud_storage_backup_test.rs".to_string(),
                 edition: "2024".to_string(),
@@ -1378,6 +1401,7 @@ mod tests {
             Rule::RustTest(RustTest {
                 name: "command_test".to_string(),
                 srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "command_test".to_string(),
                 crate_root: "vendor/tests/command_test.rs".to_string(),
                 edition: "2024".to_string(),
@@ -1393,6 +1417,7 @@ mod tests {
             Rule::RustTest(RustTest {
                 name: "e2e_mcp_flow".to_string(),
                 srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "e2e_mcp_flow".to_string(),
                 crate_root: "vendor/tests/e2e_mcp_flow.rs".to_string(),
                 edition: "2024".to_string(),
@@ -1408,6 +1433,7 @@ mod tests {
             Rule::RustTest(RustTest {
                 name: "intent_flow_test".to_string(),
                 srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "intent_flow_test".to_string(),
                 crate_root: "vendor/tests/intent_flow_test.rs".to_string(),
                 edition: "2024".to_string(),
@@ -1423,6 +1449,7 @@ mod tests {
             Rule::RustTest(RustTest {
                 name: "mcp_integration_test".to_string(),
                 srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "mcp_integration_test".to_string(),
                 crate_root: "vendor/tests/mcp_integration_test.rs".to_string(),
                 edition: "2024".to_string(),
@@ -1438,6 +1465,7 @@ mod tests {
             Rule::RustTest(RustTest {
                 name: "storage_r2_test".to_string(),
                 srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "storage_r2_test".to_string(),
                 crate_root: "vendor/tests/storage_r2_test.rs".to_string(),
                 edition: "2024".to_string(),
@@ -1509,6 +1537,7 @@ mod tests {
             Rule::RustLibrary(RustLibrary {
                 name: "aws-lc-rs".to_string(),
                 srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "aws_lc_rs".to_string(),
                 crate_root: "vendor/src/lib.rs".to_string(),
                 edition: "2021".to_string(),
@@ -1539,6 +1568,7 @@ mod tests {
             Rule::RustBinary(RustBinary {
                 name: "build-script-build".to_string(),
                 srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "build_script_build".to_string(),
                 crate_root: "vendor/build.rs".to_string(),
                 edition: "2021".to_string(),
@@ -1624,6 +1654,7 @@ mod tests {
             Rule::RustLibrary(RustLibrary {
                 name: "git-internal".to_string(),
                 srcs: Set::from([":vendor".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "git_internal".to_string(),
                 crate_root: "vendor/src/lib.rs".to_string(),
                 edition: "2024".to_string(),
@@ -1858,6 +1889,7 @@ mod tests {
         let expected = Rule::RustLibrary(RustLibrary {
             name: "example_lib".to_string(),
             srcs: Set::from(["src/lib.rs".to_string()]).into(),
+            mapped_srcs: Map::new(),
             crate_name: "example_lib".to_string(),
             crate_root: "src/lib.rs".to_string(),
             edition: "2024".to_string(),
@@ -1896,6 +1928,7 @@ mod tests {
         let expected = Rule::RustBinary(RustBinary {
             name: "example_bin".to_string(),
             srcs: Set::from(["src/main.rs".to_string()]).into(),
+            mapped_srcs: Map::new(),
             crate_name: "example_bin".to_string(),
             crate_root: "src/main.rs".to_string(),
             edition: "2024".to_string(),
@@ -1933,6 +1966,7 @@ mod tests {
         let expected = Rule::RustTest(RustTest {
             name: "example_test".to_string(),
             srcs: Set::from(["src/lib.rs".to_string()]).into(),
+            mapped_srcs: Map::new(),
             crate_name: "example_test".to_string(),
             crate_root: "src/lib.rs".to_string(),
             edition: "2024".to_string(),
@@ -2026,6 +2060,7 @@ mod tests {
             Rule::RustLibrary(RustLibrary {
                 name: "with_select".to_string(),
                 srcs: Set::from(["src/lib.rs".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "with_select".to_string(),
                 crate_root: "src/lib.rs".to_string(),
                 edition: "2024".to_string(),
@@ -2036,6 +2071,7 @@ mod tests {
             Rule::RustLibrary(RustLibrary {
                 name: "with_select_reversed".to_string(),
                 srcs: Set::from(["src/lib.rs".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "with_select_reversed".to_string(),
                 crate_root: "src/lib.rs".to_string(),
                 edition: "2024".to_string(),
@@ -2046,6 +2082,7 @@ mod tests {
             Rule::RustLibrary(RustLibrary {
                 name: "merge_both_sides".to_string(),
                 srcs: Set::from(["src/lib.rs".to_string()]).into(),
+                mapped_srcs: Map::new(),
                 crate_name: "merge_both_sides".to_string(),
                 crate_root: "src/lib.rs".to_string(),
                 edition: "2024".to_string(),

@@ -2,6 +2,7 @@ mod actions;
 pub mod cross;
 mod deps;
 mod emit;
+mod includes;
 mod rules;
 mod windows;
 
