@@ -793,10 +793,12 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
         let (env, rustc_flags, mapped_srcs) = match rule {
             Rule::RustLibrary(r) => {
                 r.deps.extend(sets.deps);
+                r.target_compatible_with.extend(sets.target_compatible_with);
                 (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs)
             }
             Rule::RustBinary(r) => {
                 r.deps.extend(sets.deps);
+                r.target_compatible_with.extend(sets.target_compatible_with);
                 (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs)
             }
             Rule::RustTest(r) => {
@@ -820,6 +822,7 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
             }
             Rule::BuildscriptRun(r) => {
                 r.env.extend(sets.env);
+                r.target_compatible_with.extend(sets.target_compatible_with);
                 r.rustc_link_lib |= run.rustc_link_lib;
                 r.rustc_link_search |= run.rustc_link_search;
                 continue;
@@ -859,6 +862,8 @@ pub(crate) fn fixup_set_contributions(
     match rule {
         Rule::RustLibrary(_) => {
             sets.deps.extend(fixup.extra_deps.iter().cloned());
+            sets.target_compatible_with
+                .extend(fixup.target_compatible_with.iter().cloned());
             sets.env.extend(fixup.env.clone());
         }
         Rule::RustBinary(r) => {
@@ -866,6 +871,8 @@ pub(crate) fn fixup_set_contributions(
                 sets.deps
                     .extend(fixup.buildscript.build.extra_deps.iter().cloned());
             }
+            sets.target_compatible_with
+                .extend(fixup.target_compatible_with.iter().cloned());
             sets.env.extend(fixup.env.clone());
         }
         Rule::RustTest(r) => {
@@ -877,7 +884,11 @@ pub(crate) fn fixup_set_contributions(
             }
             sets.env.extend(fixup.env.clone());
         }
-        Rule::BuildscriptRun(_) => sets.env.extend(fixup.buildscript_env.clone()),
+        Rule::BuildscriptRun(_) => {
+            sets.target_compatible_with
+                .extend(fixup.target_compatible_with.iter().cloned());
+            sets.env.extend(fixup.buildscript_env.clone());
+        }
         _ => {}
     }
     sets
@@ -1574,6 +1585,7 @@ mod tests {
                 test_target_compatible_with: Default::default(),
                 test_args: Default::default(),
                 tests: Default::default(),
+                target_compatible_with: Default::default(),
                 extra_deps: Default::default(),
                 buildscript: Default::default(),
             },

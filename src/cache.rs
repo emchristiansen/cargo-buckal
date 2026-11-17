@@ -33,11 +33,16 @@ use crate::resolve::BuckalResolve;
 ///            rules this version would not write, so every package is regenerated;
 ///            its record of the fixups that generation applied stays valid and is
 ///            kept for `--merge`.
+/// Version 9: rules change from an unchanged resolution again: packages that no
+///            configured platform builds are incompatible, target compilations are
+///            incompatible where their resolution lacks a platform, and binaries
+///            only the tests enable are emitted only for integration tests. A
+///            version 6 to 8 cache is stale in the same way.
 ///
 /// Migration strategy:
 /// - If found < expected (stale cache from older Buckal): ignore the old cache and rebuild.
 /// - If found > expected (cache from newer Buckal): exit immediately and prompt the user to upgrade.
-const CACHE_VERSION: u32 = 8;
+const CACHE_VERSION: u32 = 9;
 
 /// The oldest cache version whose record of the fixups a generation applied
 /// (`fixup_rustc_flags`, `fixups`) is still read, from a cache whose rules are

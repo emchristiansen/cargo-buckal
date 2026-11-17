@@ -309,6 +309,13 @@ pub struct PackageFixup {
     /// refused.
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub tests: Map<String, TestFixup>,
+    /// `target_compatible_with` constraints (or config settings) of the package's
+    /// libraries (every `rust_library`, including its variants), binaries and build
+    /// scripts (the build script binaries and their `buildscript_run`), e.g. to keep
+    /// a package off platforms where it does not build. Added to what generation
+    /// derives from where Cargo builds the package.
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub target_compatible_with: Set<String>,
     /// Extra dependencies of the package's libraries (every `rust_library`,
     /// including a host variant), as in Reindeer's top-level `extra_deps`, e.g. a
     /// toolchain target providing a system library.

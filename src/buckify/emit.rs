@@ -17,7 +17,7 @@ use crate::{
     buckify::actions::is_third_party,
     context::BuckalContext,
     platform::{buck_labels, lookup_platforms},
-    platform_features::{PlatformAttrs, split_features},
+    platform_features::{PlatformAttrs, platform_list_mut, split_features},
     resolve::{BuckalDepKind, BuckalNode, BuckalTarget, NodeKind},
     utils::{UnwrapOrExit, get_buck2_root, get_cfgs, get_target, get_vendor_path_relative},
 };
@@ -67,6 +67,14 @@ pub(super) fn emit_rust_library(
     if let Some(platforms) = lookup_platforms(&node.name) {
         rust_library.compatible_with = buck_labels(&platforms);
     }
+    let host = node.platform_features.host_context;
+    platform_compatibility(
+        node,
+        ctx,
+        host,
+        &mut rust_library.target_compatible_with,
+        &mut rust_library.platform,
+    );
 
     // Set dependencies
     set_deps(&mut rust_library, node, CargoTargetKind::Lib, ctx)
@@ -114,6 +122,14 @@ pub(super) fn emit_rust_binary(
     if let Some(platforms) = lookup_platforms(&node.name) {
         rust_binary.compatible_with = buck_labels(&platforms);
     }
+    let host = node.platform_features.host_context;
+    platform_compatibility(
+        node,
+        ctx,
+        host,
+        &mut rust_binary.target_compatible_with,
+        &mut rust_binary.platform,
+    );
 
     rust_binary
 }
@@ -173,8 +189,54 @@ pub(super) fn emit_rust_test(
     if let Some(platforms) = lookup_platforms(&node.name) {
         rust_test.compatible_with = buck_labels(&platforms);
     }
+    let host = node.platform_features.host_context;
+    platform_compatibility(
+        node,
+        ctx,
+        host,
+        &mut rust_test.target_compatible_with,
+        &mut rust_test.platform,
+    );
 
     rust_test
+}
+
+/// The prelude's constraint that no platform satisfies.
+pub(super) const INCOMPATIBLE: &str = "prelude//:none";
+
+/// Where Cargo builds a compilation of `node` (its resolution), as the rule's
+/// `target_compatible_with`. With configured platforms, a package that none of
+/// them builds (a dependency only for other targets, e.g. macOS or Windows) is
+/// incompatible everywhere. A target compilation is incompatible on each
+/// configured platform its resolution lacks (one built for wasm32 only), through
+/// the `platform` attribute. A host compilation (`host`) is configured for the
+/// execution platform, while its resolution is keyed by the target it serves, so
+/// only the first case applies to it.
+fn platform_compatibility(
+    node: &BuckalNode,
+    ctx: &BuckalContext,
+    host: bool,
+    target_compatible_with: &mut Set<String>,
+    platform: &mut PlatformAttrs,
+) {
+    let configured = &ctx.repo_config.feature_platforms;
+    if configured.is_empty() {
+        return;
+    }
+    let resolution = &node.platform_features;
+    if resolution.is_empty() {
+        target_compatible_with.insert(INCOMPATIBLE.to_owned());
+        return;
+    }
+    if host {
+        return;
+    }
+    for name in configured.keys() {
+        if !resolution.features.contains_key(name) {
+            platform_list_mut(platform, name, "target_compatible_with")
+                .insert(INCOMPATIBLE.to_owned());
+        }
+    }
 }
 
 /// The files of a package, relative to it (a glob does not enter nested Buck packages).
@@ -222,6 +284,14 @@ pub(super) fn emit_buildscript_build(
         "failed to set dependencies for '{}'",
         buildscript_build.name
     ));
+    // A build script is a host compilation.
+    platform_compatibility(
+        node,
+        ctx,
+        true,
+        &mut buildscript_build.target_compatible_with,
+        &mut buildscript_build.platform,
+    );
 
     buildscript_build
 }
@@ -248,6 +318,24 @@ pub(super) fn emit_buildscript_run(
         visibility: Set::from(["PUBLIC".to_owned()]),
         ..Default::default()
     };
+
+    let host = node.platform_features.host_context;
+    platform_compatibility(
+        node,
+        ctx,
+        host,
+        &mut buildscript_run.target_compatible_with,
+        &mut buildscript_run.platform,
+    );
+    // The per-platform build script aliases of an incompatible run are as well.
+    if buildscript_run
+        .target_compatible_with
+        .contains(INCOMPATIBLE)
+    {
+        buildscript_run
+            .buildscript_compatible_with
+            .insert(INCOMPATIBLE.to_owned());
+    }
 
     let host_target = get_target();
     let host_cfgs = get_cfgs();

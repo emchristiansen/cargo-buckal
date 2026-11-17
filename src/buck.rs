@@ -292,6 +292,12 @@ pub struct BuildscriptRun {
     /// (`{platform name: {attribute: values}}`), e.g. features one platform adds.
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub platform: PlatformAttrs,
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub target_compatible_with: Set<String>,
+    /// `target_compatible_with` of the per-platform aliases of the build script
+    /// binary that the run makes.
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub buildscript_compatible_with: Set<String>,
     pub version: String,
     pub manifest_dir: String,
     /// Pass the build script's `cargo:rustc-link-lib` (`rustc_link_search`:
@@ -1055,6 +1061,8 @@ impl BuildscriptRun {
         let rustc_link_lib = kwargs.get_bool_opt("rustc_link_lib").unwrap_or_default();
         let rustc_link_search = kwargs.get_bool_opt("rustc_link_search").unwrap_or_default();
         let visibility = kwargs.get_list("visibility");
+        let target_compatible_with = kwargs.get_list("target_compatible_with");
+        let buildscript_compatible_with = kwargs.get_list("buildscript_compatible_with");
         Ok(BuildscriptRun {
             name,
             package_name,
@@ -1063,6 +1071,8 @@ impl BuildscriptRun {
             env_srcs,
             features,
             platform: Map::new(),
+            target_compatible_with,
+            buildscript_compatible_with,
             version,
             manifest_dir,
             rustc_link_lib,
@@ -2375,6 +2385,8 @@ mod tests {
             ]),
             features: Set::from(["alloc".to_string(), "default".to_string()]),
             platform: Map::new(),
+            target_compatible_with: Set::new(),
+            buildscript_compatible_with: Set::new(),
             version: "1.2.3".to_string(),
             manifest_dir: ":vendor".to_string(),
             rustc_link_lib: false,
