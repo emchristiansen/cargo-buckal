@@ -421,6 +421,37 @@ impl PlatformResolution {
     }
 }
 
+/// What the plain rules of `r` build on `platform` (its features, and its normal and
+/// build edges): that platform's entry, or for a platform the package has none
+/// for, what every platform it has shares, which emission hoists out of
+/// `platform` (Fable N10).
+fn plain_rule_on(
+    r: &PlatformResolution,
+    platform: &str,
+) -> (BTreeSet<String>, [BTreeSet<String>; 2]) {
+    let edges_on = |on: &str| {
+        [EdgeRole::Normal, EdgeRole::Build]
+            .map(|role| r.deps.role(role).get(on).cloned().unwrap_or_default())
+    };
+    if let Some(features) = r.features.get(platform) {
+        return (features.clone(), edges_on(platform));
+    }
+    let mut platforms = r.features.keys();
+    let Some(first) = platforms.next() else {
+        return Default::default();
+    };
+    platforms.fold(
+        (r.features[first].clone(), edges_on(first)),
+        |(features, edges), on| {
+            let other = edges_on(on);
+            (
+                features.intersection(&r.features[on]).cloned().collect(),
+                [0, 1].map(|i| edges[i].intersection(&other[i]).cloned().collect()),
+            )
+        },
+    )
+}
+
 /// The kind of [`host_resolutions_differing_by_platform`] entry for a library
 /// whose plain rules host compilations use.
 pub const PLAIN_HOST_USE: &str = "plain";
@@ -474,17 +505,22 @@ pub fn host_resolutions_differing_by_platform(
             // either, N6).
             if !r.host_context && r.host_uses_plain_rules {
                 let recorded = match execution {
-                    Some(execution) => r.plain_host_needs.iter().any(|need| {
-                        need.features.iter().any(|(platform, features)| {
-                            let edges = |deps: &Edges, on: &str| {
-                                [EdgeRole::Normal, EdgeRole::Build].map(|role| {
-                                    deps.role(role).get(on).cloned().unwrap_or_default()
-                                })
-                            };
-                            r.features.get(execution) != Some(features)
-                                || edges(&need.deps, platform) != edges(&r.deps, execution)
+                    Some(execution) => {
+                        let (features, edges) = plain_rule_on(r, execution);
+                        r.plain_host_needs.iter().any(|need| {
+                            need.features.iter().any(|(platform, needed)| {
+                                let needed_edges =
+                                    [EdgeRole::Normal, EdgeRole::Build].map(|role| {
+                                        need.deps
+                                            .role(role)
+                                            .get(platform)
+                                            .cloned()
+                                            .unwrap_or_default()
+                                    });
+                                *needed != features || needed_edges != edges
+                            })
                         })
-                    }),
+                    }
                     None => differs(&r.features, &r.deps),
                 };
                 if recorded {

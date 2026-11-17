@@ -4048,3 +4048,45 @@ fn test_per_test_unset_run_env_through_generation() {
         assert_eq!(f.buck("app"), app, "{test}");
     }
 }
+
+#[test]
+fn test_with_the_execution_platform_a_library_only_elsewhere_compares_its_hoisted_rule() {
+    // Fable N10 (f35k): `w` exists on wasm32 only, with `f`; the wasm32-only
+    // proc-macro `pm` needs `w` with `f`. With no linux resolution, the plain rule
+    // Buck builds on the execution platform carries what every platform shares,
+    // here `f`: what the host needs, so nothing is recorded.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\nexclude = [\"pm\", \"w\"]\n",
+    );
+    write(
+        &f.ws.join("app/Cargo.toml"),
+        &manifest(
+            "app",
+            "[target.'cfg(target_arch = \"wasm32\")'.dependencies]\nw = { path = \"../w\", features = [\"f\"] }\npm = { path = \"../pm\" }\n",
+        ),
+    );
+    write(&f.ws.join("app/src/lib.rs"), "");
+    write(
+        &f.ws.join("pm/Cargo.toml"),
+        &manifest(
+            "pm",
+            "[workspace]\n[lib]\nproc-macro = true\n[dependencies]\nw = { path = \"../w\", features = [\"f\"] }\n",
+        ),
+    );
+    write(&f.ws.join("pm/src/lib.rs"), "");
+    write(
+        &f.ws.join("w/Cargo.toml"),
+        &manifest("w", "[workspace]\n[features]\nf = []\n"),
+    );
+    write(&f.ws.join("w/src/lib.rs"), "");
+    write(&f.ws.join("buckal.toml"), &execution_platform_toml());
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let w = f.buck("w");
+    assert!(!w.contains("name = \"w-host\""), "{w}");
+    assert!(rule(&w, "w").contains("    features = [\"f\"],\n"), "{w}");
+    assert!(!stderr.contains("resolve differently"), "{stderr}");
+}
