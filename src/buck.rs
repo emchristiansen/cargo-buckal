@@ -41,6 +41,7 @@ pub trait RustRule {
     fn env_mut(&mut self) -> &mut Map<String, String>;
     fn named_deps_mut(&mut self) -> &mut Map<String, String>;
     fn os_named_deps_mut(&mut self) -> &mut Map<String, Map<String, String>>;
+    fn platform_mut(&mut self) -> &mut PlatformAttrs;
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -582,6 +583,10 @@ macro_rules! impl_rust_rule {
 
             fn os_named_deps_mut(&mut self) -> &mut Map<String, Map<String, String>> {
                 &mut self.os_named_deps
+            }
+
+            fn platform_mut(&mut self) -> &mut PlatformAttrs {
+                &mut self.platform
             }
         }
     };

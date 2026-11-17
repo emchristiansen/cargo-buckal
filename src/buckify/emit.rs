@@ -440,7 +440,7 @@ pub(super) fn node_features(node: &BuckalNode) -> (Set<String>, PlatformAttrs) {
     if node.platform_features.is_empty() {
         (node.features.iter().cloned().collect(), Map::new())
     } else {
-        split_features(&node.platform_features)
+        split_features(&node.platform_features.features)
     }
 }
 

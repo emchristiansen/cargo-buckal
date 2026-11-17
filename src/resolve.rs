@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::bail;
@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache::{Fingerprint, PackageIdExt};
 use crate::config::RepoPatchConfig;
+use crate::platform_features::PlatformResolution;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeKind {
@@ -55,12 +56,13 @@ pub struct BuckalNode {
     pub name: String,
     pub version: String,
     pub features: Vec<String>,
-    /// Features Cargo enables for this package on each configured platform
-    /// (Reindeer platform name -> features), when `feature_platforms` is set in
+    /// Features and dependencies Cargo resolves for this package on each configured
+    /// platform (Reindeer platform name), when `feature_platforms` is set in
     /// buckal.toml. Empty otherwise, in which case `features` (the union over every
-    /// platform that `cargo metadata` reports) is used everywhere.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub platform_features: BTreeMap<String, BTreeSet<String>>,
+    /// platform that `cargo metadata` reports) and every resolved dependency are used
+    /// everywhere.
+    #[serde(default, skip_serializing_if = "PlatformResolution::is_empty")]
+    pub platform_features: PlatformResolution,
     pub kind: NodeKind,
     pub edition: Edition,
     // -- Fields from Package --
@@ -389,12 +391,21 @@ impl BuckalResolve {
         // Per-platform features (BTree order is deterministic). Hashed only when present,
         // so fingerprints of repositories that do not configure them are unchanged.
         if !node.platform_features.is_empty() {
-            hasher.update(b"platform_features");
-            for (platform, features) in &node.platform_features {
-                hasher.update(platform.as_bytes());
-                hasher.update(&(features.len() as u64).to_le_bytes());
-                for f in features {
-                    hasher.update(f.as_bytes());
+            for (tag, per_platform) in [
+                (
+                    b"platform_features".as_slice(),
+                    &node.platform_features.features,
+                ),
+                (b"platform_deps".as_slice(), &node.platform_features.deps),
+            ] {
+                hasher.update(tag);
+                for (platform, values) in per_platform {
+                    hasher.update(platform.as_bytes());
+                    hasher.update(&(values.len() as u64).to_le_bytes());
+                    for value in values {
+                        hasher.update(value.as_bytes());
+                        hasher.update(&[0]);
+                    }
                 }
             }
         }

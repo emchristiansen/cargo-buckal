@@ -1,4 +1,7 @@
-use std::{collections::BTreeSet as Set, path::PathBuf};
+use std::{
+    collections::{BTreeSet, BTreeSet as Set},
+    path::PathBuf,
+};
 
 use anyhow::{Context, Result, bail};
 
@@ -249,6 +252,17 @@ pub(super) fn set_deps(
             continue;
         }
 
+        // With per-platform resolution, Cargo's own edges decide where the dependency
+        // exists: an optional dependency enabled by a feature that is on for no
+        // configured platform is not built at all, and one enabled on some platforms
+        // only is a dependency there only.
+        let edge_platforms = node
+            .platform_features
+            .platforms_with_dep(&dep_node.package_id);
+        if edge_platforms.as_ref().is_some_and(BTreeSet::is_empty) {
+            continue;
+        }
+
         let (target_label, alias) = resolve_dep_label(dep, dep_node, ctx).with_context(|| {
             format!(
                 "failed to resolve dependency label for '{}' (package '{}')",
@@ -256,7 +270,20 @@ pub(super) fn set_deps(
             )
         })?;
 
-        if unconditional {
+        if let Some(on) = edge_platforms
+            && on.len() < node.platform_features.deps.len()
+            && alias.is_none()
+        {
+            for platform in on {
+                rust_rule
+                    .platform_mut()
+                    .entry(platform.to_owned())
+                    .or_default()
+                    .entry("deps".to_owned())
+                    .or_default()
+                    .insert(target_label.clone());
+            }
+        } else if unconditional {
             insert_dep(rust_rule, &target_label, alias.as_deref(), None)?;
         } else {
             insert_dep(rust_rule, &target_label, alias.as_deref(), Some(&platforms))?;
@@ -432,5 +459,96 @@ mod tests {
                 .deps
                 .contains("//third-party/rust/crates/foo/0.1.0:foo")
         );
+    }
+
+    #[test]
+    fn test_set_deps_follows_per_platform_edges() {
+        let id = |name: &str| PackageId {
+            repr: format!("registry+https://github.com/rust-lang/crates.io-index#{name}@1.0.0"),
+        };
+        let node = |name: &str| BuckalNode {
+            package_id: id(name),
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            features: vec![],
+            platform_features: Default::default(),
+            kind: NodeKind::ThirdParty,
+            edition: Edition::E2021,
+            manifest_path: Utf8PathBuf::from(format!("/registry/{name}/Cargo.toml")),
+            targets: vec![mock_target(name, TargetKind::Lib)],
+            source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
+            links: None,
+            checksum: None,
+        };
+        let normal = || BuckalDepKind {
+            kind: DependencyKind::Normal,
+            target: None,
+        };
+
+        let mut parent = node("minicbor");
+        // Cargo's per-platform edges: `everywhere` on both platforms, `wasm_only` on
+        // wasm32 only, `nowhere` (an optional dependency whose feature no configured
+        // platform enables) on neither.
+        let everywhere = id("everywhere").repr;
+        let wasm_only = id("wasm_only").repr;
+        parent.platform_features.deps = [
+            ("linux-x86_64".to_owned(), Set::from([everywhere.clone()])),
+            (
+                "wasm32".to_owned(),
+                Set::from([everywhere.clone(), wasm_only.clone()]),
+            ),
+        ]
+        .into();
+        parent.platform_features.features = [
+            ("linux-x86_64".to_owned(), Set::new()),
+            ("wasm32".to_owned(), Set::new()),
+        ]
+        .into();
+
+        let mut dag = Dag::new();
+        let mut index_map = HashMap::new();
+        let parent_idx = dag.add_node(parent.clone());
+        index_map.insert(parent.package_id.clone(), parent_idx);
+        for name in ["everywhere", "wasm_only", "nowhere"] {
+            let child = node(name);
+            let idx = dag.add_node(child.clone());
+            index_map.insert(child.package_id.clone(), idx);
+            dag.add_edge(
+                parent_idx,
+                idx,
+                BuckalDep {
+                    name: name.to_string(),
+                    dep_kinds: vec![normal()],
+                },
+            )
+            .unwrap();
+        }
+        let ctx = BuckalContext {
+            root: None,
+            resolve: BuckalResolve { dag, index_map },
+            workspace_root: Utf8PathBuf::from("/registry"),
+            workspace_inherit: false,
+            no_merge: false,
+            repo_config: RepoConfig::default(),
+        };
+
+        let mut rule = RustLibrary::default();
+        set_deps(&mut rule, &parent, CargoTargetKind::Lib, &ctx).expect("set deps");
+
+        assert_eq!(
+            rule.deps,
+            Set::from(["//third-party/rust/crates/everywhere/1.0.0:everywhere".to_owned()])
+        );
+        assert_eq!(
+            rule.platform["wasm32"]["deps"],
+            Set::from(["//third-party/rust/crates/wasm_only/1.0.0:wasm_only".to_owned()])
+        );
+        assert!(!rule.platform.contains_key("linux-x86_64"));
+        let all: Vec<_> = rule
+            .deps
+            .iter()
+            .chain(rule.platform.values().flat_map(|a| a.values().flatten()))
+            .collect();
+        assert!(!all.iter().any(|label| label.contains("nowhere")));
     }
 }

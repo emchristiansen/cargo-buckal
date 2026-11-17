@@ -6,22 +6,58 @@
 //! wasm32 build) therefore ends up in the native build too, which can break it.
 //!
 //! `cargo tree --target <triple>` runs Cargo's own feature resolver for that one
-//! target, so it reports the features Cargo would actually compile with there.
-//! This module asks it once per configured platform.
+//! target, so it reports the features Cargo would actually compile with there, and
+//! the dependency edges those features activate. This module asks it once per
+//! configured platform. The edges matter as much as the features: an optional
+//! dependency that only a platform-specific feature enables (e.g. a derive crate
+//! behind a `derive` feature) is in `cargo metadata`'s merged resolve, but Cargo
+//! does not build it, or the features it needs from its own dependencies, on the
+//! other platforms.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use cargo_metadata::{Package, PackageId};
+use serde::{Deserialize, Serialize};
 
 use crate::buckal_warn;
 
 /// The prelude `platform` attribute: `{platform name: {attribute: values}}`.
 pub type PlatformAttrs = BTreeMap<String, BTreeMap<String, BTreeSet<String>>>;
 
-/// Features per package, per platform name.
-pub type PlatformFeatures = HashMap<PackageId, BTreeMap<String, BTreeSet<String>>>;
+/// What Cargo resolves for one package on each configured platform where it is built.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlatformResolution {
+    /// Platform name -> enabled features.
+    pub features: BTreeMap<String, BTreeSet<String>>,
+    /// Platform name -> package ids (`PackageId::repr`) of its dependencies there.
+    pub deps: BTreeMap<String, BTreeSet<String>>,
+}
+
+impl PlatformResolution {
+    pub fn is_empty(&self) -> bool {
+        self.features.is_empty() && self.deps.is_empty()
+    }
+
+    /// The configured platforms on which this package depends on `dep`, or `None`
+    /// when there is no per-platform data.
+    pub fn platforms_with_dep(&self, dep: &PackageId) -> Option<BTreeSet<&str>> {
+        if self.deps.is_empty() {
+            return None;
+        }
+        Some(
+            self.deps
+                .iter()
+                .filter(|(_, deps)| deps.contains(&dep.repr))
+                .map(|(platform, _)| platform.as_str())
+                .collect(),
+        )
+    }
+}
+
+/// Per-platform resolution per package.
+pub type PlatformFeatures = HashMap<PackageId, PlatformResolution>;
 
 /// Resolve the features of every package for each `(platform name, target triple)`.
 ///
@@ -45,10 +81,10 @@ pub fn resolve_platform_features(
             );
         }
         for (id, features) in parsed.features {
-            result
-                .entry(id)
-                .or_default()
-                .insert(platform.clone(), features);
+            let deps = parsed.deps.get(&id).cloned().unwrap_or_default();
+            let entry = result.entry(id).or_default();
+            entry.features.insert(platform.clone(), features);
+            entry.deps.insert(platform.clone(), deps);
         }
         for id in parsed.ambiguous_ids {
             result.remove(&id);
@@ -68,7 +104,7 @@ fn run_cargo_tree(manifest_path: Option<&str>, triple: &str) -> Result<String> {
         "--edges",
         "normal,build,dev",
         "--prefix",
-        "none",
+        "depth",
         "--format",
         "{p}|{f}",
     ]);
@@ -95,11 +131,14 @@ pub(crate) struct ParsedTree {
     pub ambiguous: BTreeSet<String>,
     /// Metadata packages that a line might have meant; their result is unreliable.
     pub ambiguous_ids: BTreeSet<PackageId>,
+    /// Dependencies (`PackageId::repr`) of each package listed, from the tree's edges.
+    pub deps: HashMap<PackageId, BTreeSet<String>>,
 }
 
-/// Parse `cargo tree --prefix none --format '{p}|{f}'` output.
+/// Parse `cargo tree --prefix depth --format '{p}|{f}'` output.
 ///
-/// `{p}` is `name vX.Y.Z`, optionally followed by `(proc-macro)` and by the source in
+/// Each line starts with its depth in the tree; a package's parent is the nearest
+/// earlier line one level up, and a blank line starts the next workspace member. `{p}` is `name vX.Y.Z`, optionally followed by `(proc-macro)` and by the source in
 /// parentheses (a path for local packages, a URL for git ones); a line repeated
 /// because of deduplication ends in ` (*)`. `{f}` is a comma-separated feature list.
 pub(crate) fn parse_cargo_tree(output: &str, packages: &HashMap<PackageId, Package>) -> ParsedTree {
@@ -112,17 +151,30 @@ pub(crate) fn parse_cargo_tree(output: &str, packages: &HashMap<PackageId, Packa
     }
 
     let mut parsed = ParsedTree::default();
+    // Package at each depth along the current path; `None` for an unattributed line.
+    let mut path: Vec<Option<PackageId>> = Vec::new();
     for line in output.lines() {
         let line = line.trim();
+        let digits = line.len() - line.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        let Ok(depth) = line[..digits].parse::<usize>() else {
+            path.clear();
+            continue;
+        };
+        path.truncate(depth);
+        path.resize(depth, None);
+        let line = &line[digits..];
         let line = line.strip_suffix("(*)").map(str::trim_end).unwrap_or(line);
         let Some((p, f)) = line.rsplit_once('|') else {
+            path.push(None);
             continue;
         };
         let mut words = p.split_whitespace();
         let (Some(name), Some(version)) = (words.next(), words.next()) else {
+            path.push(None);
             continue;
         };
         let Some(version) = version.strip_prefix('v') else {
+            path.push(None);
             continue;
         };
         let rest = words.collect::<Vec<_>>().join(" ");
@@ -133,7 +185,10 @@ pub(crate) fn parse_cargo_tree(output: &str, packages: &HashMap<PackageId, Packa
             .map(Vec::as_slice)
             .unwrap_or_default();
         let package = match candidates {
-            [] => continue,
+            [] => {
+                path.push(None);
+                continue;
+            }
             [only] => *only,
             many => {
                 let matching: Vec<_> = many
@@ -147,6 +202,7 @@ pub(crate) fn parse_cargo_tree(output: &str, packages: &HashMap<PackageId, Packa
                     parsed
                         .ambiguous_ids
                         .extend(many.iter().map(|candidate| candidate.id.clone()));
+                    path.push(None);
                     continue;
                 }
             }
@@ -162,6 +218,15 @@ pub(crate) fn parse_cargo_tree(output: &str, packages: &HashMap<PackageId, Packa
             .entry(package.id.clone())
             .or_default()
             .extend(features);
+        parsed.deps.entry(package.id.clone()).or_default();
+        if let Some(Some(parent)) = depth.checked_sub(1).and_then(|up| path.get(up)) {
+            parsed
+                .deps
+                .entry(parent.clone())
+                .or_default()
+                .insert(package.id.repr.clone());
+        }
+        path.push(Some(package.id.clone()));
     }
     parsed
 }
@@ -250,7 +315,7 @@ mod tests {
         let root = dir.path();
         write(
             root.join("Cargo.toml"),
-            "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"sdk\", \"fixtures\"]\n",
+            "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"sdk\", \"fixtures\", \"extra\"]\n",
         );
         write(
             root.join("app/Cargo.toml"),
@@ -268,13 +333,17 @@ fixtures = { path = "../fixtures", features = ["test_lib"] }
         );
         write(
             root.join("sdk/Cargo.toml"),
-            "[package]\nname = \"sdk\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\ndefault = []\nbrowser = []\n",
+            "[package]\nname = \"sdk\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[dependencies]\nextra = { path = \"../extra\", optional = true }\n[features]\ndefault = []\nbrowser = [\"dep:extra\"]\n",
         );
         write(
             root.join("fixtures/Cargo.toml"),
             "[package]\nname = \"fixtures\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[features]\ntest_lib = []\n",
         );
-        for member in ["app", "sdk", "fixtures"] {
+        write(
+            root.join("extra/Cargo.toml"),
+            "[package]\nname = \"extra\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        for member in ["app", "sdk", "fixtures", "extra"] {
             write(root.join(member).join("src/lib.rs"), "");
         }
         dir
@@ -309,12 +378,35 @@ fixtures = { path = "../fixtures", features = ["test_lib"] }
             resolve_platform_features(Some(manifest.to_str().unwrap()), &platforms, &packages)
                 .expect("resolve");
 
-        assert_eq!(resolved[&sdk]["linux-x86_64"], set(&["default"]));
-        assert_eq!(resolved[&sdk]["wasm32"], set(&["browser", "default"]));
+        assert_eq!(resolved[&sdk].features["linux-x86_64"], set(&["default"]));
+        assert_eq!(
+            resolved[&sdk].features["wasm32"],
+            set(&["browser", "default"])
+        );
         // Dev-dependency features of workspace members are kept, as `cargo test` does.
-        assert_eq!(resolved[&fixtures]["linux-x86_64"], set(&["test_lib"]));
+        assert_eq!(
+            resolved[&fixtures].features["linux-x86_64"],
+            set(&["test_lib"])
+        );
 
-        let (common, platform) = split_features(&resolved[&sdk]);
+        // The optional dependency that only `browser` enables is an edge on wasm32 only.
+        let extra = packages
+            .values()
+            .find(|p| p.name.as_str() == "extra")
+            .unwrap()
+            .id
+            .clone();
+        assert!(resolved[&sdk].deps["linux-x86_64"].is_empty());
+        assert_eq!(
+            resolved[&sdk].deps["wasm32"],
+            BTreeSet::from([extra.repr.clone()])
+        );
+        assert_eq!(
+            resolved[&sdk].platforms_with_dep(&extra),
+            Some(BTreeSet::from(["wasm32"]))
+        );
+
+        let (common, platform) = split_features(&resolved[&sdk].features);
         assert_eq!(common, set(&["default"]));
         assert_eq!(
             platform,
@@ -330,9 +422,11 @@ fixtures = { path = "../fixtures", features = ["test_lib"] }
         let dir = workspace();
         let packages = metadata_packages(dir.path());
         let sdk_dir = dir.path().join("sdk");
+        let extra_dir = dir.path().join("extra");
         let output = format!(
-            "sdk v0.1.0 ({dir})|browser,default\n\nsdk v0.1.0 ({dir}) (*)|default\nunknown v9.9.9|x\n",
-            dir = sdk_dir.display()
+            "0sdk v0.1.0 ({dir})|browser,default\n1unknown v9.9.9|x\n2extra v0.1.0 ({extra})|\n1extra v0.1.0 ({extra})|\n\n0sdk v0.1.0 ({dir}) (*)|default\n",
+            dir = sdk_dir.display(),
+            extra = extra_dir.display()
         );
         let parsed = parse_cargo_tree(&output, &packages);
         let sdk = packages
@@ -341,9 +435,19 @@ fixtures = { path = "../fixtures", features = ["test_lib"] }
             .unwrap()
             .id
             .clone();
+        let extra = packages
+            .values()
+            .find(|p| p.name.as_str() == "extra")
+            .unwrap()
+            .id
+            .clone();
         assert_eq!(parsed.features[&sdk], set(&["browser", "default"]));
-        assert_eq!(parsed.features.len(), 1);
+        assert_eq!(parsed.features.len(), 2);
         assert!(parsed.ambiguous.is_empty());
+        // `extra` under the unattributed `unknown` line is not taken as sdk's dependency;
+        // the one directly below sdk is.
+        assert_eq!(parsed.deps[&sdk], BTreeSet::from([extra.repr.clone()]));
+        assert!(parsed.deps[&extra].is_empty());
     }
 
     #[test]

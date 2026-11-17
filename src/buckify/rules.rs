@@ -749,14 +749,17 @@ mod tests {
         let mut node = mock_node("sdk", vec![lib]);
         // What `cargo metadata` reports: the union, including the wasm-only feature.
         node.features = vec!["browser".to_owned(), "default".to_owned()];
-        node.platform_features = [
-            ("linux-x86_64".to_owned(), Set::from(["default".to_owned()])),
-            (
-                "wasm32".to_owned(),
-                Set::from(["browser".to_owned(), "default".to_owned()]),
-            ),
-        ]
-        .into();
+        node.platform_features = crate::platform_features::PlatformResolution {
+            features: [
+                ("linux-x86_64".to_owned(), Set::from(["default".to_owned()])),
+                (
+                    "wasm32".to_owned(),
+                    Set::from(["browser".to_owned(), "default".to_owned()]),
+                ),
+            ]
+            .into(),
+            deps: Default::default(),
+        };
 
         let rules = buckify_root_node(&node, &test_ctx());
         let lib_rule = rules
