@@ -291,6 +291,10 @@ pub(super) fn set_deps(
 ) -> Result<()> {
     let node_platforms = node.platform_features.platforms();
     for (dep, dep_node) in ctx.resolve.deps_of(&node.package_id) {
+        // A proc-macro built nowhere gets no rules, so no edge to it (Fable N20).
+        if super::rules::is_proc_macro_built_nowhere(dep_node, ctx) {
+            continue;
+        }
         if !dep
             .dep_kinds
             .iter()
