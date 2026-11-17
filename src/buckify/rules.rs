@@ -37,9 +37,9 @@ use super::emit::{
 /// an exec dependency on `_<name>` and does not carry `target_compatible_with`:
 /// with `_<name>` incompatible everywhere, no execution platform resolves, and a
 /// wildcard build fails analysis ("unspecified_exec") instead of skipping the
-/// target. No generated rule depends on such a package (its dependents' edges
-/// exist only on platforms that build it), so none of its rules is emitted.
-fn is_proc_macro_built_nowhere(node: &BuckalNode, ctx: &BuckalContext) -> bool {
+/// target. So none of its rules is emitted, and no rule gets an edge to it: only
+/// a rule that is itself built nowhere could have one (Fable N20).
+pub(super) fn is_proc_macro_built_nowhere(node: &BuckalNode, ctx: &BuckalContext) -> bool {
     !ctx.repo_config.feature_platforms.is_empty()
         && node.platform_features.is_empty()
         && !ctx.is_workspace_member(&node.package_id)

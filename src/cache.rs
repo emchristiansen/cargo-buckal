@@ -55,6 +55,7 @@ use crate::resolve::BuckalResolve;
 ///            prelude alias cannot resolve an execution platform under a wildcard).
 /// Version 16: with configured platforms, no `compatible_with` from the static package
 ///            table (Buck2 refuses it beside `target_compatible_with`).
+/// Version 17: no edge to a proc-macro package that gets no rules (Fable N20).
 ///
 /// Upstream's version 5 (path-source ids canonicalised through their `file://` URL,
 /// #102) is adopted here without a version of its own: on a path Cargo does not
@@ -64,7 +65,7 @@ use crate::resolve::BuckalResolve;
 /// Migration strategy:
 /// - If found < expected (stale cache from older Buckal): ignore the old cache and rebuild.
 /// - If found > expected (cache from newer Buckal): exit immediately and prompt the user to upgrade.
-const CACHE_VERSION: u32 = 16;
+const CACHE_VERSION: u32 = 17;
 
 /// The oldest cache version whose record of the fixups a generation applied
 /// (`fixup_rustc_flags`, `fixups`) is still read, from a cache whose rules are
