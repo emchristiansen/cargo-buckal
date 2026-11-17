@@ -74,12 +74,15 @@ impl BuckalContext {
         // So are the edges and packages only a wasm module's declared features
         // enable: its own graph has them, and its variants depend on them.
         if !repo_config.wasm.is_empty() {
-            let module_features =
-                declared_module_features(&repo_config.wasm.packages, &cargo_metadata.packages)
-                    .unwrap_or_else(|error| {
-                        buckal_error!(format!("{error:#}"));
-                        std::process::exit(1);
-                    });
+            let module_features = declared_module_features(
+                &repo_config.wasm.packages,
+                &cargo_metadata.packages,
+                &cargo_metadata.workspace_members,
+            )
+            .unwrap_or_else(|error| {
+                buckal_error!(format!("{error:#}"));
+                std::process::exit(1);
+            });
             if !module_features.is_empty() {
                 let mut features = repo_config.test_features.clone();
                 features.extend(module_features);
@@ -286,17 +289,24 @@ impl BuckalContext {
                 );
                 std::process::exit(1);
             }
-            let first_party: std::collections::BTreeMap<String, PackageId> = resolve
+            // Modules are workspace members, looked up by name among them only: a
+            // path package outside the workspace may share a member's name.
+            let members: std::collections::BTreeMap<String, PackageId> = cargo_metadata
+                .workspace_members
+                .iter()
+                .map(|id| (packages_map[id].name.to_string(), id.clone()))
+                .collect();
+            let first_party: Vec<PackageId> = resolve
                 .nodes()
                 .filter(|n| matches!(n.kind, NodeKind::FirstParty { .. }))
-                .map(|n| (n.name.clone(), n.package_id.clone()))
+                .map(|n| n.package_id.clone())
                 .collect();
             let variants = resolve_modules(
                 &wasm.packages,
                 &platform,
                 manifest_path.as_deref(),
                 &packages_map,
-                &first_party,
+                &members,
             )
             .unwrap_or_else(|error| {
                 buckal_error!(format!("{error:#}"));
@@ -313,13 +323,13 @@ impl BuckalContext {
                 resolve.dag[idx].platform_features.wasm_variants = by_module;
             }
             for module in &wasm.packages {
-                let manifest = &packages_map[&first_party[module]].manifest_path;
+                let manifest = &packages_map[&members[module]].manifest_path;
                 wasm_modules.insert(
                     module.clone(),
                     package_dir(manifest, &buck2_root).unwrap_or_default(),
                 );
             }
-            for id in first_party.values() {
+            for id in &first_party {
                 let declared = test_env_declaration(&packages_map[id]).unwrap_or_else(|error| {
                     buckal_error!(format!("{error:#}"));
                     std::process::exit(1);

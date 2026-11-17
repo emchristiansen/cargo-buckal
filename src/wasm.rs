@@ -29,12 +29,21 @@ pub struct ModuleDeclaration {
 
 /// The features the modules in `modules` (package names) declare, as
 /// `<package>/<feature>`: what `cargo metadata` needs for the workspace's resolve to
-/// contain every edge and package of the modules' own graphs. A module that is no
-/// package of `packages` is left to [`resolve_modules`] to refuse.
-pub fn declared_module_features(modules: &[String], packages: &[Package]) -> Result<Vec<String>> {
+/// contain every edge and package of the modules' own graphs. Modules are looked
+/// up among the workspace `members` only (a package outside the workspace may
+/// share a member's name); one that is no member is left to [`resolve_modules`]
+/// to refuse.
+pub fn declared_module_features(
+    modules: &[String],
+    packages: &[Package],
+    members: &[PackageId],
+) -> Result<Vec<String>> {
     let mut features = Vec::new();
     for module in modules {
-        let Some(package) = packages.iter().find(|p| p.name.as_str() == module) else {
+        let Some(package) = packages
+            .iter()
+            .find(|p| p.name.as_str() == module && members.contains(&p.id))
+        else {
             continue;
         };
         if let Some(declaration) = module_declaration(package)? {
@@ -186,7 +195,7 @@ pub fn resolve_modules(
     platform: &str,
     manifest_path: Option<&str>,
     packages: &HashMap<PackageId, Package>,
-    first_party: &BTreeMap<String, PackageId>,
+    members: &BTreeMap<String, PackageId>,
 ) -> Result<HashMap<PackageId, BTreeMap<String, WasmVariant>>> {
     let mut variants: HashMap<PackageId, BTreeMap<String, WasmVariant>> = HashMap::new();
     let mut seen = BTreeSet::new();
@@ -194,8 +203,8 @@ pub fn resolve_modules(
         if !seen.insert(module) {
             bail!("`[wasm] packages`: `{module}` is listed twice");
         }
-        let Some(id) = first_party.get(module) else {
-            bail!("`[wasm] packages`: `{module}` is no first-party package of the workspace");
+        let Some(id) = members.get(module) else {
+            bail!("`[wasm] packages`: `{module}` is no member of the workspace");
         };
         let Some(declaration) = module_declaration(&packages[id])? else {
             bail!("`[wasm] packages`: `{module}` declares no `[package.metadata.buck2.wasm]`");

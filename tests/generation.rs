@@ -4202,6 +4202,57 @@ fn test_wasm_flags_are_each_units_resolved_profile() {
 }
 
 #[test]
+fn test_wasm_module_features_come_from_the_workspace_member() {
+    // Fable P3 on 564f9450: a package outside the workspace with the module's
+    // name (here `vendored/webmod`, sorted first) must not stand in for the
+    // member when the module's declared features are read.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"webmod\", \"user\", \"opt\"]\nexclude = [\"vendored\"]\n",
+    );
+    write(
+        &f.ws.join("webmod/Cargo.toml"),
+        &manifest(
+            "webmod",
+            "[lib]\ncrate-type = [\"cdylib\", \"rlib\"]\n[features]\nweb = [\"dep:opt\"]\n\
+             [dependencies]\nopt = { path = \"../opt\", optional = true }\n\
+             [package.metadata.buck2.wasm]\nfeatures = [\"web\"]\nprofile = \"release\"\n",
+        ),
+    );
+    write(
+        &f.ws.join("vendored/webmod/Cargo.toml"),
+        "[package]\nname = \"webmod\"\nversion = \"0.0.1\"\nedition = \"2021\"\n[workspace]\n",
+    );
+    write(&f.ws.join("vendored/webmod/src/lib.rs"), "");
+    write(
+        &f.ws.join("user/Cargo.toml"),
+        &manifest(
+            "user",
+            "[dependencies]\nold_webmod = { package = \"webmod\", path = \"../vendored/webmod\" }\n",
+        ),
+    );
+    write(&f.ws.join("opt/Cargo.toml"), &manifest("opt", ""));
+    for name in ["webmod", "user", "opt"] {
+        write(&f.ws.join(name).join("src/lib.rs"), "");
+    }
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!(
+            "{}\n[wasm]\npackages = [\"webmod\"]\nplatform = \"root//buck2/platforms/wasm:wasm32_unknown_unknown\"\n",
+            BUCKAL_TOML.split("[fixups.extra]").next().unwrap()
+        ),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let webmod = f.buck("webmod");
+    let variant = rule(&webmod, "webmod-wasm-webmod");
+    assert!(variant.contains("    features = [\"web\"],\n"), "{variant}");
+    assert_eq!(top_deps(variant), ["//opt:opt-wasm-webmod"], "{variant}");
+}
+
+#[test]
 fn test_per_test_unset_run_env_through_generation() {
     // N14: a single test can drop a key of the package's `test_run_env` (an empty
     // string stays a value).
