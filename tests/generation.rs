@@ -1842,7 +1842,10 @@ fn test_omitted_same_named_binary_keeps_the_library_label() {
             );
         }
         assert!(names.contains(&"foo-lib"), "{foo}");
-        assert_eq!(names.contains(&"foo"), cli_for_tests, "{foo}");
+        // Only the tests enable `cli`, and `foo` has no integration test: Cargo
+        // builds the binary as its unit tests only (b807 r36 F1).
+        assert!(!names.contains(&"foo"), "{foo}");
+        assert_eq!(names.contains(&"foo-unittest"), cli_for_tests, "{foo}");
     }
 }
 
@@ -2714,4 +2717,57 @@ fn test_cdylib_only_library_unit_tests_are_emitted() {
         buck.contains("rust_test(\n    name = \"unittest\",\n"),
         "{buck}"
     );
+}
+
+#[test]
+fn test_binaries_only_the_tests_enable_are_emitted_where_cargo_builds_them() {
+    // b807 r36 F1: Cargo builds a binary whose `required-features` only the tests
+    // enable as its unit tests, and as a binary only for an integration test of
+    // its package. Without one, no binary rule is emitted (Cargo skips it); with
+    // one, the binary has its normal dependencies.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"diff\", \"withit\", \"shared\"]\n",
+    );
+    for name in ["diff", "withit"] {
+        write(
+            &f.ws.join(name).join("Cargo.toml"),
+            &manifest(
+                name,
+                &format!(
+                    "[features]\ntest_lib = []\n\
+                     [dependencies]\nshared = {{ path = \"../shared\" }}\n\
+                     [[bin]]\nname = \"{name}\"\npath = \"src/main.rs\"\nrequired-features = [\"test_lib\"]\n"
+                ),
+            ),
+        );
+        write(
+            &f.ws.join(name).join("src/main.rs"),
+            "fn main() {\n    shared::one();\n}\n",
+        );
+    }
+    write(&f.ws.join("withit/tests/it.rs"), "");
+    write(&f.ws.join("shared/Cargo.toml"), &manifest("shared", ""));
+    write(&f.ws.join("shared/src/lib.rs"), "pub fn one() {}\n");
+    let config = BUCKAL_TOML.split("[fixups.extra]").next().unwrap();
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!("test_features = [\"diff/test_lib\", \"withit/test_lib\"]\n{config}"),
+    );
+    f.migrate(&[]);
+    let diff = f.buck("diff");
+    assert!(!diff.contains("rust_binary("), "{diff}");
+    assert_eq!(
+        top_deps(rule(&diff, "diff-unittest")),
+        ["//shared:shared"],
+        "{diff}"
+    );
+    let withit = f.buck("withit");
+    assert_eq!(
+        top_deps(rule(&withit, "withit")),
+        ["//shared:shared"],
+        "{withit}"
+    );
+    rule(&withit, "it");
 }

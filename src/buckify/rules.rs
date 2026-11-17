@@ -241,8 +241,22 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
     let cargo_manifest = emit_cargo_manifest(node, ctx);
     buck_rules.push(Rule::CargoManifest(cargo_manifest));
 
+    // Cargo builds a binary that only the tests' resolution enables (or of a
+    // package only the tests build) as its unit tests, and as an executable only
+    // for its package's integration tests (for `CARGO_BIN_EXE_<name>`): without
+    // one, there is no binary to emit.
+    let integration_tests = !ctx.repo_config.ignore_tests && !test_targets.is_empty();
+    let emitted_bins: Vec<&BuckalTarget> = bin_targets
+        .iter()
+        .copied()
+        .filter(|t| {
+            integration_tests
+                || !node.platform_features.test_context && has_required_features(&exec_node, t)
+        })
+        .collect();
+
     // emit buck rules for bin targets
-    for bin_target in &bin_targets {
+    for bin_target in &emitted_bins {
         let buckal_name = bin_target.name.to_owned();
 
         // A binary whose `required-features` only the tests' resolution enables is
@@ -307,7 +321,7 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
             // package, named after the binary (hyphens kept). The Buck2 fork's prelude is
             // the single writer of that environment (compile time and run time); this
             // only names the binaries.
-            for bin_target in &bin_targets {
+            for bin_target in &emitted_bins {
                 rust_test
                     .cargo_bin_exes
                     .insert(bin_target.name.clone(), format!(":{}", bin_target.name));
