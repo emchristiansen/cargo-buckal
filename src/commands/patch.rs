@@ -308,6 +308,7 @@ mod tests {
                     src_path: Utf8PathBuf::from(format!("/tmp/{name}/{version}/src/lib.rs")),
                     doctest: true,
                     test: true,
+                    required_features: Vec::new(),
                 }],
                 source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
                 links: None,

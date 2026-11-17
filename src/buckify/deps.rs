@@ -224,6 +224,22 @@ pub(super) fn host_variant_name(name: &str) -> String {
     format!("{name}-host")
 }
 
+/// The name (or label) of the test variant of the rule `name`.
+pub(super) fn test_variant_name(name: &str) -> String {
+    format!("{name}-test")
+}
+
+/// Whether a test-context rule of `node` (not compiled for the host) must use
+/// `dep_node`'s test variant.
+fn uses_test_variant(node: &BuckalNode, kind: CargoTargetKind, dep_node: &BuckalNode) -> bool {
+    node.platform_features.test_context
+        && !is_host_context(node, kind)
+        && node
+            .platform_features
+            .test_variant_deps
+            .contains(&dep_node.package_id.repr)
+}
+
 /// The role of `kind`'s dependency edges in Cargo's resolution.
 fn edge_role(kind: CargoTargetKind) -> EdgeRole {
     match kind {
@@ -346,6 +362,8 @@ fn dep_label(
     })?;
     if is_host_context(node, kind) && uses_host_variant(node, dep_node) {
         target_label = host_variant_name(&target_label);
+    } else if uses_test_variant(node, kind, dep_node) {
+        target_label = test_variant_name(&target_label);
     }
     Ok((target_label, alias))
 }
@@ -371,6 +389,7 @@ mod tests {
             kind: vec![kind],
             src_path: cargo_metadata::camino::Utf8PathBuf::from("/tmp/dummy.rs"),
             doctest: true,
+            required_features: Vec::new(),
             test: true,
         }
     }

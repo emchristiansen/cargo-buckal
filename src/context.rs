@@ -26,14 +26,16 @@ pub struct BuckalContext {
 
 impl BuckalContext {
     pub fn new(manifest_path: Option<String>) -> Self {
-        let cargo_metadata = if let Some(manifest) = manifest_path.as_deref() {
-            MetadataCommand::new()
-                .manifest_path(manifest)
-                .exec()
-                .unwrap()
-        } else {
-            MetadataCommand::new().exec().unwrap()
-        };
+        let repo_config = RepoConfig::load();
+        let mut metadata_command = MetadataCommand::new();
+        if let Some(manifest) = manifest_path.as_deref() {
+            metadata_command.manifest_path(manifest);
+        }
+        // Packages that only the tests' features enable are part of the resolve.
+        if let Some(features) = repo_config.test_features.as_ref().filter(|f| !f.is_empty()) {
+            metadata_command.features(cargo_metadata::CargoOpt::SomeFeatures(features.clone()));
+        }
+        let cargo_metadata = metadata_command.exec().unwrap();
         let root = cargo_metadata.root_package().map(|p| p.id.clone());
         let packages_map = cargo_metadata
             .packages
@@ -61,7 +63,6 @@ impl BuckalContext {
                     .map(|checksum| (format!("{}-{}", p.name, p.version), checksum))
             })
             .collect::<HashMap<_, _>>();
-        let repo_config = RepoConfig::load();
         let workspace_toml = cargo_metadata.workspace_root.join("Cargo.toml");
         let workspace_content = std::fs::read_to_string(&workspace_toml)
             .unwrap_or_exit_ctx("failed to read workspace Cargo.toml");
@@ -90,6 +91,7 @@ impl BuckalContext {
                 manifest_path.as_deref(),
                 &repo_config.feature_platforms,
                 &packages_map,
+                repo_config.test_features.as_deref(),
             )
             .unwrap_or_exit_ctx("failed to resolve per-platform features");
             for (pkg_id, features) in per_platform {

@@ -361,6 +361,7 @@ mod tests {
             kind: vec![kind],
             src_path,
             doctest: true,
+            required_features: Vec::new(),
             test: true,
         }
     }

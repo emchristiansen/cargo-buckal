@@ -17,11 +17,11 @@ use super::includes::{
     IncludeGap, UnprovidedInclude, in_nested_package, repository_path, unprovided_includes,
 };
 
-use super::deps::host_variant_name;
+use super::deps::{host_variant_name, test_variant_name};
 use super::emit::{
     emit_buildscript_build, emit_buildscript_run, emit_cargo_manifest, emit_filegroup,
     emit_git_fetch, emit_http_archive, emit_rust_binary, emit_rust_library, emit_rust_test,
-    host_variant_build_target, patch_with_buildscript,
+    host_variant_build_target, patch_with_buildscript, test_variant_build_target,
 };
 
 /// Buckifies a third-party dependency into a list of BUCK rules.
@@ -106,6 +106,13 @@ pub fn buckify_dep_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         &manifest_dir,
         ctx,
     ));
+    buck_rules.extend(test_variant_rules(
+        node,
+        lib_target,
+        &node.name,
+        &manifest_dir,
+        ctx,
+    ));
 
     apply_fixups(&mut buck_rules, node, ctx);
     if ctx
@@ -156,6 +163,15 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         platform_features: node.platform_features.exec_resolution(),
         ..node.clone()
     };
+    // Tests are compiled as Cargo compiles them for `cargo test`: with a separate
+    // test resolution, in the test context.
+    let test_node = BuckalNode {
+        platform_features: node.platform_features.test_resolution(),
+        ..node.clone()
+    };
+    let has_test_variant = node.platform_features.test_variant.is_some();
+    // Rules compiled in the test context: they use the package's own test variant.
+    let mut test_context_rules: Set<String> = Set::new();
 
     // Pre-compute the library Buck target name for wiring binary → library deps.
     // In Cargo, every binary in a package implicitly depends on the package's library.
@@ -178,14 +194,27 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
     for bin_target in &bin_targets {
         let buckal_name = bin_target.name.to_owned();
 
+        // A binary whose `required-features` only the tests' resolution enables is
+        // built for the tests.
+        let for_tests = !has_required_features(&exec_node, bin_target)
+            && has_required_features(&test_node, bin_target);
+        let bin_node = if for_tests { &test_node } else { &exec_node };
         let mut rust_binary =
-            emit_rust_binary(&exec_node, bin_target, &manifest_dir, &buckal_name, ctx);
+            emit_rust_binary(bin_node, bin_target, &manifest_dir, &buckal_name, ctx);
 
         // Cargo allows `main.rs` to use items from `lib.rs` via the crate's own name by default.
         // The binary must always depend on the sibling library, even when names differ
         // (e.g., binary "my-crate" vs library "my_crate").
         if let Some(lib_name) = &lib_buck_name {
-            rust_binary.deps_mut().insert(format!(":{lib_name}"));
+            let lib = if for_tests && has_test_variant {
+                test_variant_name(lib_name)
+            } else {
+                lib_name.clone()
+            };
+            rust_binary.deps_mut().insert(format!(":{lib}"));
+        }
+        if for_tests {
+            test_context_rules.insert(buckal_name.clone());
         }
 
         buck_rules.push(Rule::RustBinary(rust_binary));
@@ -205,7 +234,8 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
 
         if !ctx.repo_config.ignore_tests && lib_target.test {
             // If the library target has inline tests, emit a rust_test rule for it
-            let rust_test = emit_rust_test(&exec_node, lib_target, &manifest_dir, "unittest", ctx);
+            let rust_test = emit_rust_test(&test_node, lib_target, &manifest_dir, "unittest", ctx);
+            test_context_rules.insert("unittest".to_owned());
 
             buck_rules.push(Rule::RustTest(rust_test));
         }
@@ -222,7 +252,8 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
             let buckal_name = test_target.name.to_owned();
 
             let mut rust_test =
-                emit_rust_test(&exec_node, test_target, &manifest_dir, &buckal_name, ctx);
+                emit_rust_test(&test_node, test_target, &manifest_dir, &buckal_name, ctx);
+            test_context_rules.insert(buckal_name.clone());
 
             // Cargo gives integration tests `CARGO_BIN_EXE_<name>` for every binary of the
             // package, named after the binary (hyphens kept). The Buck2 fork's prelude is
@@ -234,9 +265,15 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
                     .insert(bin_target.name.clone(), format!(":{}", bin_target.name));
             }
 
-            // Integration tests may use the package's library under its crate name.
+            // Integration tests may use the package's library under its crate name
+            // (as the tests need it).
             if let Some(lib_name) = &lib_buck_name {
-                rust_test.deps_mut().insert(format!(":{lib_name}"));
+                let lib = if has_test_variant {
+                    test_variant_name(lib_name)
+                } else {
+                    lib_name.clone()
+                };
+                rust_test.deps_mut().insert(format!(":{lib}"));
             }
 
             buck_rules.push(Rule::RustTest(rust_test));
@@ -250,10 +287,20 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         .find(|t| t.kind.contains(&TargetKind::CustomBuild));
 
     if let Some(build_target) = custom_build_target {
-        // Patch the rust_library and rust_binary rules to support build scripts
+        // Patch the rust_library and rust_binary rules to support build scripts; rules
+        // in the test context use the test variant's, whose features are the tests'.
+        let test_build = test_variant_build_target(build_target);
         for rule in &mut buck_rules {
+            let for_tests = has_test_variant
+                && rule
+                    .name()
+                    .is_some_and(|name| test_context_rules.contains(name));
             if let Some(rust_rule) = rule.as_rust_rule_mut() {
-                patch_with_buildscript(rust_rule, build_target);
+                if for_tests {
+                    patch_with_buildscript(rust_rule, &test_build);
+                } else {
+                    patch_with_buildscript(rust_rule, build_target);
+                }
             }
         }
 
@@ -268,6 +315,13 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
 
     if let (Some(lib_target), Some(lib_name)) = (lib_targets.first(), &lib_buck_name) {
         buck_rules.extend(host_variant_rules(
+            node,
+            lib_target,
+            lib_name,
+            &manifest_dir,
+            ctx,
+        ));
+        buck_rules.extend(test_variant_rules(
             node,
             lib_target,
             lib_name,
@@ -448,6 +502,68 @@ fn host_variant_rules(
         rules.push(Rule::BuildscriptRun(emit_buildscript_run(
             &host_node,
             &host_build,
+            ctx,
+        )));
+    }
+    rules
+}
+
+/// Whether `target`'s `required-features` are on in `node`'s resolution (on some
+/// platform; always without per-platform resolution).
+fn has_required_features(node: &BuckalNode, target: &BuckalTarget) -> bool {
+    let features = &node.platform_features.features;
+    target.required_features.is_empty()
+        || features.is_empty()
+        || features
+            .values()
+            .any(|on| target.required_features.iter().all(|f| on.contains(f)))
+}
+
+/// The rules of `node`'s test variant, if it has one: its library `<lib_name>-test`
+/// and, with a build script, `build-script-test-build`/`build-script-test-run`,
+/// compiled with the tests' resolution. Test-context rules of the package and of
+/// other packages depend on it instead of the library.
+fn test_variant_rules(
+    node: &BuckalNode,
+    lib_target: &BuckalTarget,
+    lib_name: &str,
+    manifest_dir: &Utf8PathBuf,
+    ctx: &BuckalContext,
+) -> Vec<Rule> {
+    let Some(resolution) = node.platform_features.test_variant_resolution() else {
+        return Vec::new();
+    };
+    let test_node = BuckalNode {
+        platform_features: resolution,
+        ..node.clone()
+    };
+    let mut rules = vec![Rule::RustLibrary(emit_rust_library(
+        &test_node,
+        lib_target,
+        manifest_dir,
+        &test_variant_name(lib_name),
+        ctx,
+    ))];
+    let custom_build_target = node
+        .targets
+        .iter()
+        .find(|t| t.kind.contains(&TargetKind::CustomBuild));
+    if let Some(build_target) = custom_build_target {
+        let test_build = test_variant_build_target(build_target);
+        for rule in &mut rules {
+            if let Some(rust_rule) = rule.as_rust_rule_mut() {
+                patch_with_buildscript(rust_rule, &test_build);
+            }
+        }
+        rules.push(Rule::RustBinary(emit_buildscript_build(
+            &test_build,
+            &test_node,
+            manifest_dir,
+            ctx,
+        )));
+        rules.push(Rule::BuildscriptRun(emit_buildscript_run(
+            &test_node,
+            &test_build,
             ctx,
         )));
     }
@@ -892,6 +1008,7 @@ mod tests {
             kind: vec![kind],
             src_path: Utf8PathBuf::from("/nonexistent-buckal-test-package/dummy.rs"),
             doctest: true,
+            required_features: Vec::new(),
             test: true,
         }
     }
@@ -1087,6 +1204,7 @@ mod tests {
             kind: vec![kind],
             src_path: manifest_dir.join(file),
             doctest: true,
+            required_features: Vec::new(),
             test: true,
         };
         let node = BuckalNode {
@@ -1166,6 +1284,7 @@ mod tests {
             kind: vec![kind],
             src_path: manifest_dir.join(file),
             doctest: true,
+            required_features: Vec::new(),
             test: true,
         };
         let node = BuckalNode {
@@ -1365,6 +1484,7 @@ mod tests {
             kind: vec![TargetKind::Bin],
             src_path: node.manifest_path.parent().unwrap().join("src/main.rs"),
             doctest: false,
+            required_features: Vec::new(),
             test: false,
         });
         let mut ctx = test_ctx();
@@ -1483,6 +1603,7 @@ mod tests {
             kind: vec![kind],
             src_path: pkg.join(file),
             doctest: true,
+            required_features: Vec::new(),
             test: true,
         };
         let mut node = mock_node(

@@ -1109,3 +1109,118 @@ fn test_fixup_extra_deps_and_buildscript_through_generation() {
     f.migrate(&[]);
     assert_eq!(f.buck("sdk"), sdk_before);
 }
+
+/// A workspace whose tests need features the ordinary build does not enable: `selfy`
+/// enables its own `test_lib` through a dev-dependency on itself and has a binary
+/// that requires it; `gated` has a `test_lib` feature only `--features test_lib`
+/// enables; `user` depends on both normally.
+fn test_features_fixture(test_features: Option<&str>) -> Fixture {
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"selfy\", \"gated\", \"user\"]\n",
+    );
+    write(
+        &f.ws.join("selfy/Cargo.toml"),
+        &manifest(
+            "selfy",
+            "[features]\ntest_lib = []\n[dev-dependencies]\nselfy = { path = \".\", features = [\"test_lib\"] }\n[[bin]]\nname = \"tool\"\npath = \"src/bin/tool.rs\"\nrequired-features = [\"test_lib\"]\n",
+        ),
+    );
+    write(
+        &f.ws.join("selfy/src/lib.rs"),
+        "#[cfg(feature = \"test_lib\")]\npub mod test_lib {}\n",
+    );
+    write(&f.ws.join("selfy/src/bin/tool.rs"), "fn main() {}\n");
+    write(
+        &f.ws.join("selfy/tests/t.rs"),
+        "use selfy::test_lib as _;\n",
+    );
+    write(
+        &f.ws.join("gated/Cargo.toml"),
+        &manifest("gated", "[features]\ntest_lib = []\n"),
+    );
+    write(&f.ws.join("gated/src/lib.rs"), "");
+    write(
+        &f.ws.join("user/Cargo.toml"),
+        &manifest(
+            "user",
+            "[dependencies]\nselfy = { path = \"../selfy\" }\ngated = { path = \"../gated\" }\n",
+        ),
+    );
+    write(&f.ws.join("user/src/lib.rs"), "");
+    let key = test_features
+        .map(|features| format!("test_features = [{features}]\n"))
+        .unwrap_or_default();
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!("skip_dev_dependency_cycles = true\n{key}{BUCKAL_TOML}"),
+    );
+    f
+}
+
+#[test]
+fn test_test_features_resolve_tests_apart() {
+    // Without `test_features`, everything is resolved as `cargo test` resolves it:
+    // the self dev-dependency's feature is in the ordinary library.
+    let f = test_features_fixture(None);
+    f.migrate(&[]);
+    let selfy = f.buck("selfy");
+    assert!(
+        rule(&selfy, "selfy").contains("    features = [\"test_lib\"],\n"),
+        "{selfy}"
+    );
+    assert!(!selfy.contains("selfy-test"), "{selfy}");
+
+    // With it, the ordinary build is `cargo build`'s and the tests get a variant.
+    let f = test_features_fixture(Some("\"test_lib\""));
+    f.migrate(&[]);
+    let selfy = f.buck("selfy");
+    let lib = rule(&selfy, "selfy");
+    assert!(!lib.contains("features"), "{lib}");
+    let variant = rule(&selfy, "selfy-test");
+    assert!(
+        variant.contains("    features = [\"test_lib\"],\n"),
+        "{variant}"
+    );
+    assert!(variant.contains("    crate = \"selfy\",\n"), "{variant}");
+    for test in ["unittest", "t"] {
+        let test = rule(&selfy, test);
+        assert!(test.contains("    features = [\"test_lib\"],\n"), "{test}");
+        assert!(!test.contains("\":selfy\""), "{test}");
+    }
+    assert!(
+        rule(&selfy, "t").contains("    deps = [\":selfy-test\"],\n"),
+        "{selfy}"
+    );
+    // The binary that requires `test_lib` is built as the tests need it.
+    let tool = rule(&selfy, "tool");
+    assert!(tool.contains("    features = [\"test_lib\"],\n"), "{tool}");
+    assert!(tool.contains("    deps = [\":selfy-test\"],\n"), "{tool}");
+
+    // `--features test_lib` reaches `gated`'s tests and its test variant only.
+    let gated = f.buck("gated");
+    assert!(!rule(&gated, "gated").contains("features"), "{gated}");
+    assert!(
+        rule(&gated, "gated-test").contains("    features = [\"test_lib\"],\n"),
+        "{gated}"
+    );
+    assert!(
+        rule(&gated, "unittest").contains("    features = [\"test_lib\"],\n"),
+        "{gated}"
+    );
+
+    // A dependent's library uses the ordinary libraries, its tests the variants.
+    let user = f.buck("user");
+    let lib = rule(&user, "user");
+    assert!(lib.contains("\"//selfy:selfy\""), "{lib}");
+    assert!(lib.contains("\"//gated:gated\""), "{lib}");
+    let test = rule(&user, "unittest");
+    assert!(test.contains("\"//selfy:selfy-test\""), "{test}");
+    assert!(test.contains("\"//gated:gated-test\""), "{test}");
+
+    // A fixed point.
+    f.migrate(&["--no-cache"]);
+    assert_eq!(f.buck("selfy"), selfy);
+    assert_eq!(f.buck("user"), user);
+}

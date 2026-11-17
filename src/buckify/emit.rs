@@ -22,7 +22,9 @@ use crate::{
     utils::{UnwrapOrExit, get_buck2_root, get_cfgs, get_target, get_vendor_path_relative},
 };
 
-use super::deps::{dep_kind_matches, host_variant_name, set_deps, uses_host_variant};
+use super::deps::{
+    dep_kind_matches, host_variant_name, set_deps, test_variant_name, uses_host_variant,
+};
 
 /// Emit `rust_library` rule for the given lib target
 pub(super) fn emit_rust_library(
@@ -412,6 +414,19 @@ pub(super) fn host_variant_build_target(build_target: &BuckalTarget) -> BuckalTa
         name: format!(
             "{}-build",
             host_variant_name(&get_build_name(&build_target.name))
+        ),
+        ..build_target.clone()
+    }
+}
+
+/// The build script target of a package's test variant: `build-script-build`
+/// becomes `build-script-test-build`, so its rules are `build-script-test-build` and
+/// `build-script-test-run`.
+pub(super) fn test_variant_build_target(build_target: &BuckalTarget) -> BuckalTarget {
+    BuckalTarget {
+        name: format!(
+            "{}-build",
+            test_variant_name(&get_build_name(&build_target.name))
         ),
         ..build_target.clone()
     }

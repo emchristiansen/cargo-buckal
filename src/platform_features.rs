@@ -180,6 +180,24 @@ pub struct PlatformResolution {
     /// package's main resolution above) is a host compilation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exec_context: Option<HostVariant>,
+    /// With a separate test resolution (`test_features`): the library as the tests
+    /// need it, where that differs from the ordinary build's (or depends on a
+    /// library that does). Emitted as the `<lib>-test` variant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_variant: Option<HostVariant>,
+    /// Dependencies (`PackageId::repr`) that have a test variant. Test-context rules
+    /// of this package (its tests, test-only executables, its own test variant) use
+    /// it.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub test_variant_deps: BTreeSet<String>,
+    /// With a separate test resolution: the resolution of the package's tests (and of
+    /// binaries only the tests' features enable), where it differs from the main one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests: Option<Box<PlatformResolution>>,
+    /// These rules are in the test context: they use their dependencies' test
+    /// variants. Set for a package Cargo builds only for tests.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub test_context: bool,
 }
 
 /// The resolution of one more compilation context of a package: the host variant of
@@ -223,10 +241,36 @@ impl PlatformResolution {
             features: host.features.clone(),
             deps: host.deps.clone(),
             host_context: true,
-            host_variant: None,
             host_variant_deps: self.host_variant_deps.clone(),
-            exec_context: None,
+            ..Default::default()
         })
+    }
+
+    /// The resolution of the test variant's library, if the package has one.
+    pub fn test_variant_resolution(&self) -> Option<PlatformResolution> {
+        self.test_variant.as_ref().map(|test| PlatformResolution {
+            features: test.features.clone(),
+            deps: test.deps.clone(),
+            host_variant_deps: self.host_variant_deps.clone(),
+            test_variant_deps: self.test_variant_deps.clone(),
+            test_context: true,
+            ..Default::default()
+        })
+    }
+
+    /// The resolution that the package's tests are compiled with: the test
+    /// resolution where there is a separate one, else [`Self::exec_resolution`].
+    pub fn test_resolution(&self) -> PlatformResolution {
+        match &self.tests {
+            None => self.exec_resolution(),
+            Some(tests) => PlatformResolution {
+                // Host variants are the main resolution's: those are the ones emitted.
+                host_variant_deps: self.host_variant_deps.clone(),
+                test_variant_deps: self.test_variant_deps.clone(),
+                test_context: true,
+                ..tests.exec_resolution()
+            },
+        }
     }
 
     /// The resolution that the package's binaries and tests are compiled with: the
@@ -239,9 +283,10 @@ impl PlatformResolution {
                 features: exec.features.clone(),
                 deps: exec.deps.clone(),
                 host_context: false,
-                host_variant: None,
                 host_variant_deps: self.host_variant_deps.clone(),
-                exec_context: None,
+                test_variant_deps: self.test_variant_deps.clone(),
+                test_context: self.test_context,
+                ..Default::default()
             },
         }
     }
@@ -269,15 +314,54 @@ impl ContextResolution {
 ///
 /// Edges are normal, build and dev (dev only for workspace members), which is the
 /// resolution `cargo test --workspace --target <triple>` compiles with.
+///
+/// With `test_features` (`Some`, possibly empty), the ordinary build and the tests
+/// are resolved apart, as Cargo builds them: the main resolution is that of `cargo
+/// build --workspace` (no dev-dependency features unified into the libraries), and
+/// the tests' that of `cargo test --workspace --features <test_features>`. A library
+/// the tests need with other features or dependencies gets a test variant.
 pub fn resolve_platform_features(
     manifest_path: Option<&str>,
     platforms: &BTreeMap<String, String>,
     packages: &HashMap<PackageId, Package>,
+    test_features: Option<&[String]>,
+) -> Result<PlatformFeatures> {
+    let main_shape = match test_features {
+        None => GraphShape::Test(&[]),
+        Some(_) => GraphShape::Build,
+    };
+    let main = resolve_shape(manifest_path, platforms, packages, main_shape)?;
+    let Some(features) = test_features else {
+        return Ok(main);
+    };
+    let tests = resolve_shape(
+        manifest_path,
+        platforms,
+        packages,
+        GraphShape::Test(features),
+    )?;
+    Ok(with_test_resolution(main, tests))
+}
+
+/// Which compilation Cargo plans in a unit graph.
+#[derive(Debug, Clone, Copy)]
+enum GraphShape<'a> {
+    /// `cargo build --workspace`: libraries and binaries.
+    Build,
+    /// `cargo test --workspace --no-run`, with these `--features`.
+    Test(&'a [String]),
+}
+
+fn resolve_shape(
+    manifest_path: Option<&str>,
+    platforms: &BTreeMap<String, String>,
+    packages: &HashMap<PackageId, Package>,
+    shape: GraphShape,
 ) -> Result<PlatformFeatures> {
     let mut target: HashMap<PackageId, ContextResolution> = HashMap::new();
     let mut host: HashMap<PackageId, ContextResolution> = HashMap::new();
     for (platform, triple) in platforms {
-        let output = run_unit_graph(manifest_path, triple)
+        let output = run_unit_graph(manifest_path, triple, shape)
             .with_context(|| format!("failed to resolve features for platform `{platform}`"))?;
         let parsed = parse_unit_graph(&output, packages)
             .with_context(|| format!("failed to read Cargo's unit graph for `{triple}`"))?;
@@ -301,6 +385,90 @@ pub fn resolve_platform_features(
         }
     }
     Ok(combine_contexts(target, host))
+}
+
+/// Combine the ordinary build's resolution (`main`) with the tests' (`tests`).
+///
+/// A package that only the tests build takes the test resolution, in the test
+/// context. A target-context library that the tests build with other features or
+/// library dependencies, or whose library dependencies there include a test
+/// variant, gets a test variant. A package whose tests resolve differently from its
+/// main resolution, or use a test variant, records its tests' resolution.
+fn with_test_resolution(
+    mut main: PlatformFeatures,
+    mut tests: PlatformFeatures,
+) -> PlatformFeatures {
+    let lib_edges = |r: &PlatformResolution| (r.deps.normal.clone(), r.deps.build.clone());
+    let differs = |m: &PlatformResolution, t: &PlatformResolution| {
+        m.features != t.features || lib_edges(m) != lib_edges(t)
+    };
+    let in_both_on_target = |id: &PackageId| {
+        main.get(id).is_some_and(|m| !m.host_context)
+            && tests.get(id).is_some_and(|t| !t.host_context)
+    };
+    let mut variants: BTreeSet<String> = tests
+        .iter()
+        .filter(|(id, t)| in_both_on_target(id) && differs(&main[*id], t))
+        .map(|(id, _)| id.repr.clone())
+        .collect();
+    loop {
+        let more: Vec<String> = tests
+            .iter()
+            .filter(|(id, _)| in_both_on_target(id) && !variants.contains(&id.repr))
+            .filter(|(_, t)| {
+                t.deps
+                    .normal
+                    .values()
+                    .chain(t.deps.build.values())
+                    .flatten()
+                    .any(|dep| variants.contains(dep))
+            })
+            .map(|(id, _)| id.repr.clone())
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        variants.extend(more);
+    }
+
+    let ids: BTreeSet<PackageId> = main.keys().chain(tests.keys()).cloned().collect();
+    for id in ids {
+        let Some(t) = tests.remove(&id) else {
+            continue;
+        };
+        let test_variant_deps: BTreeSet<String> = t
+            .deps
+            .all()
+            .chain(t.exec_context.iter().flat_map(|e| e.deps.all()))
+            .filter(|dep| variants.contains(*dep))
+            .cloned()
+            .collect();
+        match main.get_mut(&id) {
+            None => {
+                // Built for the tests only: its rules are in the test context.
+                let mut only = t;
+                only.test_variant_deps = test_variant_deps;
+                only.test_context = true;
+                main.insert(id, only);
+            }
+            Some(m) => {
+                if variants.contains(&id.repr) {
+                    m.test_variant = Some(HostVariant {
+                        features: t.features.clone(),
+                        deps: t.deps.clone(),
+                    });
+                }
+                let same = m.features == t.features
+                    && m.deps == t.deps
+                    && m.exec_context == t.exec_context;
+                if !same || !test_variant_deps.is_empty() {
+                    m.tests = Some(Box::new(t));
+                }
+                m.test_variant_deps = test_variant_deps;
+            }
+        }
+    }
+    main
 }
 
 /// Combine the target- and host-context resolutions into each package's rules: the
@@ -377,6 +545,7 @@ fn combine_contexts(
                 host_context: false,
                 host_variant_deps,
                 exec_context: None,
+                ..Default::default()
             },
             (t, Some(h)) => {
                 let exec_context = t.map(|t| {
@@ -401,6 +570,7 @@ fn combine_contexts(
                     host_variant: None,
                     host_variant_deps,
                     exec_context,
+                    ..Default::default()
                 }
             }
             (None, None) => continue,
@@ -411,28 +581,33 @@ fn combine_contexts(
     result
 }
 
-fn run_unit_graph(manifest_path: Option<&str>, triple: &str) -> Result<String> {
+fn run_unit_graph(manifest_path: Option<&str>, triple: &str, shape: GraphShape) -> Result<String> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     let mut cmd = Command::new(cargo);
-    cmd.env("RUSTC_BOOTSTRAP", "1").args([
-        "test",
-        "--workspace",
-        "--no-run",
-        "--target",
-        triple,
-        "-Z",
-        "unstable-options",
-        "--unit-graph",
-    ]);
+    cmd.env("RUSTC_BOOTSTRAP", "1");
+    let command = match shape {
+        GraphShape::Build => {
+            cmd.args(["build", "--workspace"]);
+            "cargo build"
+        }
+        GraphShape::Test(features) => {
+            cmd.args(["test", "--workspace", "--no-run"]);
+            if !features.is_empty() {
+                cmd.args(["--features", &features.join(",")]);
+            }
+            "cargo test"
+        }
+    };
+    cmd.args(["--target", triple, "-Z", "unstable-options", "--unit-graph"]);
     if let Some(path) = manifest_path {
         cmd.args(["--manifest-path", path]);
     }
     let output = cmd
         .output()
-        .context("failed to run `cargo test --unit-graph`")?;
+        .with_context(|| format!("failed to run `{command} --unit-graph`"))?;
     if !output.status.success() {
         bail!(
-            "`cargo test --unit-graph --target {triple}` exited with {}: {}",
+            "`{command} --unit-graph --target {triple}` exited with {}: {}",
             output.status,
             String::from_utf8_lossy(&output.stderr)
         );
@@ -738,9 +913,13 @@ fixtures = { path = "../fixtures", features = ["test_lib"] }
             ("wasm32".to_owned(), "wasm32-unknown-unknown".to_owned()),
         ]);
         let manifest = dir.path().join("Cargo.toml");
-        let resolved =
-            resolve_platform_features(Some(manifest.to_str().unwrap()), &platforms, &packages)
-                .expect("resolve");
+        let resolved = resolve_platform_features(
+            Some(manifest.to_str().unwrap()),
+            &platforms,
+            &packages,
+            None,
+        )
+        .expect("resolve");
 
         assert_eq!(resolved[&sdk].features["linux-x86_64"], set(&["default"]));
         assert_eq!(
@@ -917,9 +1096,13 @@ fixtures = { path = "../fixtures", features = ["test_lib"] }
             "x86_64-unknown-linux-gnu".to_owned(),
         )]);
         let manifest = ws.join("Cargo.toml");
-        let resolved =
-            resolve_platform_features(Some(manifest.to_str().unwrap()), &platforms, &packages)
-                .expect("resolve");
+        let resolved = resolve_platform_features(
+            Some(manifest.to_str().unwrap()),
+            &platforms,
+            &packages,
+            None,
+        )
+        .expect("resolve");
 
         // The target copy of `json` does not get the build dependency's feature.
         let json = &resolved[&id("json")];

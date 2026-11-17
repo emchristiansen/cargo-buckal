@@ -48,6 +48,9 @@ pub struct BuckalTarget {
     pub doctest: bool,
     /// Whether tests are enabled for this target.
     pub test: bool,
+    /// Features the target needs (Cargo's `required-features`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_features: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,6 +154,7 @@ impl BuckalResolve {
                     src_path: t.src_path.clone(),
                     doctest: t.doctest,
                     test: t.test,
+                    required_features: t.required_features.clone(),
                 })
                 .collect();
 
@@ -1249,6 +1253,7 @@ mod tests {
                 kind: vec![TargetKind::Lib],
                 src_path: Utf8PathBuf::from("/home/alice/project/src/lib.rs"),
                 doctest: true,
+                required_features: Vec::new(),
                 test: true,
             }],
             source: None,
@@ -1405,6 +1410,7 @@ mod tests {
                     )),
                     doctest: true,
                     test: true,
+                    required_features: Vec::new(),
                 }],
                 source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
                 links: None,
