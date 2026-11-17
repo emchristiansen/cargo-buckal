@@ -1232,3 +1232,56 @@ fn test_unverified_inventory_regenerates_every_package() {
     assert_eq!(changes.len(), resolve.nodes().count());
     assert!(changes.values().all(|c| matches!(c, ChangeType::Changed)));
 }
+
+/// Which dev edge of a dev-dev cycle is skipped must not depend on `HashMap` order:
+/// rebuilding the maps (each with its own random hash seed) gives the same graph.
+#[test]
+fn test_dev_dependency_cycle_skips_the_same_edge_every_time() {
+    let fixture_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dev-dev-cycle");
+    let metadata = MetadataCommand::new()
+        .manifest_path(fixture_dir.join("Cargo.toml"))
+        .exec()
+        .expect("cargo metadata failed");
+    let root_path = std::path::Path::new(metadata.workspace_root.as_str());
+    let edges = || {
+        let packages_map: HashMap<PackageId, cargo_metadata::Package> = metadata
+            .packages
+            .iter()
+            .cloned()
+            .map(|p| (p.id.clone(), p))
+            .collect();
+        let nodes_map: HashMap<PackageId, cargo_metadata::Node> = metadata
+            .resolve
+            .clone()
+            .expect("no resolve in metadata")
+            .nodes
+            .into_iter()
+            .map(|n| (n.id.clone(), n))
+            .collect();
+        let resolve = BuckalResolve::from_metadata(
+            &nodes_map,
+            &packages_map,
+            &HashMap::new(),
+            root_path,
+            true,
+        )
+        .expect("lenient resolution succeeds");
+        let mut edges: Vec<(String, String)> = resolve
+            .nodes()
+            .flat_map(|node| {
+                resolve
+                    .dependencies(&node.package_id)
+                    .into_iter()
+                    .map(|dep| (node.name.clone(), dep.name.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        edges.sort();
+        edges
+    };
+    let first = edges();
+    for _ in 0..20 {
+        assert_eq!(edges(), first);
+    }
+}

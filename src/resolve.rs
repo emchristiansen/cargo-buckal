@@ -216,8 +216,12 @@ impl BuckalResolve {
             }
         }
 
-        // Pass 2: Dev deps only
-        for (pkg_id, node) in nodes_map {
+        // Pass 2: Dev deps only. In package-id order: when a dev edge would close a
+        // cycle, which edge is skipped depends on the edges inserted before it, so a
+        // stable order keeps the generated rules stable across runs.
+        let mut dev_order: Vec<_> = nodes_map.iter().collect();
+        dev_order.sort_by(|(a, _), (b, _)| a.repr.cmp(&b.repr));
+        for (pkg_id, node) in dev_order {
             if let Some(&parent_idx) = index_map.get(pkg_id) {
                 for dep in &node.deps {
                     if let Some(&child_idx) = index_map.get(&dep.pkg) {
