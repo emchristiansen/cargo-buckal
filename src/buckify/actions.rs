@@ -559,7 +559,11 @@ mod tests {
         let idx = dag.add_node(node);
         let mut index_map = HashMap::new();
         index_map.insert(package_id.clone(), idx);
-        let resolve = BuckalResolve { dag, index_map };
+        let resolve = BuckalResolve {
+            dag,
+            index_map,
+            test_only_edges: Default::default(),
+        };
 
         // BuckalChange with Added for our root package
         let mut changes = BTreeMap::new();

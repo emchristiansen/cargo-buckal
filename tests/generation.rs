@@ -2323,3 +2323,132 @@ fn test_binary_unit_tests_get_cargo_bin_name() {
     assert!(unittest.contains("crate = \"my_cli\""), "{unittest}");
     assert!(!unittest.contains("CARGO_BIN_EXE"), "{unittest}");
 }
+
+/// The packages (`//<pkg>:` labels' packages) a rule depends on, platform-specific
+/// ones included.
+fn dep_packages(rule: &str) -> std::collections::BTreeSet<String> {
+    rule.split('"')
+        .filter_map(|s| s.strip_prefix("//"))
+        .filter_map(|s| s.split_once(':').map(|(p, _)| p.to_owned()))
+        .filter(|p| !p.starts_with("platforms"))
+        .collect()
+}
+
+#[test]
+fn test_dev_edges_closing_package_cycles_stay_on_the_tests() {
+    // b807 r30/r31 (Muninn): with `skip_dev_dependency_cycles`, a dev edge that
+    // closes a cycle among packages was dropped, so the dependent's tests lost it.
+    // A test is a rule apart from its package's library, so in Buck no rule depends
+    // on itself through such an edge, and Cargo builds the tests with it.
+    // - true back-edge: `metrics` dev-depends on `init`, which depends on `metrics`;
+    // - longer back-edge: `covered` dev-depends on `policy`, which depends on
+    //   `gen`, which depends on `covered`;
+    // - dev-only back-edge: `testkit` and `usage` dev-depend on each other.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"metrics\", \"init\", \"covered\", \"policy\", \"gen\", \"testkit\", \"usage\"]\n",
+    );
+    let path = |n: &str| format!("{n} = {{ path = \"../{n}\" }}\n");
+    for (name, deps, dev_deps) in [
+        ("metrics", String::new(), path("init")),
+        ("init", path("metrics"), String::new()),
+        ("covered", String::new(), path("policy")),
+        ("policy", path("gen"), String::new()),
+        ("gen", path("covered"), String::new()),
+        ("testkit", String::new(), path("usage")),
+        ("usage", String::new(), path("testkit")),
+    ] {
+        write(
+            &f.ws.join(name).join("Cargo.toml"),
+            &manifest(
+                name,
+                &format!("[dependencies]\n{deps}[dev-dependencies]\n{dev_deps}"),
+            ),
+        );
+        write(&f.ws.join(name).join("src/lib.rs"), "");
+    }
+    let config = BUCKAL_TOML.split("[fixups.extra]").next().unwrap();
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!("skip_dev_dependency_cycles = true\n{config}"),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("Skipping dev-dependency"), "{stderr}");
+
+    for (name, dev_dep) in [
+        ("metrics", "init"),
+        ("covered", "policy"),
+        ("testkit", "usage"),
+        ("usage", "testkit"),
+    ] {
+        let buck = f.buck(name);
+        let unittest = rule(&buck, "unittest");
+        assert!(
+            dep_packages(unittest).contains(dev_dep),
+            "{name} tests lack {dev_dep}:\n{unittest}"
+        );
+        // The library has no dev-dependency.
+        assert!(!dep_packages(rule(&buck, name)).contains(dev_dep), "{buck}");
+    }
+
+    // Parity: each unit test depends on exactly the packages Cargo's unit graph
+    // gives its unit-test unit (on linux).
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    let output = Command::new(cargo)
+        .args([
+            "test",
+            "--workspace",
+            "--no-run",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "-Z",
+            "unstable-options",
+            "--unit-graph",
+        ])
+        .current_dir(&f.ws)
+        .env("RUSTC_BOOTSTRAP", "1")
+        .env("CARGO_NET_OFFLINE", "true")
+        .output()
+        .expect("run cargo");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let graph: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let units = graph["units"].as_array().unwrap();
+    let package = |u: &serde_json::Value| {
+        let id = u["pkg_id"].as_str().unwrap();
+        id.rsplit('/')
+            .next()
+            .unwrap()
+            .split('#')
+            .next()
+            .unwrap()
+            .to_owned()
+    };
+    for name in [
+        "metrics", "init", "covered", "policy", "gen", "testkit", "usage",
+    ] {
+        let unit = units
+            .iter()
+            .find(|u| u["mode"] == "test" && u["target"]["kind"][0] == "lib" && package(u) == name)
+            .unwrap_or_else(|| panic!("no unit test unit for {name}"));
+        let cargo_deps: std::collections::BTreeSet<String> = unit["dependencies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| package(&units[d["index"].as_u64().unwrap() as usize]))
+            .filter(|p| p != name)
+            .collect();
+        let buck = f.buck(name);
+        assert_eq!(
+            dep_packages(rule(&buck, "unittest")),
+            cargo_deps,
+            "{name}:\n{buck}"
+        );
+    }
+}

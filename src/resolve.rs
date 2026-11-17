@@ -96,7 +96,16 @@ pub fn is_lib_like(kind: &TargetKind) -> bool {
 pub struct BuckalResolve {
     pub dag: Dag<BuckalNode, BuckalDep, u32>,
     pub index_map: HashMap<PackageId, NodeIndex<u32>>,
+    /// Dev-dependency edges that would close a cycle among packages, by dependent
+    /// (with `skip_dev_dependency_cycles`). Only tests use dev-dependencies, and a
+    /// test is a rule of its own, apart from the package's library: its edge to the
+    /// dependency closes no cycle among Buck rules. They are kept outside the
+    /// acyclic package graph and still reach the dependent's tests.
+    pub test_only_edges: TestOnlyEdges,
 }
+
+/// See [`BuckalResolve::test_only_edges`].
+pub type TestOnlyEdges = HashMap<NodeIndex<u32>, Vec<(NodeIndex<u32>, BuckalDep)>>;
 
 impl BuckalResolve {
     /// O(1) lookup of a node by its `PackageId`.
@@ -123,6 +132,7 @@ impl BuckalResolve {
     ) -> anyhow::Result<Self> {
         let mut dag = Dag::<BuckalNode, BuckalDep, u32>::new();
         let mut index_map = HashMap::new();
+        let mut test_only_edges = TestOnlyEdges::new();
 
         // Create nodes
         for (pkg_id, node) in nodes_map {
@@ -264,17 +274,17 @@ impl BuckalResolve {
                         // edges here, and (2) ensure downstream consumers correctly
                         // scope dev edges to test targets only.
                         // See: https://github.com/buck2hub/cargo-buckal/pull/75#discussion_r2975238783
-                        if dag.add_edge(parent_idx, child_idx, buckal_dep).is_err() {
+                        if let Err(cycle) = dag.add_edge(parent_idx, child_idx, buckal_dep) {
                             let parent_name = &dag[parent_idx].name;
                             let child_name = &dag[child_idx].name;
                             if lenient {
-                                // In lenient mode, skip the cyclic dev edge so we still
-                                // have all nodes. A package's dev-dependency on itself
-                                // needs no edge: its tests compile against its own
-                                // library, and the features the edge enables are in the
-                                // tests' resolution (with per-platform resolution). Any
-                                // other cyclic dev-dependency is not a dependency of the
-                                // parent's tests.
+                                // A package's dev-dependency on itself needs no edge:
+                                // its tests compile against its own library, and the
+                                // features the edge enables are in the tests'
+                                // resolution (with per-platform resolution). Any other
+                                // cycle-closing dev edge is kept for the dependent's
+                                // tests only: the tests are rules apart from the
+                                // library, so no Buck rule depends on itself through it.
                                 if parent_idx == child_idx {
                                     crate::buckal_note!(
                                         "Dev-dependency of `{}` on itself needs no edge; with `feature_platforms`, its tests use `{}` with the features it enables.",
@@ -282,13 +292,10 @@ impl BuckalResolve {
                                         parent_name
                                     );
                                 } else {
-                                    crate::buckal_warn!(
-                                        "Skipping dev-dependency `{}` -> `{}`, which forms a cycle; the tests of `{}` do not depend on `{}`.",
-                                        parent_name,
-                                        child_name,
-                                        parent_name,
-                                        child_name
-                                    );
+                                    test_only_edges
+                                        .entry(parent_idx)
+                                        .or_default()
+                                        .push((child_idx, cycle.0));
                                 }
                                 continue;
                             }
@@ -312,7 +319,11 @@ impl BuckalResolve {
             }
         }
 
-        Ok(Self { dag, index_map })
+        Ok(Self {
+            dag,
+            index_map,
+            test_only_edges,
+        })
     }
 
     pub fn dependents(&self, pkg_id: &PackageId) -> Vec<&BuckalNode> {
@@ -373,6 +384,13 @@ impl BuckalResolve {
             .children(idx)
             .iter(&self.dag)
             .map(|(edge_idx, node_idx)| (&self.dag[edge_idx], &self.dag[node_idx]))
+            .chain(
+                self.test_only_edges
+                    .get(&idx)
+                    .into_iter()
+                    .flatten()
+                    .map(|(child, dep)| (dep, &self.dag[*child])),
+            )
             .collect()
     }
 
@@ -503,6 +521,28 @@ impl BuckalResolve {
             hasher.update(&dep_encoded);
             hasher.update(child_canonical_id.repr.as_bytes());
         }
+        // Dev edges kept for the tests only.
+        let mut test_only: Vec<_> = self
+            .test_only_edges
+            .get(&idx)
+            .into_iter()
+            .flatten()
+            .map(|(child, dep)| {
+                (
+                    self.dag[*child].package_id.canonicalize(workspace_root),
+                    dep,
+                )
+            })
+            .collect();
+        test_only.sort_by(|(a, _), (b, _)| a.repr.cmp(&b.repr));
+        for (child_canonical_id, dep) in &test_only {
+            hasher.update(b"test-only");
+            let dep_encoded =
+                bincode_next::serde::encode_to_vec(*dep, bincode_next::config::standard())
+                    .expect("Serialization failed");
+            hasher.update(&dep_encoded);
+            hasher.update(child_canonical_id.repr.as_bytes());
+        }
 
         // 9. Version patch config — if a patch references this node's crate name
         //    AND this node's version matches the patch's "from" or "to", include
@@ -611,7 +651,11 @@ mod tests {
         dag.add_edge(idx_a, idx_b, make_dep("b")).unwrap();
         dag.add_edge(idx_b, idx_c, make_dep("c")).unwrap();
 
-        let resolve = BuckalResolve { dag, index_map };
+        let resolve = BuckalResolve {
+            dag,
+            index_map,
+            test_only_edges: Default::default(),
+        };
 
         // B's dependents should be [A]
         let b_dependents = resolve.dependents(&make_pkg_id("b"));
@@ -660,7 +704,11 @@ mod tests {
         index_map.insert(node_a.package_id.clone(), idx_a);
         index_map.insert(node_b.package_id.clone(), idx_b);
 
-        let resolve = BuckalResolve { dag, index_map };
+        let resolve = BuckalResolve {
+            dag,
+            index_map,
+            test_only_edges: Default::default(),
+        };
 
         assert!(resolve.find_by_name("serde", None).is_some());
         assert!(resolve.find_by_name("serde", Some("1.0.0")).is_some());
@@ -680,6 +728,7 @@ mod tests {
         let idx1 = dag.add_node(node1.clone());
         index_map.insert(node1.package_id.clone(), idx1);
         let resolve1 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag,
             index_map: index_map.clone(),
         };
@@ -689,6 +738,7 @@ mod tests {
         let idx2 = dag2.add_node(node2.clone());
         index_map2.insert(node2.package_id.clone(), idx2);
         let resolve2 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag: dag2,
             index_map: index_map2,
         };
@@ -698,6 +748,7 @@ mod tests {
         let idx3 = dag3.add_node(node3.clone());
         index_map3.insert(node3.package_id.clone(), idx3);
         let resolve3 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag: dag3,
             index_map: index_map3,
         };
@@ -789,7 +840,11 @@ mod tests {
         dag.add_edge(idx_a, idx_cv1, make_dep("common")).unwrap();
         dag.add_edge(idx_b, idx_cv2, make_dep("common")).unwrap();
 
-        let resolve = BuckalResolve { dag, index_map };
+        let resolve = BuckalResolve {
+            dag,
+            index_map,
+            test_only_edges: Default::default(),
+        };
 
         // Total: root + dep_a + dep_b + common@1.0 + common@2.0 = 5 nodes
         assert_eq!(resolve.nodes().count(), 5);
@@ -883,7 +938,11 @@ mod tests {
         dag.add_edge(idx_a, idx_b, make_dep("b")).unwrap();
         dag.add_edge(idx_b, idx_c, make_dep("c")).unwrap();
 
-        let resolve = BuckalResolve { dag, index_map };
+        let resolve = BuckalResolve {
+            dag,
+            index_map,
+            test_only_edges: Default::default(),
+        };
 
         // A → B: one pair with dep name "b" pointing to node "b"
         let a_deps = resolve.deps_of(&make_pkg_id("a"));
@@ -936,7 +995,11 @@ mod tests {
         )
         .unwrap();
 
-        let resolve = BuckalResolve { dag, index_map };
+        let resolve = BuckalResolve {
+            dag,
+            index_map,
+            test_only_edges: Default::default(),
+        };
 
         let a_deps = resolve.deps_of(&make_pkg_id("a"));
         assert_eq!(a_deps.len(), 2);
@@ -967,6 +1030,7 @@ mod tests {
         let idx_a1 = dag1.add_node(node_a1.clone());
         index_map1.insert(node_a1.package_id.clone(), idx_a1);
         let resolve1 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag: dag1,
             index_map: index_map1,
         };
@@ -982,6 +1046,7 @@ mod tests {
         index_map2.insert(node_b2.package_id.clone(), idx_b2);
         dag2.add_edge(idx_a2, idx_b2, make_dep("b")).unwrap();
         let resolve2 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag: dag2,
             index_map: index_map2,
         };
@@ -998,6 +1063,7 @@ mod tests {
         dag3.add_edge(idx_a3, idx_b3, make_dep("b-renamed"))
             .unwrap();
         let resolve3 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag: dag3,
             index_map: index_map3,
         };
@@ -1045,7 +1111,11 @@ mod tests {
         index_map.insert(child.package_id.clone(), idx_child);
         dag.add_edge(idx_parent, idx_child, make_dep("child"))
             .unwrap();
-        let resolve = BuckalResolve { dag, index_map };
+        let resolve = BuckalResolve {
+            dag,
+            index_map,
+            test_only_edges: Default::default(),
+        };
 
         let fp_no_patch = resolve.fingerprint_of(
             &parent.package_id,
@@ -1107,7 +1177,11 @@ mod tests {
             });
         }
 
-        let resolve = BuckalResolve { dag, index_map };
+        let resolve = BuckalResolve {
+            dag,
+            index_map,
+            test_only_edges: Default::default(),
+        };
 
         // dependencies() should return b exactly once (not duplicated)
         let a_deps = resolve.dependencies(&make_pkg_id("a"));
@@ -1205,7 +1279,11 @@ mod tests {
             .unwrap();
         }
 
-        let resolve = BuckalResolve { dag, index_map };
+        let resolve = BuckalResolve {
+            dag,
+            index_map,
+            test_only_edges: Default::default(),
+        };
 
         // deps_of should return TWO edges: "foo" (Normal) and "bar" (Dev)
         let a_deps = resolve.deps_of(&make_pkg_id("a"));
@@ -1280,6 +1358,7 @@ mod tests {
         let idx1 = dag1.add_node(node_alice.clone());
         map1.insert(node_alice.package_id.clone(), idx1);
         let resolve1 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag: dag1,
             index_map: map1,
         };
@@ -1297,6 +1376,7 @@ mod tests {
         let idx2 = dag2.add_node(node_alice.clone());
         map2.insert(node_alice.package_id.clone(), idx2);
         let resolve2 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag: dag2,
             index_map: map2,
         };
@@ -1361,6 +1441,7 @@ mod tests {
         dag1.add_edge(idx_p1, idx_a1, make_dep("alpha")).unwrap();
         dag1.add_edge(idx_p1, idx_b1, make_dep("beta")).unwrap();
         let resolve1 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag: dag1,
             index_map: map1,
         };
@@ -1381,6 +1462,7 @@ mod tests {
         dag2.add_edge(idx_p2, idx_b2, make_dep("beta")).unwrap();
         dag2.add_edge(idx_p2, idx_a2, make_dep("alpha")).unwrap();
         let resolve2 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag: dag2,
             index_map: map2,
         };
@@ -1441,6 +1523,7 @@ mod tests {
         let idx1 = dag1.add_node(node1.clone());
         map1.insert(node1.package_id.clone(), idx1);
         let resolve1 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag: dag1,
             index_map: map1,
         };
@@ -1450,6 +1533,7 @@ mod tests {
         let idx2 = dag2.add_node(node2.clone());
         map2.insert(node2.package_id.clone(), idx2);
         let resolve2 = BuckalResolve {
+            test_only_edges: Default::default(),
             dag: dag2,
             index_map: map2,
         };

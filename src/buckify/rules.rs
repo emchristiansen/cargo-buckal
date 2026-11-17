@@ -1256,6 +1256,7 @@ mod tests {
 
     fn empty_resolve() -> BuckalResolve {
         BuckalResolve {
+            test_only_edges: Default::default(),
             dag: Dag::new(),
             index_map: HashMap::new(),
         }

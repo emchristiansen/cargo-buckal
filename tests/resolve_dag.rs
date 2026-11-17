@@ -794,7 +794,8 @@ fn test_dev_dependency_cycle() {
     );
 }
 
-/// With `lenient`, the cycle-closing dev edge is dropped and every package stays.
+/// With `lenient`, every package stays, and the cycle-closing dev edge is kept for
+/// the tests only.
 #[test]
 fn test_dev_dependency_cycle_lenient_keeps_all_packages() {
     let fixture_dir =
@@ -824,13 +825,22 @@ fn test_dev_dependency_cycle_lenient_keeps_all_packages() {
             .expect("lenient resolution succeeds");
 
     assert_eq!(resolve.nodes().count(), packages_map.len());
-    // Exactly one direction of the cycle survives.
+    // Every edge is kept: the one that closes the cycle among packages for the
+    // dependent's tests only, apart from the acyclic package graph.
     let edge_count: usize = resolve
         .nodes()
         .map(|n| resolve.deps_of(&n.package_id).len())
         .sum();
     let declared: usize = nodes_map.values().map(|n| n.deps.len()).sum();
-    assert_eq!(edge_count + 1, declared);
+    assert_eq!(edge_count, declared);
+    assert_eq!(
+        resolve
+            .test_only_edges
+            .values()
+            .map(Vec::len)
+            .sum::<usize>(),
+        1
+    );
 }
 
 /// Verify that `cargo test` succeeds for a mutual dev-dependency cycle.

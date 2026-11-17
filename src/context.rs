@@ -248,7 +248,11 @@ mod tests {
         index_map.insert(to_registry.package_id.clone(), idx_to_reg);
         index_map.insert(to_git.package_id.clone(), idx_to_git);
 
-        let resolve = BuckalResolve { dag, index_map };
+        let resolve = BuckalResolve {
+            dag,
+            index_map,
+            test_only_edges: Default::default(),
+        };
 
         let patch = RepoPatchConfig {
             version: [(
@@ -290,7 +294,11 @@ mod tests {
         index_map.insert(from_registry.package_id.clone(), idx_from);
         index_map.insert(to_git.package_id.clone(), idx_to_git);
 
-        let resolve = BuckalResolve { dag, index_map };
+        let resolve = BuckalResolve {
+            dag,
+            index_map,
+            test_only_edges: Default::default(),
+        };
 
         let patch = RepoPatchConfig {
             version: [(

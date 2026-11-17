@@ -318,7 +318,11 @@ mod tests {
 
         BuckalContext {
             root: None,
-            resolve: BuckalResolve { dag, index_map },
+            resolve: BuckalResolve {
+                dag,
+                index_map,
+                test_only_edges: Default::default(),
+            },
             workspace_root: Utf8PathBuf::from("/tmp/workspace"),
             workspace_inherit: false,
             no_merge: false,
