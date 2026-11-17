@@ -2,7 +2,7 @@ use cargo_metadata::camino::Utf8Path;
 use regex::Regex;
 
 use crate::{
-    buck::{Rule, parse_buck_file, patch_buck_rules},
+    buck::{Rule, TopLevelKind, parse_buck_file, patch_buck_rules, top_level_statements},
     buckal_log,
     buckify::emit::emit_export_file,
     cache::{BuckalChange, ChangeType},
@@ -12,7 +12,8 @@ use crate::{
 };
 
 use super::{
-    buckify_dep_node, buckify_root_node, cross, gen_buck_content, vendor_package, windows,
+    buckify_dep_node, buckify_root_node, cross, gen_buck_content, gen_buck_content_preserving,
+    vendor_package, windows,
 };
 
 impl BuckalChange {
@@ -72,8 +73,14 @@ impl BuckalChange {
                             .unwrap_or_default();
                         merge_rules(&buck_path, &mut buck_rules, ctx, previous_flags);
 
-                        // Generate the BUCK file
-                        let mut buck_content = gen_buck_content(&buck_rules);
+                        // Generate the BUCK file, keeping what a first-party package's
+                        // BUCK file has beyond the rules generation owns.
+                        let mut buck_content = if is_third_party_pkg {
+                            gen_buck_content(&buck_rules)
+                        } else {
+                            let (loads, statements) = hand_written(&buck_path);
+                            gen_buck_content_preserving(&buck_rules, &loads, &statements)
+                        };
                         if !is_third_party_pkg {
                             buck_content =
                                 windows::patch_root_windows_rustc_flags(buck_content, ctx, node);
@@ -111,31 +118,106 @@ impl BuckalChange {
             }
         }
 
-        // Export workspace manifest for virtual workspace
+        // Export workspace manifest for virtual workspace. Generation owns only this
+        // rule of the root BUCK file; everything else in it is kept byte for byte.
         if !workspace_emitted && ctx.workspace_inherit {
             let buck_path = ctx.workspace_root.join("BUCK");
-            let mut rules = if buck_path.exists() {
-                parse_buck_file(&buck_path)
-                    .unwrap_or_exit_ctx(format!("Failed to parse {}", buck_path))
-                    .values()
-                    .cloned()
-                    .collect::<Vec<_>>()
+            let buck_content = if buck_path.exists() {
+                let existing = std::fs::read_to_string(&buck_path)
+                    .unwrap_or_exit_ctx(format!("Failed to read {}", buck_path));
+                let export =
+                    serde_starlark::to_string(&emit_export_file()).expect("serialize export_file");
+                splice_rules(
+                    buck_path.as_str(),
+                    &existing,
+                    &[("export_file", "workspace", export.trim_end())],
+                )
+                .unwrap_or_exit_ctx(format!("Failed to parse {}", buck_path))
             } else {
-                Vec::new()
+                gen_buck_content(&[Rule::ExportFile(emit_export_file())])
             };
-            let export_file = Rule::ExportFile(emit_export_file());
-            if let Some(existing) = rules
-                .iter_mut()
-                .find(|r| matches!(r, Rule::ExportFile(ef) if ef.name == "workspace"))
-            {
-                *existing = export_file;
-            } else {
-                rules.push(export_file);
-            }
-            let buck_content = gen_buck_content(&rules);
             std::fs::write(&buck_path, buck_content).expect("Failed to write BUCK file");
         }
     }
+}
+
+/// Rule kinds that generation owns in a package BUCK file it writes: their calls
+/// are replaced by the generated rules.
+const GENERATED_RULE_KINDS: [&str; 9] = [
+    "buildscript_run",
+    "cargo_manifest",
+    "export_file",
+    "filegroup",
+    "git_fetch",
+    "http_archive",
+    "rust_binary",
+    "rust_library",
+    "rust_test",
+];
+
+/// The hand-written content of the BUCK file at `buck_path`, which generation
+/// keeps when it rewrites the file: loads of other than `@buckal//` files, and
+/// every other top-level statement that is not a call of a generated rule kind,
+/// each with the comments leading up to it, verbatim. Comments after the last
+/// statement are kept as a statement of their own.
+fn hand_written(buck_path: &Utf8Path) -> (Vec<String>, Vec<String>) {
+    let Ok(content) = std::fs::read_to_string(buck_path) else {
+        return Default::default();
+    };
+    let (statements, trailing) = top_level_statements(buck_path.as_str(), &content)
+        .unwrap_or_exit_ctx(format!(
+            "Failed to parse {buck_path}, whose hand-written content generation would replace"
+        ));
+    let mut loads = Vec::new();
+    let mut kept = Vec::new();
+    for statement in statements {
+        let text = content[statement.with_comments.clone()].to_owned();
+        match &statement.kind {
+            TopLevelKind::Load(bzl) if bzl.starts_with("@buckal//") => {}
+            TopLevelKind::Load(_) => loads.push(text),
+            TopLevelKind::Call { function, .. }
+                if GENERATED_RULE_KINDS.contains(&function.as_str()) => {}
+            _ => kept.push(text),
+        }
+    }
+    kept.extend(trailing.map(|range| content[range].to_owned()));
+    (loads, kept)
+}
+
+/// `content` of a BUCK file that generation does not own as a whole, with each
+/// `(function, name, text)` rule replacing the top-level call of `function` with
+/// that `name` in place, or appended if there is none. Everything else is kept
+/// byte for byte.
+fn splice_rules(path: &str, content: &str, rules: &[(&str, &str, &str)]) -> anyhow::Result<String> {
+    let mut spliced = content.to_owned();
+    for (function, name, text) in rules {
+        let (statements, _) = top_level_statements(path, &spliced)?;
+        let existing = statements.iter().find(|statement| {
+            matches!(
+                &statement.kind,
+                TopLevelKind::Call { function: f, name: Some(n) } if f == function && n == name
+            )
+        });
+        spliced = match existing {
+            Some(statement) => format!(
+                "{}{text}{}",
+                &spliced[..statement.span.start],
+                &spliced[statement.span.end..]
+            ),
+            None => {
+                if !spliced.is_empty() && !spliced.ends_with('\n') {
+                    spliced.push('\n');
+                }
+                if !spliced.is_empty() {
+                    spliced.push('\n');
+                }
+                spliced.push_str(text);
+                spliced.push('\n');
+                spliced
+            }
+        };
+    }
+    Ok(spliced)
 }
 
 /// Check if a node represents a third-party dependency
