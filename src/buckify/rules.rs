@@ -911,6 +911,7 @@ mod tests {
             &existing,
             &mut regenerated,
             &Set::from(["rustc_flags".to_owned()]),
+            &[],
         );
         assert_eq!(gen_buck_content(&regenerated), content);
     }

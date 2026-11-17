@@ -296,12 +296,12 @@ fn test_cached_migrate_follows_fixups_and_old_caches() {
     f.migrate(&[]);
     assert!(!lib(&f).contains("opt-level"), "{}", lib(&f));
 
-    // A cache written by an older generator (v0.1.4 wrote version 4) is stale: the
+    // A cache written by an older generator (v0.1.4 wrote version 4; this one writes 6) is stale: the
     // rules are regenerated even though the packages did not change.
     let snap = f.ws.join("buckal.snap");
     let cache = std::fs::read_to_string(&snap).unwrap();
-    assert!(cache.contains("version = 5"), "{cache}");
-    std::fs::write(&snap, cache.replace("version = 5", "version = 4")).unwrap();
+    assert!(cache.contains("version = 6"), "{cache}");
+    std::fs::write(&snap, cache.replace("version = 6", "version = 4")).unwrap();
     let stale = "# stale rules from an older generator\n";
     write(&f.ws.join("extra/BUCK"), stale);
     f.migrate(&[]);
@@ -443,7 +443,7 @@ fn test_update_after_an_old_cache_regenerates_before_certifying() {
     // Rules and cache from an older generator (cache version 4).
     let snap = f.ws.join("buckal.snap");
     let cache = std::fs::read_to_string(&snap).unwrap();
-    std::fs::write(&snap, cache.replace("version = 5", "version = 4")).unwrap();
+    std::fs::write(&snap, cache.replace("version = 6", "version = 4")).unwrap();
     let stale = "# stale rules from v4\n";
     write(&f.ws.join("extra/BUCK"), stale);
 
@@ -453,10 +453,69 @@ fn test_update_after_an_old_cache_regenerates_before_certifying() {
     assert!(
         std::fs::read_to_string(&snap)
             .unwrap()
-            .contains("version = 5")
+            .contains("version = 6")
     );
     assert_eq!(f.buck("extra"), current);
     // ...so that an ordinary migrate afterwards finds current rules.
     f.migrate(&[]);
     assert_eq!(f.buck("extra"), current);
+}
+
+/// The `rustc_flags` of a rule's text, in order.
+fn rustc_flags(rule: &str) -> Vec<String> {
+    let start =
+        rule.find("    rustc_flags = [").expect("rustc_flags") + "    rustc_flags = [".len();
+    let mut flags = Vec::new();
+    let mut chars = rule[start..].chars();
+    while let Some(c) = chars.next() {
+        match c {
+            ']' => break,
+            '"' => flags.push(chars.by_ref().take_while(|&c| c != '"').collect()),
+            _ => {}
+        }
+    }
+    flags
+}
+
+#[test]
+fn test_merge_keeps_manual_flag_groups_and_drops_old_fixup_flags() {
+    let f = fixture();
+    let config =
+        |fixup: &str| format!("ignore_tests = false\npatch_fields = [\"rustc_flags\"]\n{fixup}");
+    let manifest_flag = "@$(location :manifest[env_flags])";
+
+    // A manually written rule with its own `-C` group, merged with a generated fixup
+    // `-C` group (no cache yet).
+    write(
+        &f.ws.join("buckal.toml"),
+        &config("[fixups.extra]\nrustc_flags = [\"-C\", \"opt-level=2\"]\n"),
+    );
+    write(
+        &f.ws.join("extra/BUCK"),
+        "rust_library(\n    name = \"extra\",\n    srcs = [],\n    crate = \"extra\",\n    crate_root = \"src/lib.rs\",\n    edition = \"2021\",\n    rustc_flags = [\"-C\", \"debuginfo=1\"],\n)\n",
+    );
+    f.migrate(&["--no-cache", "--merge"]);
+    assert_eq!(
+        rustc_flags(rule(&f.buck("extra"), "extra")),
+        [manifest_flag, "-C", "opt-level=2", "-C", "debuginfo=1"]
+    );
+
+    // The fixup changes: the old fixup group is not taken for a manual edit.
+    write(
+        &f.ws.join("buckal.toml"),
+        &config("[fixups.extra]\nrustc_flags = [\"-C\", \"opt-level=3\"]\n"),
+    );
+    f.migrate(&["--merge"]);
+    assert_eq!(
+        rustc_flags(rule(&f.buck("extra"), "extra")),
+        [manifest_flag, "-C", "opt-level=3", "-C", "debuginfo=1"]
+    );
+
+    // The fixup goes away: only the manual group stays.
+    write(&f.ws.join("buckal.toml"), &config(""));
+    f.migrate(&["--merge"]);
+    assert_eq!(
+        rustc_flags(rule(&f.buck("extra"), "extra")),
+        [manifest_flag, "-C", "debuginfo=1"]
+    );
 }

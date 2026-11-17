@@ -65,7 +65,12 @@ impl BuckalChange {
 
                         // Patch BUCK Rules
                         let buck_path = vendor_dir.join("BUCK");
-                        merge_rules(&buck_path, &mut buck_rules, ctx);
+                        let previous_flags = self
+                            .previous_fixup_rustc_flags
+                            .get(&node.name)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default();
+                        merge_rules(&buck_path, &mut buck_rules, ctx, previous_flags);
 
                         // Generate the BUCK file
                         let mut buck_content = gen_buck_content(&buck_rules);
@@ -139,13 +144,23 @@ pub(super) fn is_third_party(node: &BuckalNode) -> bool {
 }
 
 /// Merge existing BUCK rules with new ones, preserving manual changes in specified fields.
-fn merge_rules(buck_path: &Utf8Path, buck_rules: &mut [Rule], ctx: &BuckalContext) {
+fn merge_rules(
+    buck_path: &Utf8Path,
+    buck_rules: &mut [Rule],
+    ctx: &BuckalContext,
+    previous_rustc_flags: &[String],
+) {
     if buck_path.exists() {
         // Skip merging manual changes if `--no-merge` is set
         if !ctx.no_merge && !ctx.repo_config.patch_fields.is_empty() {
             let existing_rules = parse_buck_file(buck_path)
                 .unwrap_or_exit_ctx(format!("Failed to parse {}", buck_path));
-            patch_buck_rules(&existing_rules, buck_rules, &ctx.repo_config.patch_fields);
+            patch_buck_rules(
+                &existing_rules,
+                buck_rules,
+                &ctx.repo_config.patch_fields,
+                previous_rustc_flags,
+            );
         }
     } else {
         std::fs::File::create(buck_path)
@@ -237,7 +252,10 @@ mod tests {
         // BuckalChange with Added for our root package
         let mut changes = BTreeMap::new();
         changes.insert(package_id.clone(), ChangeType::Added);
-        let change = BuckalChange { changes };
+        let change = BuckalChange {
+            changes,
+            ..Default::default()
+        };
 
         // BuckalContext with root set to our package (this is the key scenario)
         let ctx = BuckalContext {

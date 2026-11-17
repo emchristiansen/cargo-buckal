@@ -658,16 +658,38 @@ where
     }
 }
 
-/// Merge an ordered argument list from an existing rule (`src`) into a generated one
-/// (`dst`): the arguments of `src` that are not accounted for by `dst` (as a multiset,
-/// so repeated arguments such as `-C` survive) are appended in their order.
-fn patch_list(dst: &mut Vec<String>, src: &[String]) {
-    let mut generated = dst.clone();
-    for arg in src {
-        if let Some(pos) = generated.iter().position(|g| g == arg) {
+/// Split an ordered argument list into argument groups: an option (a token starting
+/// with `-`, or an `@file` argument) together with the value tokens that follow it.
+/// `["-C", "opt-level=2", "-Lnative=x"]` is `[["-C", "opt-level=2"], ["-Lnative=x"]]`.
+/// Leading value tokens with no option form a group of their own.
+pub fn argument_groups(args: &[String]) -> Vec<Vec<String>> {
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    for arg in args {
+        let starts_option = arg.starts_with('-') || arg.starts_with('@');
+        match groups.last_mut() {
+            Some(group) if !starts_option => group.push(arg.clone()),
+            _ => groups.push(vec![arg.clone()]),
+        }
+    }
+    groups
+}
+
+/// Merge the ordered argument list of an existing rule (`src`) into a generated one
+/// (`dst`), keeping only the existing rule's manual additions. The comparison is by
+/// whole argument group (`-C` with its value), never by single token, so a manual
+/// `-C debuginfo=1` survives next to a generated `-C opt-level=2`. The groups of
+/// `dst`, and of `previously_generated` (arguments an earlier generation emitted
+/// that the current one may no longer, e.g. a changed or removed fixup), are not
+/// manual and are not carried over; each accounts for one matching group (a
+/// multiset), so a repeated manual group survives.
+fn patch_list(dst: &mut Vec<String>, src: &[String], previously_generated: &[String]) {
+    let mut generated = argument_groups(dst);
+    generated.extend(argument_groups(previously_generated));
+    for group in argument_groups(src) {
+        if let Some(pos) = generated.iter().position(|g| *g == group) {
             generated.remove(pos);
         } else {
-            dst.push(arg.clone());
+            dst.extend(group);
         }
     }
 }
@@ -720,7 +742,12 @@ fn patch_deps_fields(patch_fields: &Set<String>, dst: &mut DepFieldsMut, src: &D
 macro_rules! impl_patch_from {
     ($ty:ident) => {
         impl $ty {
-            fn patch_from(&mut self, other: &Self, patch_fields: &Set<String>) {
+            fn patch_from(
+                &mut self,
+                other: &Self,
+                patch_fields: &Set<String>,
+                previous_rustc_flags: &[String],
+            ) {
                 // Patch target_compatible_with set
                 if patch_fields.contains("target_compatible_with") {
                     patch_set(
@@ -746,7 +773,11 @@ macro_rules! impl_patch_from {
                 }
                 // Patch rustc_flags set
                 if patch_fields.contains("rustc_flags") {
-                    patch_list(&mut self.rustc_flags, &other.rustc_flags);
+                    patch_list(
+                        &mut self.rustc_flags,
+                        &other.rustc_flags,
+                        previous_rustc_flags,
+                    );
                 }
                 // Patch visibility set
                 if patch_fields.contains("visibility") {
@@ -1134,10 +1165,15 @@ pub fn parse_buck_file<T: AsRef<Utf8Path>>(file: T) -> anyhow::Result<Map<String
     Ok(buck_rules)
 }
 
+/// Keep the configured `patch_fields` of the existing rules (manual edits) in the
+/// regenerated ones. `previous_rustc_flags` are the fixup `rustc_flags` an earlier
+/// generation added to this package's rules (recorded in the cache); they are not
+/// manual edits.
 pub fn patch_buck_rules(
     existing: &Map<String, Rule>,
     to_patch: &mut [Rule],
     patch_fields: &Set<String>,
+    previous_rustc_flags: &[String],
 ) {
     fn find_existing<'a>(existing: &'a Map<String, Rule>, rule: &Rule) -> Option<&'a Rule> {
         existing.get(&rule_map_key(rule))
@@ -1151,7 +1187,7 @@ pub fn patch_buck_rules(
                     ..RustLibrary::default()
                 });
                 if let Some(Rule::RustLibrary(existing_rule)) = find_existing(existing, &probe) {
-                    new_rule.patch_from(existing_rule, patch_fields);
+                    new_rule.patch_from(existing_rule, patch_fields, previous_rustc_flags);
                 }
             }
             Rule::RustBinary(new_rule) => {
@@ -1160,7 +1196,7 @@ pub fn patch_buck_rules(
                     ..RustBinary::default()
                 });
                 if let Some(Rule::RustBinary(existing_rule)) = find_existing(existing, &probe) {
-                    new_rule.patch_from(existing_rule, patch_fields);
+                    new_rule.patch_from(existing_rule, patch_fields, previous_rustc_flags);
                 }
             }
             Rule::RustTest(new_rule) => {
@@ -1169,7 +1205,7 @@ pub fn patch_buck_rules(
                     ..RustTest::default()
                 });
                 if let Some(Rule::RustTest(existing_rule)) = find_existing(existing, &probe) {
-                    new_rule.patch_from(existing_rule, patch_fields);
+                    new_rule.patch_from(existing_rule, patch_fields, previous_rustc_flags);
                 }
             }
             Rule::BuildscriptRun(new_rule) => {
@@ -2190,5 +2226,60 @@ mod tests {
                 key
             );
         }
+    }
+
+    #[test]
+    fn test_patch_list_merges_whole_argument_groups() {
+        let v = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            argument_groups(&v(&[
+                "@f",
+                "-C",
+                "opt-level=2",
+                "-Lnative=x",
+                "-C",
+                "debuginfo=1"
+            ])),
+            [
+                v(&["@f"]),
+                v(&["-C", "opt-level=2"]),
+                v(&["-Lnative=x"]),
+                v(&["-C", "debuginfo=1"])
+            ]
+        );
+
+        // A manual `-C` group next to a generated one keeps its own `-C`.
+        let mut dst = v(&["@f", "-C", "opt-level=2"]);
+        patch_list(&mut dst, &v(&["-C", "debuginfo=1"]), &[]);
+        assert_eq!(dst, v(&["@f", "-C", "opt-level=2", "-C", "debuginfo=1"]));
+
+        // Groups the previous generation emitted (a changed fixup) are not manual;
+        // a repeated manual group survives once per occurrence beyond the generated.
+        let mut dst = v(&["@f", "-C", "opt-level=3"]);
+        patch_list(
+            &mut dst,
+            &v(&[
+                "@f",
+                "-C",
+                "opt-level=2",
+                "-C",
+                "debuginfo=1",
+                "-C",
+                "debuginfo=1",
+            ]),
+            &v(&["-C", "opt-level=2"]),
+        );
+        assert_eq!(
+            dst,
+            v(&[
+                "@f",
+                "-C",
+                "opt-level=3",
+                "-C",
+                "debuginfo=1",
+                "-C",
+                "debuginfo=1"
+            ])
+        );
     }
 }

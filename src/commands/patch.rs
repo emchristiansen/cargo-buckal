@@ -47,14 +47,18 @@ pub fn execute(args: &PatchArgs) {
     // The cache saved below certifies every package's rules. Without a compatible
     // record of generated rules, regenerate all of them first.
     let last_cache = get_last_cache(args.manifest_path.as_deref());
+    let full = BuckalCache::from_resolve_with_fixups(
+        &ctx.resolve,
+        &ctx.workspace_root,
+        &ctx.repo_config.patch,
+        &ctx.repo_config.fixups,
+    )
+    .diff(&last_cache, &ctx.workspace_root);
     if last_cache.is_unverified_inventory() {
-        let current = BuckalCache::from_resolve_with_fixups(
-            &ctx.resolve,
-            &ctx.workspace_root,
-            &ctx.repo_config.patch,
-            &ctx.repo_config.fixups,
-        );
-        changes.merge(current.diff(&last_cache, &ctx.workspace_root));
+        changes.merge(full);
+    } else {
+        // Only what the previous generation emitted, for merging manual edits.
+        changes.previous_fixup_rustc_flags = full.previous_fixup_rustc_flags;
     }
 
     upsert_version_patch(
@@ -184,7 +188,10 @@ fn targeted_patch_changes(ctx: &BuckalContext, selected: &SelectedPatch) -> Resu
         changes.insert(dependent.package_id.clone(), ChangeType::Changed);
     }
 
-    Ok(BuckalChange { changes })
+    Ok(BuckalChange {
+        changes,
+        ..Default::default()
+    })
 }
 
 fn find_unique_third_party_node<'a>(
