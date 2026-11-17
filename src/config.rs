@@ -461,6 +461,14 @@ pub struct TestFixup {
     /// `test_supports_execution_caching`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_test_execution_caching: Option<bool>,
+    /// Run-time environment of this test, after the package's `test_run_env`: a key
+    /// set here extends it, or overrides the package's value.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub run_env: Map<String, String>,
+    /// `RuntimeToolsInfo` label of this test, instead of the package's
+    /// `test_runtime_tools`; `""` gives this test none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_tools: Option<String>,
 }
 
 /// Test arguments (e.g. a narrowing selection such as `--declared-skip-substring

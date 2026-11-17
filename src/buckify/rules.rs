@@ -882,6 +882,11 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
                     if let Some(caching) = test.supports_test_execution_caching {
                         r.supports_test_execution_caching = Some(caching);
                     }
+                    r.run_env.extend(test.run_env.clone());
+                    if let Some(runtime_tools) = &test.runtime_tools {
+                        r.runtime_tools =
+                            (!runtime_tools.is_empty()).then(|| runtime_tools.clone());
+                    }
                     r.labels.extend(test.labels.iter().cloned());
                     r.args.extend(test.args.iter().cloned());
                     if !test.compatible_with.is_empty() {

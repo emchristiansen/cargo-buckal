@@ -3828,3 +3828,46 @@ fn test_fingerprints_do_not_depend_on_the_checkout_path() {
     assert_eq!(a_one, a_two);
     assert_eq!(snap_one, snap_two);
 }
+
+#[test]
+fn test_per_test_run_env_and_runtime_tools_through_generation() {
+    // Main gave run-time environment and tools to single tests; the package-wide
+    // keys reach every test. A per-test key extends or overrides them, and
+    // `runtime_tools = ""` gives a test none.
+    let f = fixture();
+    write(&f.ws.join("app/tests/it.rs"), "");
+    write(&f.ws.join("app/tests/other.rs"), "");
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!(
+            "{BUCKAL_TOML}\n[fixups.app]\ntest_runtime_tools = \"//tools:pkg\"\n\n[fixups.app.test_run_env]\nA = \"pkg\"\nB = \"pkg\"\n\n\
+             [fixups.app.tests.it]\nruntime_tools = \"//tools:it\"\nrun_env = {{ B = \"it\", C = \"it\" }}\n\n\
+             [fixups.app.tests.other]\nruntime_tools = \"\"\n"
+        ),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let app = f.buck("app");
+    let it = rule(&app, "it");
+    assert!(it.contains("    runtime_tools = \"//tools:it\",\n"), "{it}");
+    assert!(
+        it.contains("    run_env = {\n        \"A\": \"pkg\",\n        \"B\": \"it\",\n        \"C\": \"it\",\n    },\n"),
+        "{it}"
+    );
+    let other = rule(&app, "other");
+    assert!(!other.contains("runtime_tools"), "{other}");
+    assert!(
+        other.contains(
+            "    run_env = {\n        \"A\": \"pkg\",\n        \"B\": \"pkg\",\n    },\n"
+        ),
+        "{other}"
+    );
+    let unittest = rule(&app, "unittest");
+    assert!(
+        unittest.contains("    runtime_tools = \"//tools:pkg\",\n"),
+        "{unittest}"
+    );
+    f.migrate(&["--no-cache"]);
+    assert_eq!(f.buck("app"), app);
+}
