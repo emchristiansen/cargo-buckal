@@ -2681,3 +2681,37 @@ fn test_no_test_variant_for_a_target_dependency_with_a_test_host_variant() {
     let app = f.buck("app");
     assert!(rule(&app, "unittest").contains("\"//user:user\""), "{app}");
 }
+
+#[test]
+fn test_cdylib_only_library_unit_tests_are_emitted() {
+    // b807 r28 C: Cargo runs the unit tests of a library whose only crate type is
+    // cdylib (unit mode=test, kind cdylib), as for any library.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"wasmlib\"]\n",
+    );
+    write(
+        &f.ws.join("wasmlib/Cargo.toml"),
+        &manifest("wasmlib", "[lib]\ncrate-type = [\"cdylib\"]\n"),
+    );
+    write(
+        &f.ws.join("wasmlib/src/lib.rs"),
+        "#[cfg(test)]\nmod tests {\n    #[test]\n    fn inline() {}\n}\n",
+    );
+    write(
+        &f.ws.join("buckal.toml"),
+        BUCKAL_TOML.split("[fixups.extra]").next().unwrap(),
+    );
+    f.migrate(&[]);
+    let buck = f.buck("wasmlib");
+    let unittest = rule(&buck, "unittest");
+    assert!(
+        unittest.contains("crate_root = \"src/lib.rs\""),
+        "{unittest}"
+    );
+    assert!(
+        buck.contains("rust_test(\n    name = \"unittest\",\n"),
+        "{buck}"
+    );
+}
