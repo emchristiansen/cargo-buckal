@@ -241,55 +241,113 @@ fn expand(input: &str, workspace_root: &Utf8Path) -> Result<Vec<String>, String>
         return Err("matches no file".to_owned());
     }
     let mut files: Vec<String> = Vec::new();
-    // Symbolic links to directories are followed below the base as at it, so
-    // the glob sees the tree a build script reading through them sees (a loop
-    // is an error the walk reports).
-    for entry in walkdir::WalkDir::new(&start)
-        .follow_links(true)
-        .into_iter()
-        .filter_entry(|entry| entry.file_name() != ".git")
-    {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(error) => {
-                let at = error.path().and_then(Utf8Path::from_path);
-                let at_relative = at.and_then(|p| relative(p, workspace_root).ok());
-                // A link that leads nowhere: refused when the glob matches it,
-                // as its literal path is; otherwise it gives no file whatever it
-                // was meant to be.
-                if let (Some(at), Some(at_relative)) = (at, &at_relative)
-                    && at.is_symlink()
-                    && !at.exists()
-                {
-                    if matcher.is_match(at_relative) {
-                        return Err(format!("`{at_relative}` is a dangling symbolic link"));
-                    }
-                    continue;
-                }
-                // An entry the walk cannot read could hold a matching file:
-                // refuse rather than give the build script fewer files than Cargo
-                // would.
-                let at = at_relative.unwrap_or_else(|| base.to_string());
-                return Err(format!("cannot read `{at}`: {error}"));
-            }
-        };
-        let Some(path) = Utf8Path::from_path(entry.path()) else {
-            continue;
-        };
-        let Ok(relative_path) = relative(path, workspace_root) else {
-            continue;
-        };
-        // A symbolic link to a file counts as the file, as a literal path does;
-        // where it leads is checked with every match.
-        if entry.file_type().is_file() && matcher.is_match(&relative_path) {
-            files.push(relative_path);
-        }
-    }
+    let canonical_root = workspace_root
+        .canonicalize_utf8()
+        .map_err(|error| format!("cannot read the workspace root: {error}"))?;
+    let mut walk = Walk {
+        workspace_root,
+        canonical_root: &canonical_root,
+        matcher: &matcher,
+        files: &mut files,
+        ancestors: Vec::new(),
+    };
+    walk.dir(&start)?;
     files.sort();
     if files.is_empty() {
         return Err("matches no file".to_owned());
     }
     Ok(files)
+}
+
+/// A glob's walk below its base. Symbolic links to files count as the files,
+/// as a literal path does (where they lead is checked with every match).
+/// Symbolic links to directories are followed when they resolve inside the
+/// workspace, as the base is, and passed over when they lead outside it, so an
+/// untracked link such as a Nix `result` does not change what generation sees.
+/// A link that leads nowhere is refused when the glob matches it, as its literal
+/// path is; an entry the walk cannot read, or a loop, is refused: either could
+/// hide a matching file.
+struct Walk<'a> {
+    workspace_root: &'a Utf8Path,
+    canonical_root: &'a Utf8Path,
+    matcher: &'a globset::GlobMatcher,
+    files: &'a mut Vec<String>,
+    /// The canonical directories being walked, for loops.
+    ancestors: Vec<Utf8PathBuf>,
+}
+
+impl Walk<'_> {
+    fn relative(&self, path: &Utf8Path) -> String {
+        relative(path, self.workspace_root).unwrap_or_else(|_| path.to_string())
+    }
+
+    fn dir(&mut self, dir: &Utf8Path) -> Result<(), String> {
+        let unreadable = |walk: &Self, error: std::io::Error| {
+            format!("cannot read `{}`: {error}", walk.relative(dir))
+        };
+        let canonical = dir
+            .canonicalize_utf8()
+            .map_err(|error| unreadable(self, error))?;
+        if self.ancestors.contains(&canonical) {
+            return Err(format!(
+                "cannot read `{}`: a symbolic link loops back to `{canonical}`",
+                self.relative(dir)
+            ));
+        }
+        self.ancestors.push(canonical);
+        let mut entries = std::fs::read_dir(dir)
+            .map_err(|error| unreadable(self, error))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| unreadable(self, error))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            let Some(path) = Utf8Path::from_path(&entry.path()).map(Utf8Path::to_path_buf) else {
+                continue;
+            };
+            let relative_path = self.relative(&path);
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("cannot read `{relative_path}`: {error}"))?;
+            if file_type.is_dir() {
+                self.dir(&path)?;
+            } else if file_type.is_file() {
+                self.file(relative_path);
+            } else if file_type.is_symlink() {
+                match std::fs::metadata(&path) {
+                    Err(_) if !path.exists() => {
+                        if self.matcher.is_match(&relative_path) {
+                            return Err(format!("`{relative_path}` is a dangling symbolic link"));
+                        }
+                    }
+                    Err(error) => {
+                        return Err(format!("cannot read `{relative_path}`: {error}"));
+                    }
+                    Ok(target) if target.is_file() => self.file(relative_path),
+                    Ok(target) if target.is_dir() => {
+                        let inside = path
+                            .canonicalize_utf8()
+                            .map(|target| target.starts_with(self.canonical_root))
+                            .map_err(|error| format!("cannot read `{relative_path}`: {error}"))?;
+                        if inside {
+                            self.dir(&path)?;
+                        }
+                    }
+                    Ok(_) => {}
+                }
+            }
+        }
+        self.ancestors.pop();
+        Ok(())
+    }
+
+    fn file(&mut self, relative_path: String) {
+        if self.matcher.is_match(&relative_path) {
+            self.files.push(relative_path);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -387,6 +445,27 @@ mod tests {
         assert!(
             error.contains("`sdk/real/x.toml` is a dangling symbolic link"),
             "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_glob_ignores_a_linked_directory_outside_the_workspace() {
+        // Fable P3 on fcca702b: an untracked link to a directory outside the
+        // workspace (a Nix `result` link) is not walked, so generation does not
+        // depend on it; a linked directory inside the workspace still is.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("store/pkg");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("x.toml"), "").unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().join("ws")).unwrap();
+        std::fs::create_dir_all(root.join("sdk/real/deep")).unwrap();
+        std::fs::write(root.join("sdk/real/deep/d.toml"), "").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("sdk/result")).unwrap();
+        std::os::unix::fs::symlink("real", root.join("sdk/linkdir")).unwrap();
+        assert_eq!(
+            expand("sdk/**/*.toml", &root).unwrap(),
+            ["sdk/linkdir/deep/d.toml", "sdk/real/deep/d.toml"]
         );
     }
 
