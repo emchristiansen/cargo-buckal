@@ -3,8 +3,8 @@ use regex::Regex;
 
 use crate::{
     buck::{
-        FixupFlags, FixupSets, GENERATED_HEADER, NamedFileGroup, PARTLY_GENERATED_HEADER, Rule,
-        TopLevelKind, parse_buck_file, patch_buck_rules, top_level_statements,
+        FixupFlags, FixupSets, NamedFileGroup, PARTLY_GENERATED_HEADER, Rule, TopLevelKind,
+        is_generated_header_line, parse_buck_file, patch_buck_rules, top_level_statements,
     },
     buckal_error, buckal_log,
     buckify::emit::emit_export_file,
@@ -110,7 +110,13 @@ impl BuckalChange {
                         let mut buck_content = if is_third_party_pkg {
                             gen_buck_content(&buck_rules)
                         } else {
-                            let hand = hand_written(&buck_path);
+                            let owned = OwnedNames::of(
+                                node,
+                                &buck_rules,
+                                ctx,
+                                self.previous_fixups.as_ref(),
+                            );
+                            let hand = hand_written(&buck_path, &owned);
                             // The workspace-root rules spliced into this file later.
                             let reserved = if vendor_dir == ctx.workspace_root {
                                 root_owned_names(ctx)
@@ -234,10 +240,10 @@ impl BuckalChange {
 /// file) becomes [`PARTLY_GENERATED_HEADER`]. Nothing else changes.
 fn partly_generated_header(content: &str) -> String {
     match content.split_once('\n') {
-        Some((first, rest)) if first.trim() == GENERATED_HEADER => {
+        Some((first, rest)) if is_generated_header_line(first) => {
             format!("{PARTLY_GENERATED_HEADER}\n{rest}")
         }
-        None if content.trim() == GENERATED_HEADER => PARTLY_GENERATED_HEADER.to_owned(),
+        None if is_generated_header_line(content) => PARTLY_GENERATED_HEADER.to_owned(),
         _ => content.to_owned(),
     }
 }
@@ -302,7 +308,59 @@ const GENERATED_RULE_KINDS: [&str; 9] = [
 /// every other top-level statement that is not a call of a generated rule kind,
 /// each with the comments leading up to it, verbatim. Comments after the last
 /// statement are kept as a statement of their own.
-fn hand_written(buck_path: &Utf8Path) -> HandWritten {
+/// The names of the `filegroup` and `export_file` rules generation owns in a
+/// first-party package's BUCK file, now or in the previous generation, and the
+/// names of all the rules it emits now.
+#[derive(Debug, Default)]
+struct OwnedNames {
+    filegroups: std::collections::BTreeSet<String>,
+    exports: std::collections::BTreeSet<String>,
+    emitted: std::collections::BTreeSet<String>,
+}
+
+impl OwnedNames {
+    fn of(
+        node: &BuckalNode,
+        rules: &[Rule],
+        ctx: &BuckalContext,
+        previous_fixups: Option<&std::collections::BTreeMap<String, crate::config::PackageFixup>>,
+    ) -> Self {
+        let export_paths = |fixup: Option<&crate::config::PackageFixup>| {
+            fixup
+                .into_iter()
+                .flat_map(|fixup| fixup.export_files.iter().map(|e| e.path().to_owned()))
+                .collect::<Vec<_>>()
+        };
+        let mut exports: std::collections::BTreeSet<String> =
+            ["workspace".to_owned(), MANIFEST_EXPORT.to_owned()].into();
+        exports.extend(export_paths(ctx.repo_config.fixups.get(&node.name)));
+        exports.extend(export_paths(
+            previous_fixups.and_then(|fixups| fixups.get(&node.name)),
+        ));
+        Self {
+            filegroups: ["vendor".to_owned(), WORKSPACE_MANIFESTS.to_owned()].into(),
+            exports,
+            emitted: rules
+                .iter()
+                .filter_map(Rule::name)
+                .map(str::to_owned)
+                .collect(),
+        }
+    }
+
+    /// Whether generation owns the call of `function` named `name`: every call of a
+    /// Rust, build-script or vendoring rule kind, and the `filegroup` and
+    /// `export_file` calls it writes.
+    fn owns(&self, function: &str, name: Option<&str>) -> bool {
+        match (function, name) {
+            ("filegroup", Some(name)) => self.filegroups.contains(name),
+            ("export_file", Some(name)) => self.exports.contains(name),
+            _ => GENERATED_RULE_KINDS.contains(&function),
+        }
+    }
+}
+
+fn hand_written(buck_path: &Utf8Path, owned: &OwnedNames) -> HandWritten {
     let Ok(content) = std::fs::read_to_string(buck_path) else {
         return Default::default();
     };
@@ -316,8 +374,22 @@ fn hand_written(buck_path: &Utf8Path) -> HandWritten {
         match &statement.kind {
             TopLevelKind::Load(bzl) if bzl.starts_with("@buckal//") => {}
             TopLevelKind::Load(_) => hand.loads.push(text),
-            TopLevelKind::Call { function, .. }
-                if GENERATED_RULE_KINDS.contains(&function.as_str()) => {}
+            TopLevelKind::Call { function, name } if owned.owns(function, name.as_deref()) => {
+                // A rule generation owns but no longer emits (a removed target, or
+                // one written by hand in a kind generation owns) goes away: say so.
+                if let Some(name) = name
+                    && !owned.emitted.contains(name)
+                {
+                    crate::buckal_warn!(format!(
+                        "{buck_path}: removing `{function}(name = \"{name}\")`: generation owns every `{function}` rule of a first-party BUCK file{} and no longer emits this one",
+                        if matches!(function.as_str(), "filegroup" | "export_file") {
+                            " that it writes (its own names and `export_files`)"
+                        } else {
+                            ""
+                        }
+                    ));
+                }
+            }
             kind => {
                 if let TopLevelKind::Call {
                     function,
