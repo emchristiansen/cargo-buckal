@@ -199,13 +199,20 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
 
     // Pre-compute the library Buck target name for wiring binary → library deps.
     // In Cargo, every binary in a package implicitly depends on the package's library.
-    let lib_buck_name: Option<String> = lib_targets.first().map(|lib_target| {
-        if bin_targets.iter().any(|b| b.name == lib_target.name) {
+    // The name depends on every binary of the manifest, emitted or not: dependents'
+    // labels (`deps::dep_label`) are named from the manifest alone.
+    let lib_rule_name = |lib_target: &BuckalTarget| -> String {
+        if node
+            .targets
+            .iter()
+            .any(|b| b.kind.contains(&TargetKind::Bin) && b.name == lib_target.name)
+        {
             format!("{}-lib", lib_target.name)
         } else {
             lib_target.name.to_owned()
         }
-    });
+    };
+    let lib_buck_name: Option<String> = lib_targets.first().map(|t| lib_rule_name(t));
 
     // emit filegroup rule for vendor
     let filegroup = emit_filegroup();
@@ -246,11 +253,7 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
 
     // emit buck rules for lib targets
     for lib_target in &lib_targets {
-        let buckal_name = if bin_targets.iter().any(|b| b.name == lib_target.name) {
-            format!("{}-lib", lib_target.name)
-        } else {
-            lib_target.name.to_owned()
-        };
+        let buckal_name = lib_rule_name(lib_target);
 
         let rust_library = emit_rust_library(node, lib_target, &manifest_dir, &buckal_name, ctx);
 

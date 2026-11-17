@@ -1788,3 +1788,60 @@ fn test_binary_unit_tests_match_cargo_unit_graph() {
     assert_eq!(from_cargo, ["enabled", "tool"].map(str::to_owned).into());
     assert_eq!(emitted, from_cargo, "{tool}");
 }
+
+#[test]
+fn test_omitted_same_named_binary_keeps_the_library_label() {
+    // FEAT-BIN-LABEL-1 (t_7c72255f): `foo` has a library and a same-named binary
+    // whose required feature `cli` nothing enables, so the binary is not emitted;
+    // `app` depends on `foo`. The library rule and the label `app` uses must agree.
+    for cli_for_tests in [false, true] {
+        let f = fixture();
+        write(
+            &f.ws.join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"foo\"]\n",
+        );
+        write(
+            &f.ws.join("app/Cargo.toml"),
+            &manifest("app", "[dependencies]\nfoo = { path = \"../foo\" }\n"),
+        );
+        write(&f.ws.join("app/src/lib.rs"), "");
+        write(&f.ws.join("app/build.rs"), "fn main() {}\n");
+        write(
+            &f.ws.join("foo/Cargo.toml"),
+            &manifest(
+                "foo",
+                "[features]\ncli = []\n[[bin]]\nname = \"foo\"\npath = \"src/main.rs\"\nrequired-features = [\"cli\"]\n",
+            ),
+        );
+        write(&f.ws.join("foo/src/lib.rs"), "");
+        write(&f.ws.join("foo/src/main.rs"), "fn main() {}\n");
+        let config = BUCKAL_TOML.split("[fixups.extra]").next().unwrap();
+        let config = if cli_for_tests {
+            format!("test_features = [\"foo/cli\"]\n{config}")
+        } else {
+            config.to_owned()
+        };
+        write(&f.ws.join("buckal.toml"), &config);
+        f.migrate(&[]);
+        let foo = f.buck("foo");
+        let app = f.buck("app");
+        let names: Vec<&str> = foo
+            .lines()
+            .filter_map(|l| l.strip_prefix("    name = \""))
+            .filter_map(|l| l.strip_suffix("\","))
+            .collect();
+        let labels: Vec<&str> = app
+            .split('"')
+            .filter_map(|s| s.strip_prefix("//foo:"))
+            .collect();
+        assert!(!labels.is_empty(), "{app}");
+        for label in labels {
+            assert!(
+                names.contains(&label),
+                "{label} not in {names:?}\n{foo}\n{app}"
+            );
+        }
+        assert!(names.contains(&"foo-lib"), "{foo}");
+        assert_eq!(names.contains(&"foo"), cli_for_tests, "{foo}");
+    }
+}
