@@ -2529,3 +2529,70 @@ fn test_an_older_cache_regenerates_rules_and_keeps_its_fixup_record() {
             .contains("version = 8")
     );
 }
+
+#[test]
+fn test_test_only_host_compilations_use_host_flavours() {
+    // F3 (Fable review): the ordinary build compiles `e` for the target only, and
+    // `f` in both contexts (`f` with `t` for the target, `f-host` with `h`). The
+    // proc-macro `dpm`, which only the tests build, uses `e`: Cargo compiles a host
+    // `e` against the host `f` with `h`. The tests' host `e` must not be the
+    // production target rule, which depends on the target `f`.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"e\", \"f\"]\nexclude = [\"dpm\"]\n",
+    );
+    write(
+        &f.ws.join("app/Cargo.toml"),
+        &manifest(
+            "app",
+            "[dependencies]\ne = { path = \"../e\" }\nf = { path = \"../f\", features = [\"t\"] }\n\
+             [build-dependencies]\nf = { path = \"../f\", features = [\"h\"] }\n\
+             [dev-dependencies]\ndpm = { path = \"../dpm\" }\n",
+        ),
+    );
+    write(&f.ws.join("app/build.rs"), "fn main() {}\n");
+    write(&f.ws.join("app/src/lib.rs"), "");
+    write(
+        &f.ws.join("e/Cargo.toml"),
+        &manifest("e", "[dependencies]\nf = { path = \"../f\" }\n"),
+    );
+    write(
+        &f.ws.join("f/Cargo.toml"),
+        &manifest("f", "[features]\nt = []\nh = []\n"),
+    );
+    write(
+        &f.ws.join("dpm/Cargo.toml"),
+        &manifest(
+            "dpm",
+            "[lib]\nproc-macro = true\n[dependencies]\ne = { path = \"../e\" }\n",
+        ),
+    );
+    for name in ["e", "f", "dpm"] {
+        write(&f.ws.join(name).join("src/lib.rs"), "");
+    }
+    write(
+        &f.ws.join("buckal.toml"),
+        BUCKAL_TOML.split("[fixups.extra]").next().unwrap(),
+    );
+    f.migrate(&[]);
+    let fbuck = f.buck("f");
+    assert!(rule(&fbuck, "f").contains("\"t\""), "{fbuck}");
+    assert!(rule(&fbuck, "f-host").contains("\"h\""), "{fbuck}");
+    // Production `e` is a target rule on the target `f`.
+    let ebuck = f.buck("e");
+    assert!(rule(&ebuck, "e").contains("\"//f:f\""), "{ebuck}");
+
+    // The test-only proc-macro's `e` is a host compilation on the host `f`.
+    let dpm = f.buck("dpm");
+    let e_label = top_deps(rule(&dpm, "dpm"))
+        .into_iter()
+        .find(|d| d.starts_with("//e:"))
+        .unwrap_or_else(|| panic!("{dpm}"))
+        .to_owned();
+    let e_name = e_label.strip_prefix("//e:").unwrap();
+    assert_ne!(e_name, "e", "{dpm}");
+    let host_e = rule(&ebuck, e_name);
+    assert!(host_e.contains("\"//f:f-host\""), "{e_label}:\n{ebuck}");
+    assert!(!host_e.contains("\"//f:f\""), "{e_label}:\n{ebuck}");
+}

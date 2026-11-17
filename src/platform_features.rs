@@ -513,12 +513,31 @@ fn with_test_resolution(
     let in_both_on_host = |id: &PackageId| {
         tests_host_built.contains(id) && main.contains_key(id) && tests.contains_key(id)
     };
+    // Packages with a host compilation in the ordinary build: a host-only one, or a
+    // host variant.
+    let host_compiled_in_main: BTreeSet<String> = main
+        .iter()
+        .filter(|(_, m)| m.host_context || m.host_variant.is_some())
+        .map(|(id, _)| id.repr.clone())
+        .collect();
     let mut host_variants: BTreeSet<String> = tests
         .iter()
         .filter(|(id, t)| {
             in_both_on_host(id) && {
                 let (m, t) = (host_side(&main[*id]), host_side(t));
-                m.features != t.features || host_edges(&m) != host_edges(&t)
+                m.features != t.features
+                    || host_edges(&m) != host_edges(&t)
+                    // The ordinary build compiles it for the target only, so its rule
+                    // is a target compilation: one whose host dependencies have a
+                    // host compilation of their own would reach their target
+                    // flavours.
+                    || !host_compiled_in_main.contains(&id.repr)
+                        && t.deps
+                            .normal
+                            .values()
+                            .chain(t.deps.build.values())
+                            .flatten()
+                            .any(|dep| host_compiled_in_main.contains(dep))
             }
         })
         .map(|(id, _)| id.repr.clone())
