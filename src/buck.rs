@@ -119,8 +119,15 @@ pub struct ExportFile {
     pub src: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// [`EXPORT_FILES_LABEL`] on the rules an `export_files` fixup writes, so that
+    /// generation recognises them without a record of the earlier fixups.
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub labels: Set<String>,
     pub visibility: Set<String>,
 }
+
+/// The label of an `export_file` rule written for an `export_files` fixup entry.
+pub const EXPORT_FILES_LABEL: &str = "buckal-export-files";
 
 #[derive(Serialize, Default, Debug, PartialEq, Clone)]
 #[serde(rename = "rust_library")]
@@ -1158,11 +1165,13 @@ impl ExportFile {
         let name = kwargs.get_str("name")?;
         let src = kwargs.get_str("src")?;
         let mode = kwargs.get_str_opt("mode");
+        let labels = kwargs.get_list("labels");
         let visibility = kwargs.get_list("visibility");
         Ok(ExportFile {
             name,
             src,
             mode,
+            labels,
             visibility,
         })
     }
@@ -2234,6 +2243,7 @@ mod tests {
             name: "workspace".to_string(),
             src: "Cargo.toml".to_string(),
             mode: Some("reference".to_string()),
+            labels: Default::default(),
             visibility: Set::from(["PUBLIC".to_string()]),
         });
         let actual = rules

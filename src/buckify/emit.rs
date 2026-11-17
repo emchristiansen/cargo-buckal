@@ -495,6 +495,7 @@ pub(super) fn emit_export_file() -> ExportFile {
         name: "workspace".to_owned(),
         src: "Cargo.toml".to_string(),
         mode: Some("reference".to_owned()),
+        labels: Default::default(),
         visibility: Set::from(["PUBLIC".to_owned()]),
     }
 }

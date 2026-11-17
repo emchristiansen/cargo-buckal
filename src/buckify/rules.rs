@@ -541,6 +541,7 @@ fn export_manifest_to_workspace_root(
             name: MANIFEST_EXPORT.to_owned(),
             src: "Cargo.toml".to_owned(),
             mode: Some("reference".to_owned()),
+            labels: Default::default(),
             visibility: Set::from([root_package]),
         })),
     }
@@ -606,6 +607,7 @@ fn fixup_export_files(
                 name: path.to_owned(),
                 src: path.to_owned(),
                 mode: Some("reference".to_owned()),
+                labels: Set::from([crate::buck::EXPORT_FILES_LABEL.to_owned()]),
                 visibility: entry.visibility(),
             })
         })

@@ -394,7 +394,13 @@ fn hand_written(buck_path: &Utf8Path, owned: &OwnedNames) -> HandWritten {
         match &statement.kind {
             TopLevelKind::Load(bzl) if bzl.starts_with("@buckal//") => {}
             TopLevelKind::Load(_) => hand.loads.push(text),
-            TopLevelKind::Call { function, name } if owned.owns(function, name.as_deref()) => {
+            TopLevelKind::Call { function, name }
+                if owned.owns(function, name.as_deref())
+                    // An `export_files` rule generation wrote, recognised by its
+                    // label even without a record of the earlier fixups.
+                    || function == "export_file"
+                        && text.contains(&format!("\"{}\"", crate::buck::EXPORT_FILES_LABEL)) =>
+            {
                 // A rule generation owns but no longer emits (a removed target, or
                 // one written by hand in a kind generation owns) goes away: say so.
                 if let Some(name) = name

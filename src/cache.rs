@@ -50,11 +50,12 @@ use crate::resolve::BuckalResolve;
 /// Version 12: a library host compilations use through its plain rule is not
 ///            marked incompatible on a platform (Fable N6).
 /// Version 13: no test variant from a build dependency's target test variant.
+/// Version 14: `export_files` rules carry the `buckal-export-files` label.
 ///
 /// Migration strategy:
 /// - If found < expected (stale cache from older Buckal): ignore the old cache and rebuild.
 /// - If found > expected (cache from newer Buckal): exit immediately and prompt the user to upgrade.
-const CACHE_VERSION: u32 = 13;
+const CACHE_VERSION: u32 = 14;
 
 /// The oldest cache version whose record of the fixups a generation applied
 /// (`fixup_rustc_flags`, `fixups`) is still read, from a cache whose rules are
