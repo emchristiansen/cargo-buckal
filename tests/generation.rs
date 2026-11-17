@@ -2596,3 +2596,38 @@ fn test_test_only_host_compilations_use_host_flavours() {
     assert!(host_e.contains("\"//f:f-host\""), "{e_label}:\n{ebuck}");
     assert!(!host_e.contains("\"//f:f\""), "{e_label}:\n{ebuck}");
 }
+
+#[test]
+fn test_integration_tests_honour_required_features() {
+    // F7 (Fable review): Cargo builds an integration test only where its
+    // `required-features` are on in the tests' resolution.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\n",
+    );
+    write(
+        &f.ws.join("app/Cargo.toml"),
+        &manifest(
+            "app",
+            "[features]\noff = []\ntest_lib = []\n\
+             [[test]]\nname = \"gated_it\"\npath = \"tests/gated_it.rs\"\nrequired-features = [\"off\"]\n\
+             [[test]]\nname = \"lib_it\"\npath = \"tests/lib_it.rs\"\nrequired-features = [\"test_lib\"]\n\
+             [[test]]\nname = \"plain_it\"\npath = \"tests/plain_it.rs\"\n",
+        ),
+    );
+    write(&f.ws.join("app/src/lib.rs"), "");
+    for name in ["gated_it", "lib_it", "plain_it"] {
+        write(&f.ws.join(format!("app/tests/{name}.rs")), "");
+    }
+    let config = BUCKAL_TOML.split("[fixups.extra]").next().unwrap();
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!("test_features = [\"app/test_lib\"]\n{config}"),
+    );
+    f.migrate(&[]);
+    let app = f.buck("app");
+    rule(&app, "lib_it");
+    rule(&app, "plain_it");
+    assert!(!app.contains("name = \"gated_it\""), "{app}");
+}

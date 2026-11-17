@@ -162,10 +162,16 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         .filter(|t| t.kind.iter().any(is_lib_like))
         .collect();
 
+    // Like binaries, Cargo builds an integration test only where the tests'
+    // resolution enables its `required-features`.
     let test_targets: Vec<_> = node
         .targets
         .iter()
         .filter(|t| t.kind.contains(&TargetKind::Test))
+        .filter(|t| {
+            let per_platform = !ctx.repo_config.feature_platforms.is_empty();
+            features_enable(&tests, &t.required_features, per_platform)
+        })
         .collect();
 
     let mut buck_rules: Vec<Rule> = Vec::new();
