@@ -1959,3 +1959,32 @@ fn test_workspace_manifests_refuses_a_root_target_of_that_name() {
     );
     assert_refused_unchanged(&f, &["BUCK"], "workspace_manifests");
 }
+
+#[test]
+fn test_mapped_srcs_refuse_a_destination_above_the_package() {
+    // R7-1 (t_7c72255f): package `b` at `a/b`; a destination `..` (`a`) would have
+    // to be a file and the directory of `a/b`'s sources at once.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"extra\", \"a/b\"]\n",
+    );
+    write(&f.ws.join("a/b/Cargo.toml"), &manifest("b", ""));
+    write(&f.ws.join("a/b/src/lib.rs"), "");
+    f.migrate(&[]);
+    let config = |entry: &str| format!("{BUCKAL_TOML}\n[fixups.b.mapped_srcs]\n{entry}\n");
+    write(
+        &f.ws.join("buckal.toml"),
+        &config("\"//:data.txt\" = \"..\""),
+    );
+    assert_refused_unchanged(&f, &["a/b/BUCK"], "is a directory above the package `a/b`");
+
+    // A file beside the package, out of it, is fine.
+    write(
+        &f.ws.join("buckal.toml"),
+        &config("\"//:data.txt\" = \"../data.txt\""),
+    );
+    f.migrate(&[]);
+    let b = f.buck("a/b");
+    assert!(b.contains("\"//:data.txt\": \"a/data.txt\""), "{b}");
+}

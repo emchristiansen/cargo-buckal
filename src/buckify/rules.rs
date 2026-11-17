@@ -955,7 +955,7 @@ fn package_location(node: &BuckalNode) -> anyhow::Result<(Utf8PathBuf, Utf8PathB
 
 /// The package's `[fixups] mapped_srcs` with destinations as repository paths,
 /// refusing a destination that is absolute, leaves the repository, is the package
-/// directory, repeats, or clashes with the package's own sources or another
+/// directory or above it, repeats, or clashes with the package's own sources or another
 /// destination (the same path, or one a directory prefix of the other).
 fn fixup_mapped_srcs(
     node: &BuckalNode,
@@ -983,6 +983,13 @@ fn repository_mapped_srcs(
             anyhow::anyhow!("`[fixups.{name}] mapped_srcs`: `{label}` = `{written}`: {why}")
         };
         let destination = repository_path(package, written).map_err(refuse)?;
+        // The package's sources sit below its directory: a destination above it
+        // would have to be both a file and a directory of them.
+        if destination != package && package.starts_with(&destination) {
+            return Err(refuse(format!(
+                "`{destination}` is a directory above the package `{package}`, whose sources are below it"
+            )));
+        }
         if let Ok(own) = destination.strip_prefix(package) {
             if own.as_str().is_empty() {
                 return Err(refuse(
@@ -1940,6 +1947,10 @@ mod tests {
                 "leaves the repository",
             ),
             (written(&[("//x:a", ".")]), "is the package directory"),
+            (
+                written(&[("//x:a", "..")]),
+                "`text` is a directory above the package `text/glyph_vocab`",
+            ),
             (written(&[("//x:a", "src/lib.rs")]), "own sources"),
             (
                 written(&[("//x:a", "src")]),
