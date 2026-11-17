@@ -217,6 +217,10 @@ pub struct RustTest {
     /// the binaries are dependencies of the test through it.
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub cargo_bin_exes: Map<String, String>,
+    /// Run-time inputs from outside the package (`[fixups.<pkg>] test_resources`), for
+    /// the prelude to add to `resources` at their project paths.
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub extra_resources: Set<String>,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub features: Set<String>,
     /// Per-platform attributes for the prelude's `platform` argument
@@ -879,6 +883,7 @@ impl RustTest {
         let run_env = kwargs.get_dict("run_env");
         let resources = kwargs.get_glob_opt("resources");
         let cargo_bin_exes = kwargs.get_dict("cargo_bin_exes");
+        let extra_resources = kwargs.get_list("extra_resources");
         Ok(RustTest {
             name,
             srcs,
@@ -893,6 +898,7 @@ impl RustTest {
             run_env,
             resources,
             cargo_bin_exes,
+            extra_resources,
             features,
             platform: Map::new(),
             rustc_flags,
@@ -2046,6 +2052,7 @@ mod tests {
             run_env: Map::new(),
             resources: None,
             cargo_bin_exes: Map::new(),
+            extra_resources: Set::new(),
             features: Set::from(["default".to_string()]),
             platform: Map::new(),
             rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),

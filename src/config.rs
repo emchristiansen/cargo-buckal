@@ -221,6 +221,13 @@ pub struct PackageFixup {
     /// `include_str!`/`include_bytes!` reads but the package glob does not provide.
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub mapped_srcs: Map<String, String>,
+    /// Extra run-time inputs of the package's tests, as labels (e.g. an `export_file`
+    /// or `filegroup` of files a test reads outside its own package). The package's
+    /// own files are always test resources; these add files from elsewhere. Emitted
+    /// as the tests' `extra_resources`, which the prelude adds to `resources` at
+    /// their project paths.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub test_resources: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]

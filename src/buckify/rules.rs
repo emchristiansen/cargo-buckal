@@ -319,7 +319,11 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
         let (env, rustc_flags, mapped_srcs) = match rule {
             Rule::RustLibrary(r) => (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs),
             Rule::RustBinary(r) => (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs),
-            Rule::RustTest(r) => (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs),
+            Rule::RustTest(r) => {
+                r.extra_resources
+                    .extend(fixup.test_resources.iter().cloned());
+                (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs)
+            }
             Rule::BuildscriptRun(r) => {
                 r.env.extend(fixup.buildscript_env.clone());
                 continue;
@@ -788,6 +792,7 @@ mod tests {
                 env: Default::default(),
                 rustc_flags: vec!["-Lnative=/opt/openssl/lib".to_owned()],
                 mapped_srcs: Default::default(),
+                test_resources: Default::default(),
             },
         );
 
@@ -899,6 +904,33 @@ mod tests {
             &Set::from(["rustc_flags".to_owned()]),
         );
         assert_eq!(gen_buck_content(&regenerated), content);
+    }
+
+    #[test]
+    fn test_fixup_test_resources_reach_tests_only() {
+        let (_dir, node) = first_party_package("conta/wire", &["src/lib.rs", "tests/wire.rs"]);
+        let mut ctx = test_ctx();
+        let label = "//conta/wire/src/generated:files".to_owned();
+        ctx.repo_config.fixups.insert(
+            node.name.clone(),
+            crate::config::PackageFixup {
+                test_resources: vec![label.clone()],
+                ..Default::default()
+            },
+        );
+        let rules = buckify_root_node(&node, &ctx);
+        for test in ["unittest", "wire"] {
+            let t = find_test(&rules, test);
+            assert_eq!(t.extra_resources, Set::from([label.clone()]));
+            // The package's own files stay declared.
+            assert!(t.resources.is_some());
+        }
+        let content = gen_buck_content(&rules);
+        assert!(
+            content.contains("    extra_resources = [\"//conta/wire/src/generated:files\"],\n"),
+            "{content}"
+        );
+        assert_eq!(content.matches("extra_resources").count(), 2, "{content}");
     }
 
     #[test]
