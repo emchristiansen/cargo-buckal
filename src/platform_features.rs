@@ -513,8 +513,13 @@ fn with_test_resolution(
     let in_both_on_host = |id: &PackageId| {
         tests_host_built.contains(id) && main.contains_key(id) && tests.contains_key(id)
     };
-    // Packages with a host compilation in the ordinary build: a host-only one, or a
-    // host variant.
+    // Packages the ordinary build compiles in both contexts apart: a target rule
+    // and a host variant, which a host compilation must use.
+    let host_variant_in_main: BTreeSet<String> = main
+        .iter()
+        .filter(|(_, m)| m.host_variant.is_some())
+        .map(|(id, _)| id.repr.clone())
+        .collect();
     let host_compiled_in_main: BTreeSet<String> = main
         .iter()
         .filter(|(_, m)| m.host_context || m.host_variant.is_some())
@@ -528,16 +533,15 @@ fn with_test_resolution(
                 m.features != t.features
                     || host_edges(&m) != host_edges(&t)
                     // The ordinary build compiles it for the target only, so its rule
-                    // is a target compilation: one whose host dependencies have a
-                    // host compilation of their own would reach their target
-                    // flavours.
+                    // is a target compilation: one whose dependencies have a host
+                    // variant would reach their target flavours.
                     || !host_compiled_in_main.contains(&id.repr)
                         && t.deps
                             .normal
                             .values()
                             .chain(t.deps.build.values())
                             .flatten()
-                            .any(|dep| host_compiled_in_main.contains(dep))
+                            .any(|dep| host_variant_in_main.contains(dep))
             }
         })
         .map(|(id, _)| id.repr.clone())
@@ -571,19 +575,27 @@ fn with_test_resolution(
     // the host only, whose production rule then has the host's resolution.
     let in_both_on_target =
         |id: &PackageId| main.contains_key(id) && tests.get(id).is_some_and(|t| !t.host_context);
+    let host_only_in_tests: BTreeSet<String> = tests
+        .iter()
+        .filter(|(_, t)| t.host_context)
+        .map(|(id, _)| id.repr.clone())
+        .collect();
     let mut variants: BTreeSet<String> = tests
         .iter()
         .filter(|(id, t)| {
             in_both_on_target(id)
                 && (differs(&main[*id], t)
                     // Its build script or a proc-macro it uses is compiled otherwise
-                    // for the tests.
+                    // for the tests. (A normal dependency is a host compilation of
+                    // this target rule only when it is host-only: a proc-macro.)
                     || t.deps
-                        .normal
+                        .build
                         .values()
-                        .chain(t.deps.build.values())
                         .flatten()
-                        .any(|dep| host_variants.contains(dep)))
+                        .any(|dep| host_variants.contains(dep))
+                    || t.deps.normal.values().flatten().any(|dep| {
+                        host_variants.contains(dep) && host_only_in_tests.contains(dep)
+                    }))
         })
         .map(|(id, _)| id.repr.clone())
         .collect();

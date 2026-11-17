@@ -2631,3 +2631,53 @@ fn test_integration_tests_honour_required_features() {
     rule(&app, "plain_it");
     assert!(!app.contains("name = \"gated_it\""), "{app}");
 }
+
+#[test]
+fn test_no_test_variant_for_a_target_dependency_with_a_test_host_variant() {
+    // `x` gets a test host variant (the test-only proc-macro `dpm` compiles it for
+    // the host with `h`), while its target compilation is the same for the tests.
+    // `user` only depends on `x` for the target, so its tests' compilation equals
+    // production: no `user-test` variant (a target rule takes a host compilation
+    // only of a proc-macro or a build dependency).
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"user\", \"x\"]\nexclude = [\"dpm\"]\n",
+    );
+    write(
+        &f.ws.join("app/Cargo.toml"),
+        &manifest(
+            "app",
+            "[dependencies]\nuser = { path = \"../user\" }\n[dev-dependencies]\ndpm = { path = \"../dpm\" }\n",
+        ),
+    );
+    write(
+        &f.ws.join("user/Cargo.toml"),
+        &manifest("user", "[dependencies]\nx = { path = \"../x\" }\n"),
+    );
+    write(
+        &f.ws.join("x/Cargo.toml"),
+        &manifest("x", "[features]\nh = []\n"),
+    );
+    write(
+        &f.ws.join("dpm/Cargo.toml"),
+        &manifest(
+            "dpm",
+            "[lib]\nproc-macro = true\n[dependencies]\nx = { path = \"../x\", features = [\"h\"] }\n",
+        ),
+    );
+    for name in ["app", "user", "x", "dpm"] {
+        write(&f.ws.join(name).join("src/lib.rs"), "");
+    }
+    write(
+        &f.ws.join("buckal.toml"),
+        BUCKAL_TOML.split("[fixups.extra]").next().unwrap(),
+    );
+    f.migrate(&[]);
+    let x = f.buck("x");
+    assert!(rule(&x, "x-test-host").contains("\"h\""), "{x}");
+    let user = f.buck("user");
+    assert!(!user.contains("name = \"user-test\""), "{user}");
+    let app = f.buck("app");
+    assert!(rule(&app, "unittest").contains("\"//user:user\""), "{app}");
+}
