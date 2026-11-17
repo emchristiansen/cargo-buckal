@@ -112,6 +112,12 @@ impl BuckalChange {
                         // Generate the BUCK file, keeping what a first-party package's
                         // BUCK file has beyond the rules generation owns.
                         let mut buck_content = if is_third_party_pkg {
+                            if let Err(error) = check_namespace(&buck_rules, &[], &[]) {
+                                buckal_error!(format!(
+                                    "{buck_path}: {error}; it is left unchanged"
+                                ));
+                                std::process::exit(1);
+                            }
                             gen_buck_content(&buck_rules)
                         } else {
                             let owned = OwnedNames::of(
@@ -461,14 +467,24 @@ fn root_owned_names(ctx: &BuckalContext) -> Vec<(&'static str, &'static str)> {
     }
 }
 
-/// Refuse a BUCK file that would declare a target name twice: a generated rule
-/// and a kept hand-written call, or either and a rule spliced in later
-/// (`reserved`, as `(function, name)`).
+/// Refuse a BUCK file that would declare a target name twice: two generated
+/// rules, a generated rule and a kept hand-written call, or either and a rule
+/// spliced in later (`reserved`, as `(function, name)`).
 fn check_namespace(
     rules: &[Rule],
     calls: &[(String, String)],
     reserved: &[(&str, &str)],
 ) -> Result<(), String> {
+    let mut seen: std::collections::BTreeMap<&str, &str> = std::collections::BTreeMap::new();
+    for rule in rules {
+        let Some(name) = rule.name() else { continue };
+        if let Some(first) = seen.insert(name, rule.function()) {
+            return Err(format!(
+                "generation emits two rules named `{name}` (`{first}` and `{}`); rename what generates one of them",
+                rule.function()
+            ));
+        }
+    }
     let generated: Vec<&str> = rules.iter().filter_map(Rule::name).collect();
     for (function, name) in calls {
         if generated.contains(&name.as_str()) {

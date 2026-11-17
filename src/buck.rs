@@ -52,6 +52,24 @@ pub struct WasmSha256 {
 }
 
 impl Rule {
+    /// The function a BUCK file calls for the rule (`load` for a load).
+    pub fn function(&self) -> &'static str {
+        match self {
+            Rule::Load(_) => "load",
+            Rule::HttpArchive(_) => "http_archive",
+            Rule::FileGroup(_) => "filegroup",
+            Rule::GitFetch(_) => "git_fetch",
+            Rule::CargoManifest(_) => "cargo_manifest",
+            Rule::ExportFile(_) => "export_file",
+            Rule::RustLibrary(_) => "rust_library",
+            Rule::RustBinary(_) => "rust_binary",
+            Rule::RustTest(_) => "rust_test",
+            Rule::BuildscriptRun(_) => "buildscript_run",
+            Rule::ConfiguredAlias(_) => "configured_alias",
+            Rule::WasmSha256(_) => "wasm_sha256",
+        }
+    }
+
     /// The rule's `name`, or `None` for a `load`.
     pub fn name(&self) -> Option<&str> {
         match self {
@@ -1458,17 +1476,7 @@ fn parse_rule_from_call(
 fn rule_map_key(rule: &Rule) -> String {
     match rule {
         Rule::Load(load) => format!("load[{}]", load.bzl),
-        Rule::HttpArchive(r) => format!("http_archive[{}]", r.name),
-        Rule::FileGroup(r) => format!("filegroup[{}]", r.name),
-        Rule::GitFetch(r) => format!("git_fetch[{}]", r.name),
-        Rule::CargoManifest(r) => format!("cargo_manifest[{}]", r.name),
-        Rule::ExportFile(r) => format!("export_file[{}]", r.name),
-        Rule::RustLibrary(r) => format!("rust_library[{}]", r.name),
-        Rule::RustBinary(r) => format!("rust_binary[{}]", r.name),
-        Rule::RustTest(r) => format!("rust_test[{}]", r.name),
-        Rule::BuildscriptRun(r) => format!("buildscript_run[{}]", r.name),
-        Rule::ConfiguredAlias(r) => format!("configured_alias[{}]", r.name),
-        Rule::WasmSha256(r) => format!("wasm_sha256[{}]", r.name),
+        rule => format!("{}[{}]", rule.function(), rule.name().unwrap_or_default()),
     }
 }
 

@@ -4726,3 +4726,63 @@ fn test_a_sibling_directory_sharing_the_root_prefix_is_not_the_workspace() {
         "{snap}"
     );
 }
+
+/// A workspace with the wasm module `module` (declaring `module_metadata` after
+/// its featureless module) and `testkit`, whose test-env is `test_env`.
+fn wasm_test_env_fixture(module_metadata: &str, test_env: &str) -> Fixture {
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"module\", \"testkit\"]\n",
+    );
+    write(
+        &f.ws.join("module/Cargo.toml"),
+        &manifest(
+            "module",
+            &format!(
+                "[lib]\ncrate-type = [\"cdylib\", \"rlib\"]\n[features]\nadmission = []\n\
+                 [package.metadata.buck2.wasm]\nfeatures = []\nprofile = \"release\"\n{module_metadata}"
+            ),
+        ),
+    );
+    write(
+        &f.ws.join("testkit/Cargo.toml"),
+        &manifest(
+            "testkit",
+            &format!("[package.metadata.buck2.test-env]\n{test_env}"),
+        ),
+    );
+    for name in ["module", "testkit"] {
+        write(&f.ws.join(name).join("src/lib.rs"), "");
+    }
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!(
+            "{}\n[wasm]\npackages = [\"module\"]\nplatform = \"root//buck2/platforms/wasm:wasm32_unknown_unknown\"\n",
+            BUCKAL_TOML.split("[fixups.extra]").next().unwrap()
+        ),
+    );
+    f
+}
+
+#[test]
+fn test_a_name_generation_emits_twice_is_refused() {
+    // Fable N21 (fixture f61): variant `x`'s witness `lib-wasm-wasm32.x-sha256` is
+    // also the alias of the variant `x-sha256`. Buck2 refuses a BUCK file that
+    // declares a name twice, so generation refuses it and writes nothing.
+    let f = wasm_test_env_fixture(
+        "[package.metadata.buck2.wasm-variants.x]\nfeatures = [\"admission\"]\n\
+         [package.metadata.buck2.wasm-variants.x-sha256]\nfeatures = []\n",
+        "D = { wasm_sha256 = \"module\", variant = \"x\" }\n",
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "generation emits two rules named `lib-wasm-wasm32.x-sha256` (`wasm_sha256` and `configured_alias`)"
+        ),
+        "{stderr}"
+    );
+    assert!(!f.ws.join("module/BUCK").exists());
+}
