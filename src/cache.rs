@@ -110,31 +110,33 @@ pub trait PackageIdExt {
 
 impl PackageIdExt for PackageId {
     fn resolve(&self, workspace_root: &Utf8PathBuf) -> Self {
-        if self.repr.starts_with("path+file://($WORKSPACE)") {
-            PackageId {
-                repr: self
-                    .repr
-                    .clone()
-                    .replace("($WORKSPACE)", workspace_root.as_str()),
-            }
-        } else {
-            self.clone()
+        // Only the root itself: `($WORKSPACE)` followed by a path separator, a
+        // fragment or nothing.
+        match self.repr.strip_prefix("path+file://($WORKSPACE)") {
+            Some(rest) if rest.is_empty() || rest.starts_with(['/', '#', '?']) => PackageId {
+                repr: format!("path+file://{}{rest}", workspace_root.as_str()),
+            },
+            _ => self.clone(),
         }
     }
 
     fn canonicalize(&self, workspace_root: &Utf8PathBuf) -> Self {
-        if self
-            .repr
-            .starts_with(format!("path+file://{}", workspace_root.as_str()).as_str())
-        {
-            PackageId {
-                repr: self
-                    .repr
-                    .clone()
-                    .replace(workspace_root.as_str(), "($WORKSPACE)"),
+        // Compare path components, not a string prefix: `<root>-other/b` is not
+        // below `<root>` (Fable N13).
+        let Some(rest) = self.repr.strip_prefix("path+file://") else {
+            return self.clone();
+        };
+        let end = rest.find(['#', '?']).unwrap_or(rest.len());
+        let (path, tail) = rest.split_at(end);
+        match cargo_metadata::camino::Utf8Path::new(path).strip_prefix(workspace_root) {
+            Ok(relative) => {
+                let relative = relative.as_str();
+                let separator = if relative.is_empty() { "" } else { "/" };
+                PackageId {
+                    repr: format!("path+file://($WORKSPACE){separator}{relative}{tail}"),
+                }
             }
-        } else {
-            self.clone()
+            Err(_) => self.clone(),
         }
     }
 }

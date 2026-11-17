@@ -4160,3 +4160,44 @@ fn test_a_plain_rule_entry_changes_when_its_host_needs_change() {
         snap
     );
 }
+
+#[test]
+fn test_a_sibling_directory_sharing_the_root_prefix_is_not_the_workspace() {
+    // Fable N13: canonicalisation replaced the root string wherever the id
+    // started with it, so a path dependency at `<root>-other/b` became
+    // `($WORKSPACE)-other/b`. Only the root directory itself is the workspace.
+    let f = fixture();
+    let sibling = f.ws.with_file_name("ws-other");
+    // The Buck project holds both directories; the Cargo workspace is `ws`.
+    std::fs::remove_file(f.ws.join(".buckconfig")).unwrap();
+    write(&f.ws.with_file_name(".buckconfig"), "[cells]\nroot = .\n");
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\n",
+    );
+    write(
+        &f.ws.join("app/Cargo.toml"),
+        &manifest(
+            "app",
+            "[dependencies]\nb = { path = \"../../ws-other/b\" }\n",
+        ),
+    );
+    write(&f.ws.join("app/src/lib.rs"), "");
+    write(
+        &sibling.join("b/Cargo.toml"),
+        &manifest("b", "[workspace]\n"),
+    );
+    write(&sibling.join("b/src/lib.rs"), "");
+    write(
+        &f.ws.join("buckal.toml"),
+        BUCKAL_TOML.split("[fixups.extra]").next().unwrap(),
+    );
+    f.migrate(&[]);
+    // The emission record is kept at the Buck project's root.
+    let snap = std::fs::read_to_string(f.ws.with_file_name("buckal.snap")).unwrap();
+    assert!(!snap.contains("($WORKSPACE)-other"), "{snap}");
+    assert!(
+        snap.contains("path+file://($WORKSPACE)/app#0.1.0"),
+        "{snap}"
+    );
+}
