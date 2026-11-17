@@ -32,7 +32,27 @@ use super::emit::{
 /// Buckifies a third-party dependency into a list of BUCK rules.
 ///
 /// This includes generating rules for the library target, and if a build script is present, also generating rules for the build script and patching the library rule accordingly.
+/// Whether `node` is a proc-macro package that no configured platform builds.
+/// The prelude wraps a proc-macro library in a `rust_proc_macro_alias` that takes
+/// an exec dependency on `_<name>` and does not carry `target_compatible_with`:
+/// with `_<name>` incompatible everywhere, no execution platform resolves, and a
+/// wildcard build fails analysis ("unspecified_exec") instead of skipping the
+/// target. No generated rule depends on such a package (its dependents' edges
+/// exist only on platforms that build it), so none of its rules is emitted.
+fn is_proc_macro_built_nowhere(node: &BuckalNode, ctx: &BuckalContext) -> bool {
+    !ctx.repo_config.feature_platforms.is_empty()
+        && node.platform_features.is_empty()
+        && !ctx.is_workspace_member(&node.package_id)
+        && node
+            .targets
+            .iter()
+            .any(|t| t.kind.contains(&TargetKind::ProcMacro))
+}
+
 pub fn buckify_dep_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
+    if is_proc_macro_built_nowhere(node, ctx) {
+        return Vec::new();
+    }
     // emit buck rules for lib target
     let mut buck_rules: Vec<Rule> = Vec::new();
 
@@ -152,6 +172,9 @@ pub fn buckify_dep_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
 
 /// Buckifies workspace package into a list of BUCK rules, including rules for all targets (bin, lib, test) and handling build scripts if present.
 pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
+    if is_proc_macro_built_nowhere(node, ctx) {
+        return Vec::new();
+    }
     // Cargo builds a binary only where its `required-features` are on; one that
     // neither the production nor the test resolution enables is not built at all.
     let production = node.platform_features.exec_resolution();

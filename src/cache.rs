@@ -51,6 +51,10 @@ use crate::resolve::BuckalResolve;
 ///            marked incompatible on a platform (Fable N6).
 /// Version 13: no test variant from a build dependency's target test variant.
 /// Version 14: `export_files` rules carry the `buckal-export-files` label.
+/// Version 15: a proc-macro package no configured platform builds gets no rules (its
+///            prelude alias cannot resolve an execution platform under a wildcard).
+/// Version 16: with configured platforms, no `compatible_with` from the static package
+///            table (Buck2 refuses it beside `target_compatible_with`).
 ///
 /// Upstream's version 5 (path-source ids canonicalised through their `file://` URL,
 /// #102) is adopted here without a version of its own: on a path Cargo does not
@@ -60,7 +64,7 @@ use crate::resolve::BuckalResolve;
 /// Migration strategy:
 /// - If found < expected (stale cache from older Buckal): ignore the old cache and rebuild.
 /// - If found > expected (cache from newer Buckal): exit immediately and prompt the user to upgrade.
-const CACHE_VERSION: u32 = 14;
+const CACHE_VERSION: u32 = 16;
 
 /// The oldest cache version whose record of the fixups a generation applied
 /// (`fixup_rustc_flags`, `fixups`) is still read, from a cache whose rules are
