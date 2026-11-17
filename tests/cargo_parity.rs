@@ -148,6 +148,9 @@ struct Report {
     /// With tests: `(platform, package)` with a dev-dependency on itself in `cargo
     /// tree`, each also compared with BUCKAL's dev edge of the package to itself.
     self_dev_edges: usize,
+    /// Host-context lines whose rule was checked for compatibility with every
+    /// configured platform.
+    host_rules_checked: usize,
 }
 
 /// Compare BUCKAL's resolution with `cargo tree`'s: production, or with `tests`
@@ -311,6 +314,25 @@ fn compare(
                 continue;
             };
             report.compared += 1;
+            // A host compilation is configured for the execution platform: the rule
+            // it uses must not be marked incompatible on any configured platform.
+            // That is the package's own host-context rule, its host (or, for the
+            // tests, test host) variant, or else its plain rule, which generation
+            // marks on each platform its target resolution lacks unless host
+            // compilations use it (`host_uses_plain_rules`).
+            if context == Context::Host {
+                let r = &resolved[&id];
+                let variant =
+                    r.host_variant.is_some() || tests.is_some() && r.test_host_variant.is_some();
+                let marked = platforms.keys().any(|p| !r.features.contains_key(p));
+                if !r.host_context && !variant && marked && !r.host_uses_plain_rules {
+                    report.mismatches.push(format!(
+                        "{platform}: {}: a host compilation uses a rule marked incompatible on a configured platform",
+                        id.repr
+                    ));
+                }
+                report.host_rules_checked += 1;
+            }
             let ok = match context {
                 Context::Target => target.as_ref() == Some(&line.features),
                 Context::Host => host.as_ref() == Some(&line.features),
@@ -618,8 +640,9 @@ fn test_test_contexts_match_cargo_on_workspace() {
         .filter(|r| r.test_host_variant.is_some())
         .count();
     eprintln!(
-        "tests --features {features:?}: compared {} cargo tree package lines and {} self dev-dependency edges; {} mismatches; {} lines unattributed; {} lines of packages never built; {test_variants} test variants, {test_host_variants} test host variants",
+        "tests --features {features:?}: compared {} cargo tree package lines ({} host, checked for compatibility) and {} self dev-dependency edges; {} mismatches; {} lines unattributed; {} lines of packages never built; {test_variants} test variants, {test_host_variants} test host variants",
         report.compared,
+        report.host_rules_checked,
         report.self_dev_edges,
         report.mismatches.len(),
         report.unattributed,
@@ -646,8 +669,9 @@ fn test_production_features_match_cargo_on_workspace() {
     let manifest = std::env::var("BUCKAL_PARITY_MANIFEST").expect("BUCKAL_PARITY_MANIFEST");
     let (report, _) = compare(Path::new(&manifest), &platforms(), None);
     eprintln!(
-        "compared {} cargo tree package lines; {} mismatches; {} lines unattributed; {} lines of packages cargo build builds nothing of; cargo metadata --filter-platform differs from cargo's target-context features for {} (platform, package) pairs",
+        "compared {} cargo tree package lines ({} host, checked for compatibility); {} mismatches; {} lines unattributed; {} lines of packages cargo build builds nothing of; cargo metadata --filter-platform differs from cargo's target-context features for {} (platform, package) pairs",
         report.compared,
+        report.host_rules_checked,
         report.mismatches.len(),
         report.unattributed,
         report.not_built,

@@ -211,7 +211,8 @@ pub(super) const INCOMPATIBLE: &str = "prelude//:none";
 /// configured platform its resolution lacks (one built for wasm32 only), through
 /// the `platform` attribute. A host compilation (`host`) is configured for the
 /// execution platform, while its resolution is keyed by the target it serves, so
-/// only the first case applies to it.
+/// only the first case applies to it, and to a package host compilations use
+/// through these rules (no host variant).
 fn platform_compatibility(
     node: &BuckalNode,
     ctx: &BuckalContext,
@@ -228,7 +229,10 @@ fn platform_compatibility(
         target_compatible_with.insert(INCOMPATIBLE.to_owned());
         return;
     }
-    if host {
+    // Host compilations that use these rules are configured for the execution
+    // platform, whatever target they serve: marking a platform would make them
+    // incompatible there (Fable N6).
+    if host || resolution.host_uses_plain_rules {
         return;
     }
     for name in configured.keys() {

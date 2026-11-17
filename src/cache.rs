@@ -47,11 +47,13 @@ use crate::resolve::BuckalResolve;
 /// Version 11: a package's dev-dependency on itself links its library into its
 ///            unit tests (a dev edge of the tests' resolution to itself). A version
 ///            10 cache certifies rules without it.
+/// Version 12: a library host compilations use through its plain rule is not
+///            marked incompatible on a platform (Fable N6).
 ///
 /// Migration strategy:
 /// - If found < expected (stale cache from older Buckal): ignore the old cache and rebuild.
 /// - If found > expected (cache from newer Buckal): exit immediately and prompt the user to upgrade.
-const CACHE_VERSION: u32 = 11;
+const CACHE_VERSION: u32 = 12;
 
 /// The oldest cache version whose record of the fixups a generation applied
 /// (`fixup_rustc_flags`, `fixups`) is still read, from a cache whose rules are

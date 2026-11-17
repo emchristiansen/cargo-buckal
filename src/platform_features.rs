@@ -214,6 +214,11 @@ pub struct PlatformResolution {
     /// variant.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub test_context_host_variant_deps: BTreeSet<String>,
+    /// The package is also compiled in the host context (by the ordinary build or
+    /// the tests) with no host variant of its own, so host compilations, which Buck
+    /// configures for the execution platform, use these rules.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub host_uses_plain_rules: bool,
 }
 
 /// The resolution of one more compilation context of a package: the host variant of
@@ -705,6 +710,11 @@ fn with_test_resolution(
                 main.insert(id, only);
             }
             Some(m) => {
+                // The tests compile it for the host too: without a host variant of
+                // the ordinary build, their host compilations use its plain rules.
+                if !m.host_context && m.host_variant.is_none() && tests_host_built.contains(&id) {
+                    m.host_uses_plain_rules = true;
+                }
                 if variants.contains(&id.repr) {
                     m.test_variant = Some(HostVariant {
                         features: t.features.clone(),
@@ -792,6 +802,7 @@ fn combine_contexts(
         let lib_on_host = h.as_ref().is_some_and(|h| h.has_lib);
         let resolution = match (t, h) {
             (Some(t), h) if lib_on_target || !lib_on_host => PlatformResolution {
+                host_uses_plain_rules: h.is_some() && !variants.contains(&id.repr),
                 host_variant: h
                     .filter(|_| variants.contains(&id.repr))
                     .map(|h| HostVariant {
