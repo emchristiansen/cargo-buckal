@@ -236,17 +236,40 @@ fn expand(input: &str, workspace_root: &Utf8Path) -> Result<Vec<String>, String>
         .compile_matcher();
     // Walk only below the pattern's literal directory.
     let base: Utf8PathBuf = normal.iter().take_while(|part| !is_glob(part)).collect();
-    let mut files: Vec<String> = walkdir::WalkDir::new(workspace_root.join(&base))
+    let start = workspace_root.join(&base);
+    if !start.exists() {
+        return Err("matches no file".to_owned());
+    }
+    let mut files: Vec<String> = Vec::new();
+    for entry in walkdir::WalkDir::new(&start)
         .into_iter()
         .filter_entry(|entry| entry.file_name() != ".git")
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .filter_map(|entry| {
-            let path = Utf8Path::from_path(entry.path())?;
-            let path = relative(path, workspace_root).ok()?;
-            matcher.is_match(&path).then_some(path)
-        })
-        .collect();
+    {
+        // An entry the walk cannot read could hold a matching file: refuse
+        // rather than give the build script fewer files than Cargo would.
+        let entry = entry.map_err(|error| {
+            let at = error
+                .path()
+                .and_then(Utf8Path::from_path)
+                .and_then(|p| relative(p, workspace_root).ok())
+                .unwrap_or_else(|| base.to_string());
+            format!("cannot read `{at}`: {error}")
+        })?;
+        // A symbolic link to a file counts as the file, as a literal path does;
+        // where it leads is checked with every match.
+        if !entry.path().is_file() {
+            continue;
+        }
+        let Some(path) = Utf8Path::from_path(entry.path()) else {
+            continue;
+        };
+        let Ok(path) = relative(path, workspace_root) else {
+            continue;
+        };
+        if matcher.is_match(&path) {
+            files.push(path);
+        }
+    }
     files.sort();
     if files.is_empty() {
         return Err("matches no file".to_owned());
@@ -258,6 +281,38 @@ fn expand(input: &str, workspace_root: &Utf8Path) -> Result<Vec<String>, String>
 mod tests {
     use super::expand;
     use cargo_metadata::camino::Utf8PathBuf;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_glob_follows_symlinked_files_and_reports_unreadable_directories() {
+        // N9: a glob accepts a symbolic link to a file, as the literal path does,
+        // and an entry the walk cannot read is an error, not a silent omission.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
+        std::fs::create_dir_all(root.join("conf/locked")).unwrap();
+        std::fs::write(root.join("conf/a.toml"), "").unwrap();
+        std::os::unix::fs::symlink("a.toml", root.join("conf/link.toml")).unwrap();
+        assert_eq!(expand("conf/link.toml", &root).unwrap(), ["conf/link.toml"]);
+        assert_eq!(
+            expand("conf/*.toml", &root).unwrap(),
+            ["conf/a.toml", "conf/link.toml"]
+        );
+        std::fs::write(root.join("conf/locked/b.toml"), "").unwrap();
+        let locked = root.join("conf/locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = expand("conf/**/*.toml", &root);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = result.unwrap_err();
+        assert!(
+            error.contains("cannot read") && error.contains("conf/locked"),
+            "{error}"
+        );
+        assert_eq!(
+            expand("missing/*.toml", &root).unwrap_err(),
+            "matches no file"
+        );
+    }
 
     #[test]
     fn test_expand_refuses_and_matches() {
