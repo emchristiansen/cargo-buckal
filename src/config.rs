@@ -300,6 +300,75 @@ pub struct PackageFixup {
     /// refused.
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub tests: Map<String, TestFixup>,
+    /// Extra dependencies of the package's libraries (every `rust_library`,
+    /// including a host variant), as in Reindeer's top-level `extra_deps`, e.g. a
+    /// toolchain target providing a system library.
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub extra_deps: Set<String>,
+    /// The build script, in Reindeer's `[buildscript.build]` and `[buildscript.run]`
+    /// shape.
+    #[serde(skip_serializing_if = "BuildscriptFixup::is_empty")]
+    pub buildscript: BuildscriptFixup,
+}
+
+/// `[fixups.<pkg>.buildscript]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct BuildscriptFixup {
+    /// Compiling the build script (`build-script-build` and a host variant's).
+    #[serde(skip_serializing_if = "BuildscriptBuildFixup::is_empty")]
+    pub build: BuildscriptBuildFixup,
+    /// Running it: `true` (Reindeer's `buildscript.run = true`; generation always
+    /// runs a package's build script) or a table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run: Option<BuildscriptRunEntry>,
+}
+
+impl BuildscriptFixup {
+    pub fn is_empty(&self) -> bool {
+        self.build.is_empty() && self.run.is_none()
+    }
+}
+
+/// `[fixups.<pkg>.buildscript.build]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct BuildscriptBuildFixup {
+    /// Files the build script reads at compile time, as Reindeer's globs relative
+    /// to the package. The build script is compiled from the whole package's
+    /// sources, so they are present already; each must be a relative pattern inside
+    /// the package.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub extra_srcs: Vec<String>,
+    /// Extra dependencies of the build script binary.
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub extra_deps: Set<String>,
+}
+
+impl BuildscriptBuildFixup {
+    pub fn is_empty(&self) -> bool {
+        self.extra_srcs.is_empty() && self.extra_deps.is_empty()
+    }
+}
+
+/// `buildscript.run = true` or `[fixups.<pkg>.buildscript.run]`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum BuildscriptRunEntry {
+    Run(bool),
+    Table(BuildscriptRunFixup),
+}
+
+/// `[fixups.<pkg>.buildscript.run]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct BuildscriptRunFixup {
+    /// Link the crate with the build script's `cargo:rustc-link-lib` libraries.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub rustc_link_lib: bool,
+    /// Search the build script's `cargo:rustc-link-search` directories.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub rustc_link_search: bool,
 }
 
 /// Additions to one test (`rust_test` rule) of a package, after the package-wide

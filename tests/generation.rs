@@ -1051,3 +1051,61 @@ fn test_fixup_test_labels_and_compatibility_through_generation() {
     assert_eq!(f.buck("app"), app_before);
     assert_eq!(f.buck("shared"), shared_before);
 }
+
+#[test]
+fn test_fixup_extra_deps_and_buildscript_through_generation() {
+    let f = fixture();
+    f.migrate(&[]);
+    let sdk_before = f.buck("sdk");
+    let app_before = f.buck("app");
+
+    // Reindeer-shaped: library `extra_deps`, `[buildscript.build]` and
+    // `[buildscript.run]`, and `buildscript.run = true`, which changes nothing.
+    let config = format!(
+        "{BUCKAL_TOML}\n[fixups.app]\nbuildscript.run = true\n\n[fixups.sdk]\nextra_deps = [\"toolchains//:alsa\"]\n\n[fixups.sdk.buildscript.build]\nextra_srcs = [\"src/probe/*.rs\"]\nextra_deps = [\"//tools:probe\"]\n\n[fixups.sdk.buildscript.run]\nrustc_link_lib = true\nrustc_link_search = true\n"
+    );
+    write(&f.ws.join("buckal.toml"), &config);
+    f.migrate(&[]);
+    assert_eq!(f.buck("app"), app_before);
+    let sdk = f.buck("sdk");
+    let lib = rule(&sdk, "sdk");
+    assert!(lib.contains("\"toolchains//:alsa\""), "{lib}");
+    let build = rule(&sdk, "build-script-build");
+    assert!(build.contains("\"//tools:probe\""), "{build}");
+    assert!(!build.contains("toolchains//:alsa"), "{build}");
+    let run = rule(&sdk, "build-script-run");
+    assert!(
+        run.contains("    rustc_link_lib = True,\n    rustc_link_search = True,\n"),
+        "{run}"
+    );
+    assert!(!rule(&sdk, "unittest").contains("toolchains//:alsa"));
+    f.migrate(&["--no-cache"]);
+    assert_eq!(f.buck("sdk"), sdk);
+
+    // Not running the build script, and an extra source outside the package, are
+    // refused.
+    for (fixup, why) in [
+        (
+            "[fixups.sdk]\nbuildscript.run = false\n",
+            "`[fixups.sdk] buildscript.run = false`: generation always runs",
+        ),
+        (
+            "[fixups.sdk.buildscript.build]\nextra_srcs = [\"../app/build.rs\"]\n",
+            "`[fixups.sdk.buildscript.build] extra_srcs`: `../app/build.rs` is not a relative pattern inside the package",
+        ),
+    ] {
+        write(
+            &f.ws.join("buckal.toml"),
+            &format!("{BUCKAL_TOML}\n{fixup}"),
+        );
+        let output = f.output(&["migrate"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{fixup}:\n{stderr}");
+        assert!(stderr.contains(why), "{fixup}:\n{stderr}");
+    }
+
+    // Removing the fixups restores the rules.
+    write(&f.ws.join("buckal.toml"), BUCKAL_TOML);
+    f.migrate(&[]);
+    assert_eq!(f.buck("sdk"), sdk_before);
+}

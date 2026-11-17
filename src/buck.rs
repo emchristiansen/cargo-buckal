@@ -293,6 +293,12 @@ pub struct BuildscriptRun {
     pub platform: PlatformAttrs,
     pub version: String,
     pub manifest_dir: String,
+    /// Pass the build script's `cargo:rustc-link-lib` (`rustc_link_search`:
+    /// `cargo:rustc-link-search`) output on to the crate's linking.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub rustc_link_lib: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub rustc_link_search: bool,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub visibility: Set<String>,
 }
@@ -1002,6 +1008,8 @@ impl BuildscriptRun {
         let features = kwargs.get_list("features");
         let version = kwargs.get_str("version")?;
         let manifest_dir = kwargs.get_str("manifest_dir")?;
+        let rustc_link_lib = kwargs.get_bool_opt("rustc_link_lib").unwrap_or_default();
+        let rustc_link_search = kwargs.get_bool_opt("rustc_link_search").unwrap_or_default();
         let visibility = kwargs.get_list("visibility");
         Ok(BuildscriptRun {
             name,
@@ -1013,6 +1021,8 @@ impl BuildscriptRun {
             platform: Map::new(),
             version,
             manifest_dir,
+            rustc_link_lib,
+            rustc_link_search,
             visibility,
         })
     }
@@ -2275,6 +2285,8 @@ mod tests {
             platform: Map::new(),
             version: "1.2.3".to_string(),
             manifest_dir: ":vendor".to_string(),
+            rustc_link_lib: false,
+            rustc_link_search: false,
             visibility: Set::from(["PUBLIC".to_string()]),
         });
         let actual = rules

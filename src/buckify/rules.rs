@@ -484,10 +484,34 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
         );
         std::process::exit(1);
     }
+    if let Err(error) = check_buildscript_fixup(&node.name, &fixup.buildscript) {
+        buckal_error!("{:#}", error);
+        std::process::exit(1);
+    }
+    let run = match &fixup.buildscript.run {
+        Some(crate::config::BuildscriptRunEntry::Table(run)) => run.clone(),
+        _ => Default::default(),
+    };
+    let build_scripts: Set<String> = rules
+        .iter()
+        .filter_map(|rule| match rule {
+            Rule::BuildscriptRun(r) => r.buildscript_rule.strip_prefix(':').map(str::to_owned),
+            _ => None,
+        })
+        .collect();
     for rule in rules {
         let (env, rustc_flags, mapped_srcs) = match rule {
-            Rule::RustLibrary(r) => (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs),
-            Rule::RustBinary(r) => (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs),
+            Rule::RustLibrary(r) => {
+                r.deps.extend(fixup.extra_deps.iter().cloned());
+                (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs)
+            }
+            Rule::RustBinary(r) => {
+                if build_scripts.contains(&r.name) {
+                    r.deps
+                        .extend(fixup.buildscript.build.extra_deps.iter().cloned());
+                }
+                (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs)
+            }
             Rule::RustTest(r) => {
                 r.extra_resources
                     .extend(fixup.test_resources.iter().cloned());
@@ -512,6 +536,8 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
             }
             Rule::BuildscriptRun(r) => {
                 r.env.extend(fixup.buildscript_env.clone());
+                r.rustc_link_lib |= run.rustc_link_lib;
+                r.rustc_link_search |= run.rustc_link_search;
                 continue;
             }
             _ => continue,
@@ -520,6 +546,32 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
         rustc_flags.extend(fixup.rustc_flags.iter().cloned());
         mapped_srcs.extend(mapped.clone());
     }
+}
+
+/// Refuse what generation cannot honour in `[fixups.<package>.buildscript]`: not
+/// running the build script, and an `extra_srcs` pattern outside the package.
+fn check_buildscript_fixup(
+    package: &str,
+    buildscript: &crate::config::BuildscriptFixup,
+) -> anyhow::Result<()> {
+    if buildscript.run == Some(crate::config::BuildscriptRunEntry::Run(false)) {
+        anyhow::bail!(
+            "`[fixups.{package}] buildscript.run = false`: generation always runs a package's build script"
+        );
+    }
+    for pattern in &buildscript.build.extra_srcs {
+        let path = Utf8Path::new(pattern);
+        let inside = !pattern.is_empty()
+            && path
+                .components()
+                .all(|c| matches!(c, cargo_metadata::camino::Utf8Component::Normal(_)));
+        if !inside {
+            anyhow::bail!(
+                "`[fixups.{package}.buildscript.build] extra_srcs`: `{pattern}` is not a relative pattern inside the package"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Report compile-time includes of a first-party package that its sources do not
@@ -1162,6 +1214,8 @@ mod tests {
                 test_target_compatible_with: Default::default(),
                 test_args: Default::default(),
                 tests: Default::default(),
+                extra_deps: Default::default(),
+                buildscript: Default::default(),
             },
         );
 
