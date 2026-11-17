@@ -5,21 +5,28 @@
 //! enables only under `[target.'cfg(...)'.dependencies]` (e.g. `browser` for a
 //! wasm32 build) therefore ends up in the native build too, which can break it.
 //!
-//! `cargo tree --target <triple>` runs Cargo's own feature resolver for that one
-//! target, so it reports the features Cargo would actually compile with there, and
-//! the dependency edges those features activate. This module asks it once per
-//! configured platform. The edges matter as much as the features: an optional
-//! dependency that only a platform-specific feature enables (e.g. a derive crate
-//! behind a `derive` feature) is in `cargo metadata`'s merged resolve, but Cargo
-//! does not build it, or the features it needs from its own dependencies, on the
-//! other platforms.
+//! Cargo's unit graph (`cargo test --workspace --no-run --target <triple>
+//! --unit-graph`) is the compilation plan Cargo itself would run for that target:
+//! every unit with its resolved features and dependencies. This module reads it
+//! once per configured platform. The edges matter as much as the features: an
+//! optional dependency that only a platform-specific feature enables (e.g. a derive
+//! crate behind a `derive` feature) is in `cargo metadata`'s merged resolve, but
+//! Cargo does not build it, or the features it needs from its own dependencies, on
+//! the other platforms.
 //!
 //! Cargo's resolver 2 also resolves the host context separately: build
 //! dependencies, proc-macros and everything below them are compiled for the build
-//! machine with their own feature set, so a feature a build script's dependency
-//! needs (e.g. `serde_json/preserve_order` for a `[build-dependencies]` entry)
-//! does not reach the crate the target links. A package built in both contexts
-//! with different resolutions gets a separate host variant.
+//! machine (units without a `platform`) with their own feature set, so a feature a
+//! build script's dependency needs (e.g. `serde_json/preserve_order` for a
+//! `[build-dependencies]` entry) does not reach the crate the target links. A
+//! package built in both contexts with different resolutions gets a separate host
+//! variant.
+//!
+//! `--unit-graph` is an unstable Cargo flag, so the command runs with
+//! `RUSTC_BOOTSTRAP=1`; it only plans, it compiles and runs nothing. (`cargo tree`
+//! was used before, but it shows some dev-dependency subtrees of workspace members
+//! with host-context features, so its output cannot be split into the two
+//! contexts reliably.)
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::process::Command;
@@ -27,8 +34,6 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use cargo_metadata::{Package, PackageId};
 use serde::{Deserialize, Serialize};
-
-use crate::buckal_warn;
 
 /// The prelude `platform` attribute: `{platform name: {attribute: values}}`.
 pub type PlatformAttrs = BTreeMap<String, BTreeMap<String, BTreeSet<String>>>;
@@ -126,18 +131,11 @@ pub fn resolve_platform_features(
 ) -> Result<PlatformFeatures> {
     let mut target: HashMap<PackageId, ContextResolution> = HashMap::new();
     let mut host: HashMap<PackageId, ContextResolution> = HashMap::new();
-    let mut ambiguous_ids = BTreeSet::new();
     for (platform, triple) in platforms {
-        let output = run_cargo_tree(manifest_path, triple)
+        let output = run_unit_graph(manifest_path, triple)
             .with_context(|| format!("failed to resolve features for platform `{platform}`"))?;
-        let parsed = parse_cargo_tree(&output, packages);
-        for name in &parsed.ambiguous {
-            buckal_warn!(
-                "Features of `{}` on platform `{}` could not be attributed to one package; using the union over platforms for it.",
-                name,
-                platform
-            );
-        }
+        let parsed = parse_unit_graph(&output, packages)
+            .with_context(|| format!("failed to read Cargo's unit graph for `{triple}`"))?;
         for (context, into) in [(parsed.target, &mut target), (parsed.host, &mut host)] {
             for (id, features) in context.features {
                 let deps = context.deps.get(&id).cloned().unwrap_or_default();
@@ -146,11 +144,6 @@ pub fn resolve_platform_features(
                 entry.deps.insert(platform.clone(), deps);
             }
         }
-        ambiguous_ids.extend(parsed.ambiguous_ids);
-    }
-    for id in &ambiguous_ids {
-        target.remove(id);
-        host.remove(id);
     }
     Ok(combine_contexts(target, host))
 }
@@ -233,28 +226,28 @@ fn combine_contexts(
     result
 }
 
-fn run_cargo_tree(manifest_path: Option<&str>, triple: &str) -> Result<String> {
+fn run_unit_graph(manifest_path: Option<&str>, triple: &str) -> Result<String> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     let mut cmd = Command::new(cargo);
-    cmd.args([
-        "tree",
+    cmd.env("RUSTC_BOOTSTRAP", "1").args([
+        "test",
         "--workspace",
+        "--no-run",
         "--target",
         triple,
-        "--edges",
-        "normal,build,dev",
-        "--charset",
-        "ascii",
-        "--format",
-        "{p}|{f}",
+        "-Z",
+        "unstable-options",
+        "--unit-graph",
     ]);
     if let Some(path) = manifest_path {
         cmd.args(["--manifest-path", path]);
     }
-    let output = cmd.output().context("failed to run `cargo tree`")?;
+    let output = cmd
+        .output()
+        .context("failed to run `cargo test --unit-graph`")?;
     if !output.status.success() {
         bail!(
-            "`cargo tree --target {triple}` exited with {}: {}",
+            "`cargo test --unit-graph --target {triple}` exited with {}: {}",
             output.status,
             String::from_utf8_lossy(&output.stderr)
         );
@@ -262,185 +255,122 @@ fn run_cargo_tree(manifest_path: Option<&str>, triple: &str) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?)
 }
 
-/// Features and dependencies listed for packages in one context.
+/// Features and dependencies of packages in one context.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct ContextTree {
-    /// Union of the features reported on every line for a package in this context.
+    /// Union of the features of the package's units in this context.
     pub features: HashMap<PackageId, BTreeSet<String>>,
-    /// Dependencies (`PackageId::repr`) of each package listed, from the tree's edges.
+    /// Dependencies (`PackageId::repr`) of the package's units in this context,
+    /// including its build script's (which are host-context packages).
     pub deps: HashMap<PackageId, BTreeSet<String>>,
 }
 
 #[derive(Debug, Default, PartialEq)]
-pub(crate) struct ParsedTree {
+pub(crate) struct ParsedGraph {
     /// Packages as compiled for the target.
     pub target: ContextTree,
     /// Packages as compiled for the host: build dependencies, proc-macros and all
     /// their dependencies.
     pub host: ContextTree,
-    /// Packages whose lines could not be matched to exactly one metadata package.
-    pub ambiguous: BTreeSet<String>,
-    /// Metadata packages that a line might have meant; their result is unreliable.
-    pub ambiguous_ids: BTreeSet<PackageId>,
 }
 
-/// Parse `cargo tree --charset ascii --format '{p}|{f}'` output.
-///
-/// Each line is indented by four characters per level (`|-- `, `` `-- ``, `|   `,
-/// four spaces); a package's parent is the nearest earlier line one level up, and a
-/// blank line starts the next workspace member. A `[build-dependencies]` line marks
-/// the following children of the same parent as build dependencies, until a
-/// `[dev-dependencies]` line. A package is in the host context when it is a build
-/// dependency, a proc-macro, or below either. `{p}` is `name vX.Y.Z`, optionally
-/// followed by `(proc-macro)` and by the source in parentheses (a path for local
-/// packages, a URL for git ones); a line repeated because of deduplication ends in
-/// ` (*)`. `{f}` is a comma-separated feature list.
-pub(crate) fn parse_cargo_tree(output: &str, packages: &HashMap<PackageId, Package>) -> ParsedTree {
-    let mut by_name_version: HashMap<(&str, String), Vec<&Package>> = HashMap::new();
-    for package in packages.values() {
-        by_name_version
-            .entry((package.name.as_str(), package.version.to_string()))
-            .or_default()
-            .push(package);
+#[derive(Deserialize)]
+struct UnitGraph {
+    units: Vec<Unit>,
+}
+
+#[derive(Deserialize)]
+struct Unit {
+    pkg_id: String,
+    target: UnitTarget,
+    /// The target triple; `None` for units compiled for the host.
+    platform: Option<String>,
+    mode: String,
+    features: Vec<String>,
+    dependencies: Vec<UnitDep>,
+}
+
+#[derive(Deserialize)]
+struct UnitTarget {
+    kind: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct UnitDep {
+    index: usize,
+}
+
+impl Unit {
+    /// Compiling a build script. Such a unit has no `platform` whatever the
+    /// package's context is; it is reached through the package's
+    /// `run-custom-build` unit, which does carry the context.
+    fn is_build_script_compile(&self) -> bool {
+        self.mode != "run-custom-build" && self.target.kind.iter().any(|k| k == "custom-build")
     }
+}
 
-    let mut parsed = ParsedTree::default();
-    // Package and its context (host or not) at each depth along the current path;
-    // `None` for an unattributed line.
-    let mut path: Vec<(Option<PackageId>, bool)> = Vec::new();
-    // Whether the children at each depth currently are build dependencies.
-    let mut build_edges: Vec<bool> = Vec::new();
-    for line in output.lines() {
-        let indent = line.len() - line.trim_start_matches(['|', '`', '-', ' ']).len();
-        let content = line[indent..].trim_end();
-        if content.is_empty() {
-            path.clear();
-            build_edges.clear();
+/// Parse `cargo --unit-graph` output into each package's features and dependencies
+/// per context. A unit is in the host context when it has no `platform`.
+/// Doc-test units are skipped. Units of packages that are not in `packages` (the
+/// `cargo metadata` resolve) are ignored.
+pub(crate) fn parse_unit_graph(
+    output: &str,
+    packages: &HashMap<PackageId, Package>,
+) -> Result<ParsedGraph> {
+    let graph: UnitGraph = serde_json::from_str(output)?;
+    let unit = |index: usize| {
+        graph
+            .units
+            .get(index)
+            .with_context(|| format!("unit graph refers to missing unit {index}"))
+    };
+    let mut parsed = ParsedGraph::default();
+    for u in &graph.units {
+        if u.mode == "doctest" || u.is_build_script_compile() {
             continue;
         }
-        let depth = indent / 4;
-        if content.starts_with('[') {
-            // `[build-dependencies]` / `[dev-dependencies]` for children at depth + 1.
-            build_edges.resize(build_edges.len().max(depth + 2), false);
-            build_edges[depth + 1] = content == "[build-dependencies]";
+        let id = PackageId {
+            repr: u.pkg_id.clone(),
+        };
+        if !packages.contains_key(&id) {
             continue;
         }
-        path.truncate(depth);
-        path.resize(depth, (None, false));
-        build_edges.resize(build_edges.len().max(depth + 2), false);
-        let parent_host = depth
-            .checked_sub(1)
-            .and_then(|up| path.get(up))
-            .is_some_and(|p| p.1);
-        let host =
-            parent_host || (depth > 0 && build_edges[depth]) || content.contains(" (proc-macro)");
-        // The children of this line start as normal dependencies.
-        build_edges.truncate(depth + 1);
-        build_edges.push(false);
-
-        let content = content
-            .strip_suffix("(*)")
-            .map(str::trim_end)
-            .unwrap_or(content);
-        let Some((p, f)) = content.rsplit_once('|') else {
-            path.push((None, host));
-            continue;
-        };
-        let mut words = p.split_whitespace();
-        let (Some(name), Some(version)) = (words.next(), words.next()) else {
-            path.push((None, host));
-            continue;
-        };
-        let Some(version) = version.strip_prefix('v') else {
-            path.push((None, host));
-            continue;
-        };
-        let rest = words.collect::<Vec<_>>().join(" ");
-        let rest = rest.as_str();
-
-        let candidates = by_name_version
-            .get(&(name, version.to_owned()))
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let package = match candidates {
-            [] => {
-                path.push((None, host));
-                continue;
-            }
-            [only] => *only,
-            many => {
-                let matching: Vec<_> = many
-                    .iter()
-                    .filter(|candidate| source_matches(candidate, rest))
-                    .collect();
-                if let [only] = matching.as_slice() {
-                    **only
-                } else {
-                    parsed.ambiguous.insert(format!("{name} v{version}"));
-                    parsed
-                        .ambiguous_ids
-                        .extend(many.iter().map(|candidate| candidate.id.clone()));
-                    path.push((None, host));
-                    continue;
-                }
-            }
-        };
-
-        let features = f
-            .split(',')
-            .map(str::trim)
-            .filter(|feature| !feature.is_empty())
-            .map(str::to_owned);
-        let context = if host {
-            &mut parsed.host
-        } else {
+        let context = if u.platform.is_some() {
             &mut parsed.target
+        } else {
+            &mut parsed.host
         };
         context
             .features
-            .entry(package.id.clone())
+            .entry(id.clone())
             .or_default()
-            .extend(features);
-        context.deps.entry(package.id.clone()).or_default();
-        if let Some((Some(parent), parent_host)) = depth.checked_sub(1).and_then(|up| path.get(up))
-        {
-            let parent_context = if *parent_host {
-                &mut parsed.host
-            } else {
-                &mut parsed.target
-            };
-            parent_context
-                .deps
-                .entry(parent.clone())
-                .or_default()
-                .insert(package.id.repr.clone());
-        }
-        path.push((Some(package.id.clone()), host));
-    }
-    parsed
-}
-
-/// Whether the source shown by `cargo tree` (`rest`, the text after the version) is
-/// the source of `package`.
-fn source_matches(package: &Package, rest: &str) -> bool {
-    match &package.source {
-        // Local package: `cargo tree` shows its directory.
-        None => package
-            .manifest_path
-            .parent()
-            .is_some_and(|dir| rest.contains(&format!("({dir})"))),
-        Some(source) => {
-            let repr = source.repr.as_str();
-            if let Some(git) = repr.strip_prefix("git+") {
-                // `git+URL#commit`; `cargo tree` shows `(URL#short-commit)`.
-                let url = git.split_once('#').map(|(url, _)| url).unwrap_or(git);
-                rest.contains(url)
-            } else {
-                // Registry: shown without a source for crates.io, or as `(registry ...)`.
-                !rest.contains("(/") && !rest.contains("://")
+            .extend(u.features.iter().cloned());
+        let deps = context.deps.entry(id).or_default();
+        for dep in &u.dependencies {
+            let v = unit(dep.index)?;
+            if v.pkg_id != u.pkg_id {
+                // Another package's `run-custom-build` (its `links` metadata) comes
+                // with a dependency on that package's library, which is recorded.
+                if v.mode != "run-custom-build" {
+                    deps.insert(v.pkg_id.clone());
+                }
+                continue;
+            }
+            // The package's own build script: its dependencies are the package's
+            // build dependencies.
+            if v.mode == "run-custom-build" {
+                for compile in &v.dependencies {
+                    let w = unit(compile.index)?;
+                    if w.pkg_id == u.pkg_id && w.is_build_script_compile() {
+                        for build_dep in &w.dependencies {
+                            deps.insert(unit(build_dep.index)?.pkg_id.clone());
+                        }
+                    }
+                }
             }
         }
     }
+    Ok(parsed)
 }
 
 /// Split per-platform features into the part every platform shares and the
@@ -539,7 +469,7 @@ fixtures = { path = "../fixtures", features = ["test_lib"] }
     }
 
     #[test]
-    fn test_cargo_tree_resolves_target_specific_features_per_platform() {
+    fn test_unit_graph_resolves_target_specific_features_per_platform() {
         let dir = workspace();
         let packages = metadata_packages(dir.path());
         let sdk = packages
@@ -607,26 +537,9 @@ fixtures = { path = "../fixtures", features = ["test_lib"] }
     }
 
     #[test]
-    fn test_parse_cargo_tree_lines() {
+    fn test_parse_unit_graph() {
         let dir = workspace();
         let packages = metadata_packages(dir.path());
-        let sdk_dir = dir.path().join("sdk");
-        let extra_dir = dir.path().join("extra");
-        let fixtures_dir = dir.path().join("fixtures");
-        let output = format!(
-            "sdk v0.1.0 ({dir})|browser,default\n\
-             |-- unknown v9.9.9|x\n\
-             |   `-- extra v0.1.0 ({extra})|\n\
-             `-- extra v0.1.0 ({extra})|\n\
-             [build-dependencies]\n\
-             `-- fixtures v0.1.0 ({fixtures})|test_lib\n\
-             \n\
-             sdk v0.1.0 ({dir}) (*)|default\n",
-            dir = sdk_dir.display(),
-            extra = extra_dir.display(),
-            fixtures = fixtures_dir.display(),
-        );
-        let parsed = parse_cargo_tree(&output, &packages);
         let id = |name: &str| {
             packages
                 .values()
@@ -636,12 +549,35 @@ fixtures = { path = "../fixtures", features = ["test_lib"] }
                 .clone()
         };
         let (sdk, extra, fixtures) = (id("sdk"), id("extra"), id("fixtures"));
+        let unit = |pkg: &PackageId,
+                    kind: &str,
+                    platform: bool,
+                    mode: &str,
+                    features: &[&str],
+                    deps: &[usize]| {
+            serde_json::json!({
+                "pkg_id": pkg.repr,
+                "target": {"kind": [kind]},
+                "platform": if platform { serde_json::json!("x86_64-unknown-linux-gnu") } else { serde_json::Value::Null },
+                "mode": mode,
+                "features": features,
+                "dependencies": deps.iter().map(|i| serde_json::json!({"index": i})).collect::<Vec<_>>(),
+            })
+        };
+        // 0: sdk lib (target) -> extra lib (1) and sdk's build script run (2).
+        // 2: run -> compile (3), whose build dependency is fixtures, built for the host (4).
+        // 5: a doc-test unit of sdk with a feature nothing else has, which is ignored.
+        let graph = serde_json::json!({"version": 1, "units": [
+            unit(&sdk, "lib", true, "build", &["browser", "default"], &[1, 2]),
+            unit(&extra, "lib", true, "build", &[], &[]),
+            unit(&sdk, "custom-build", true, "run-custom-build", &["browser", "default"], &[3]),
+            unit(&sdk, "custom-build", false, "build", &["browser", "default"], &[4]),
+            unit(&fixtures, "lib", false, "build", &["test_lib"], &[]),
+            unit(&sdk, "lib", true, "doctest", &["doc-only"], &[0]),
+        ], "roots": [0]});
+        let parsed = parse_unit_graph(&graph.to_string(), &packages).expect("parse");
+
         assert_eq!(parsed.target.features[&sdk], set(&["browser", "default"]));
-        assert_eq!(parsed.target.features.len(), 2);
-        assert!(parsed.ambiguous.is_empty());
-        // `extra` under the unattributed `unknown` line is not taken as sdk's dependency;
-        // the one directly below sdk is. The build dependency is sdk's dependency too,
-        // but in the host context.
         assert_eq!(
             parsed.target.deps[&sdk],
             BTreeSet::from([extra.repr.clone(), fixtures.repr.clone()])
@@ -649,6 +585,8 @@ fixtures = { path = "../fixtures", features = ["test_lib"] }
         assert!(parsed.target.deps[&extra].is_empty());
         assert_eq!(parsed.host.features[&fixtures], set(&["test_lib"]));
         assert!(!parsed.target.features.contains_key(&fixtures));
+        // The build script compile unit has no platform but is not a host package.
+        assert!(!parsed.host.features.contains_key(&sdk));
     }
 
     fn package_manifest(name: &str, body: &str) -> String {
