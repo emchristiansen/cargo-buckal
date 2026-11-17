@@ -991,7 +991,7 @@ fn test_fixup_test_labels_and_compatibility_through_generation() {
     // Package-wide labels, and a single test's labels and compatibility, which the
     // cross-compilation selector is concatenated to.
     let config = format!(
-        "{BUCKAL_TOML}\n[fixups.app]\ntest_labels = [\"gate-default-excluded\"]\n\n[fixups.app.tests.unittest]\nlabels = [\"live-effect\"]\ntarget_compatible_with = [\"//buck2:gate_excluded\"]\n\n[fixups.shared]\ntest_target_compatible_with = [\"//buck2:gate_excluded\"]\n"
+        "{BUCKAL_TOML}\n[fixups.app]\ntest_labels = [\"gate-default-excluded\"]\ntest_args = [\"--declared-skip-substring\", \"slow\"]\n\n[fixups.app.tests.unittest]\nlabels = [\"live-effect\"]\ntarget_compatible_with = [\"//buck2:gate_excluded\"]\nargs = [\"--declared-skip\", \"tests::known_absent\"]\n\n[fixups.shared]\ntest_target_compatible_with = [\"//buck2:gate_excluded\"]\n"
     );
     write(&f.ws.join("buckal.toml"), &config);
     f.migrate(&[]);
@@ -1009,6 +1009,11 @@ fn test_fixup_test_labels_and_compatibility_through_generation() {
         ),
         "{test}"
     );
+    // Case filters as runner arguments: the package's, then the test's, in order.
+    assert!(
+        test.contains("    args = [\n        \"--declared-skip-substring\",\n        \"slow\",\n        \"--declared-skip\",\n        \"tests::known_absent\",\n    ],\n"),
+        "{test}"
+    );
     assert_eq!(rule(&app, "app"), rule(&app_before, "app"));
     let shared = f.buck("shared");
     assert!(
@@ -1018,6 +1023,7 @@ fn test_fixup_test_labels_and_compatibility_through_generation() {
         "{shared}"
     );
     assert!(!shared.contains("labels ="), "{shared}");
+    assert!(!shared.contains("args ="), "{shared}");
     // Read back and re-emitted unchanged.
     f.migrate(&["--no-cache"]);
     assert_eq!(f.buck("app"), app);

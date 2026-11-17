@@ -501,10 +501,12 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
                 r.labels.extend(fixup.test_labels.iter().cloned());
                 r.target_compatible_with
                     .extend(fixup.test_target_compatible_with.iter().cloned());
+                r.args.extend(fixup.test_args.iter().cloned());
                 if let Some(test) = fixup.tests.get(&r.name) {
                     r.labels.extend(test.labels.iter().cloned());
                     r.target_compatible_with
                         .extend(test.target_compatible_with.iter().cloned());
+                    r.args.extend(test.args.iter().cloned());
                 }
                 (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs)
             }
@@ -1158,6 +1160,7 @@ mod tests {
                 export_files: Default::default(),
                 test_labels: Default::default(),
                 test_target_compatible_with: Default::default(),
+                test_args: Default::default(),
                 tests: Default::default(),
             },
         );

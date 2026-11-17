@@ -288,6 +288,12 @@ pub struct PackageFixup {
     /// the package, e.g. one that makes a test incompatible unless a setting is on.
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub test_target_compatible_with: Set<String>,
+    /// Arguments after the binary of every test of the package, which the test
+    /// runner passes on, e.g. the per-test process runner's `--declared-skip NAME`,
+    /// `--declared-only-substring WORD` and `--declared-skip-substring WORD`, or
+    /// libtest's `--skip NAME`, `--exact` and name filters.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub test_args: Vec<String>,
     /// Additions to single tests of the package (`[fixups.<pkg>.tests.<name>]`),
     /// keyed by the `rust_test` rule name (`unittest` for a library's unit tests,
     /// else the test target's name). A name that is no test of the package is
@@ -305,6 +311,9 @@ pub struct TestFixup {
     pub labels: Set<String>,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub target_compatible_with: Set<String>,
+    /// Arguments after the package's `test_args`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
 }
 
 /// An entry of `[fixups.<package>] export_files`.
