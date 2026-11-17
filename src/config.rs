@@ -227,6 +227,14 @@ pub struct RepoConfig {
 /// `variant`) names the file holding the module's lowercase hex SHA-256, which the
 /// buckal cell's `wasm_sha256` (`@buckal//:wasm_digest.bzl`) computes as
 /// `<alias>-sha256`, emitted only for a module a declaration names this way.
+///
+/// `test_packages` lists the first-party packages whose library unit tests are
+/// compiled for wasm32 and run in a browser, each declaring
+/// `[package.metadata.buck2.wasm-test]` (and optionally
+/// `[package.metadata.buck2.wasm-test-variants.<name>]`): each with exactly its
+/// declared `features`, from Cargo's own `cargo test -p <package> --lib --features
+/// <features> --target wasm32-unknown-unknown` graph. See `crate::wasm` for what
+/// is emitted.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WasmConfig {
@@ -236,11 +244,14 @@ pub struct WasmConfig {
     /// `root//buck2/platforms/wasm:wasm32_unknown_unknown`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
+    /// Packages whose library unit tests run in a browser (`wasm-test`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub test_packages: Vec<String>,
 }
 
 impl WasmConfig {
     pub fn is_empty(&self) -> bool {
-        self.packages.is_empty() && self.platform.is_none()
+        self.packages.is_empty() && self.platform.is_none() && self.test_packages.is_empty()
     }
 }
 

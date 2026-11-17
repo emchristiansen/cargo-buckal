@@ -682,3 +682,231 @@ fn test_production_features_match_cargo_on_workspace() {
     }
     assert!(report.mismatches.is_empty());
 }
+
+/// The library unit-test graph BUCKAL reads for a `wasm-test` package (`cargo test -p
+/// <package> --lib --unit-graph`), compared with `cargo tree -p <package> -e
+/// normal,dev --target wasm32-unknown-unknown --features <features>`: the target
+/// libraries (every line below the package outside a proc-macro's subtree) and
+/// their features, and the package's direct dependencies (its test unit's). The
+/// mismatches, and the number of target libraries compared.
+fn wasm_test_graph_mismatches(
+    manifest: &Path,
+    package: &str,
+    features: &[String],
+) -> (Vec<String>, usize) {
+    let triple = "wasm32-unknown-unknown";
+    let metadata = MetadataCommand::new()
+        .manifest_path(manifest)
+        .exec()
+        .unwrap();
+    let packages: HashMap<PackageId, Package> = metadata
+        .packages
+        .iter()
+        .map(|p| (p.id.clone(), p.clone()))
+        .collect();
+    let by_name_version: HashMap<(String, String), PackageId> = metadata
+        .packages
+        .iter()
+        .map(|p| ((p.name.to_string(), p.version.to_string()), p.id.clone()))
+        .collect();
+    let root = metadata
+        .packages
+        .iter()
+        .find(|p| p.name.as_str() == package && metadata.workspace_members.contains(&p.id))
+        .expect("the package is a member")
+        .id
+        .clone();
+    let (libs, test) = cargo_buckal::platform_features::resolve_package_test_graph(
+        Some(manifest.to_str().unwrap()),
+        &packages,
+        &root,
+        package,
+        features,
+        triple,
+    )
+    .unwrap();
+    let test = test.expect("a library unit-test unit");
+
+    let mut command = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned()));
+    command.args([
+        "tree",
+        "-p",
+        package,
+        "-e",
+        "normal,dev",
+        "--target",
+        triple,
+    ]);
+    if !features.is_empty() {
+        command.args(["--features", &features.join(",")]);
+    }
+    let output = command
+        .args(["--prefix", "depth", "-f", "{p}|{f}", "--manifest-path"])
+        .arg(manifest)
+        .output()
+        .expect("run cargo tree");
+    assert!(
+        output.status.success(),
+        "cargo tree: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut tree_libs: BTreeMap<PackageId, BTreeSet<String>> = BTreeMap::new();
+    let mut direct: BTreeSet<String> = BTreeSet::new();
+    // The depth of the proc-macro whose subtree (host compilations) we are in.
+    let mut host_below: Option<usize> = None;
+    let mut mismatches = Vec::new();
+    for line in String::from_utf8(output.stdout).unwrap().lines() {
+        let digits = line.chars().take_while(char::is_ascii_digit).count();
+        let depth: usize = line[..digits].parse().unwrap();
+        let (described, features) = line[digits..].split_once('|').expect("{p}|{f}");
+        let mut words = described.split_whitespace();
+        let name = words.next().unwrap().to_owned();
+        let version = words.next().unwrap().trim_start_matches('v').to_owned();
+        let Some(id) = by_name_version
+            .get(&(name.clone(), version.clone()))
+            .cloned()
+        else {
+            mismatches.push(format!(
+                "cargo tree names {name} {version}, which metadata lacks"
+            ));
+            continue;
+        };
+        if host_below.is_some_and(|d| depth <= d) {
+            host_below = None;
+        }
+        if depth == 1 {
+            direct.insert(id.repr.clone());
+        }
+        let proc_macro = described.contains("(proc-macro)");
+        if depth == 0 || host_below.is_some() || proc_macro {
+            if proc_macro && host_below.is_none() {
+                host_below = Some(depth);
+            }
+            continue;
+        }
+        let features: BTreeSet<String> = features
+            .trim_end_matches(" (*)")
+            .split(',')
+            .filter(|f| !f.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if let Some(seen) = tree_libs.insert(id.clone(), features.clone())
+            && seen != features
+        {
+            mismatches.push(format!(
+                "cargo tree shows {} with two feature sets",
+                id.repr
+            ));
+        }
+    }
+    let buckal: BTreeMap<PackageId, BTreeSet<String>> = libs
+        .iter()
+        .map(|(id, lib)| (id.clone(), lib.features.clone()))
+        .collect();
+    for (id, features) in &tree_libs {
+        match buckal.get(id) {
+            None => mismatches.push(format!("only cargo tree builds {}", id.repr)),
+            Some(ours) if ours != features => mismatches.push(format!(
+                "{}: cargo tree {features:?}, BUCKAL {ours:?}",
+                id.repr
+            )),
+            Some(_) => {}
+        }
+    }
+    for id in buckal.keys().filter(|id| !tree_libs.contains_key(*id)) {
+        mismatches.push(format!("only BUCKAL builds {}", id.repr));
+    }
+    if direct != test.deps {
+        mismatches.push(format!(
+            "direct dependencies: cargo tree {direct:?}, BUCKAL's test unit {:?}",
+            test.deps
+        ));
+    }
+    (mismatches, tree_libs.len())
+}
+
+#[test]
+fn test_wasm_test_graph_matches_cargo() {
+    // `site`'s own test graph: `d` with `m` only (the workspace's `other` adds
+    // `desktop` and its `nat`), the wasm32-only dev-dependency `wt`, the proc-macro
+    // `pm` (host, with its own `hostdep`), and `v` through `voice` alone.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(
+        &root.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"site\", \"d\", \"other\", \"v\", \"wt\", \"pm\", \"hostdep\"]\nexclude = [\"nat\"]\n",
+    );
+    let package = |name: &str, body: &str| {
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{body}")
+    };
+    write(
+        &root.join("site/Cargo.toml"),
+        &package(
+            "site",
+            "[features]\ntest_lib = []\nvoice = [\"dep:v\"]\n[dependencies]\nd = { path = \"../d\", features = [\"m\"] }\nv = { path = \"../v\", optional = true }\npm = { path = \"../pm\" }\n\
+             [target.'cfg(target_arch = \"wasm32\")'.dev-dependencies]\nwt = { path = \"../wt\" }\n",
+        ),
+    );
+    write(
+        &root.join("d/Cargo.toml"),
+        &package(
+            "d",
+            "[features]\nm = []\ndesktop = [\"dep:nat\"]\n[dependencies]\nnat = { path = \"../nat\", optional = true }\n",
+        ),
+    );
+    write(
+        &root.join("other/Cargo.toml"),
+        &package(
+            "other",
+            "[dependencies]\nd = { path = \"../d\", features = [\"desktop\"] }\n",
+        ),
+    );
+    write(
+        &root.join("nat/Cargo.toml"),
+        &package("nat", "[workspace]\n"),
+    );
+    write(
+        &root.join("pm/Cargo.toml"),
+        &package(
+            "pm",
+            "[lib]\nproc-macro = true\n[dependencies]\nhostdep = { path = \"../hostdep\" }\n",
+        ),
+    );
+    for name in ["v", "wt", "hostdep"] {
+        write(&root.join(name).join("Cargo.toml"), &package(name, ""));
+    }
+    for name in ["site", "d", "other", "nat", "v", "wt", "pm", "hostdep"] {
+        write(&root.join(name).join("src/lib.rs"), "");
+    }
+    let manifest = root.join("Cargo.toml");
+    for (features, libs) in [(vec!["test_lib"], 2), (vec!["test_lib", "voice"], 3)] {
+        let features: Vec<String> = features.into_iter().map(str::to_owned).collect();
+        let (mismatches, compared) = wasm_test_graph_mismatches(&manifest, "site", &features);
+        assert!(mismatches.is_empty(), "{features:?}: {mismatches:#?}");
+        // `d`, `wt` (and `v`): not `nat`, not the host `pm`/`hostdep`.
+        assert_eq!(compared, libs, "{features:?}");
+    }
+}
+
+#[test]
+#[ignore = "set BUCKAL_PARITY_MANIFEST, BUCKAL_PARITY_WASM_TEST (a member) and BUCKAL_PARITY_WASM_TEST_FEATURES"]
+fn test_wasm_test_graph_matches_cargo_on_workspace() {
+    let manifest = std::env::var("BUCKAL_PARITY_MANIFEST").expect("BUCKAL_PARITY_MANIFEST");
+    let package = std::env::var("BUCKAL_PARITY_WASM_TEST").expect("BUCKAL_PARITY_WASM_TEST");
+    let features: Vec<String> = std::env::var("BUCKAL_PARITY_WASM_TEST_FEATURES")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|f| !f.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let (mismatches, compared) =
+        wasm_test_graph_mismatches(Path::new(&manifest), &package, &features);
+    eprintln!(
+        "{package} --features {features:?}: compared {compared} target libraries and the direct dependencies; {} mismatches",
+        mismatches.len()
+    );
+    for mismatch in &mismatches {
+        eprintln!("MISMATCH {mismatch}");
+    }
+    assert!(mismatches.is_empty());
+}

@@ -320,7 +320,7 @@ fn workspace_manifests(ctx: &BuckalContext) -> NamedFileGroup {
 
 /// Rule kinds that generation owns in a package BUCK file it writes: their calls
 /// are replaced by the generated rules.
-const GENERATED_RULE_KINDS: [&str; 10] = [
+const GENERATED_RULE_KINDS: [&str; 11] = [
     "buildscript_run",
     "cargo_manifest",
     "export_file",
@@ -330,8 +330,9 @@ const GENERATED_RULE_KINDS: [&str; 10] = [
     "rust_binary",
     "rust_library",
     "rust_test",
-    // The buckal cell's rule, loaded from `@buckal//`, whose loads generation
+    // The buckal cell's rules, loaded from `@buckal//`, whose loads generation
     // also owns: a hand-written call could not keep its load.
+    "wasm_browser_test",
     "wasm_sha256",
 ];
 
@@ -381,16 +382,18 @@ impl OwnedNames {
     }
 
     /// Whether generation owns the call of `function` named `name`: every call of a
-    /// Rust, build-script, vendoring or `wasm_sha256` rule kind, the `filegroup`
-    /// and `export_file` calls it writes, and the modules' `configured_alias`es.
+    /// Rust, build-script, vendoring, `wasm_sha256` or `wasm_browser_test` rule
+    /// kind, the `filegroup` and `export_file` calls it writes, and the modules' and
+    /// test-mode modules' `configured_alias`es.
     /// An owned call generation does not emit is removed, with a warning.
     fn owns(&self, function: &str, name: Option<&str>) -> bool {
         match (function, name) {
             ("filegroup", Some(name)) => self.filegroups.contains(name),
             ("export_file", Some(name)) => self.exports.contains(name),
             ("configured_alias", Some(name)) => {
-                name == crate::wasm::MODULE_ALIAS
-                    || name.starts_with(&format!("{}.", crate::wasm::MODULE_ALIAS))
+                [crate::wasm::MODULE_ALIAS, crate::wasm::TEST_MODULE_ALIAS]
+                    .iter()
+                    .any(|alias| name == *alias || name.starts_with(&format!("{alias}.")))
             }
             _ => GENERATED_RULE_KINDS.contains(&function),
         }
