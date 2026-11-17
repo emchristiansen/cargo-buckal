@@ -220,6 +220,9 @@ pub struct RustTest {
     pub compatible_with: Set<String>,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub exec_compatible_with: Set<String>,
+    /// Test labels (`[fixups.<pkg>] test_labels` and per-test `labels`).
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub labels: Set<String>,
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub env: Map<String, String>,
     /// Environment for running the test only (not for compiling it).
@@ -935,6 +938,7 @@ impl RustTest {
         let target_compatible_with = kwargs.get_list("target_compatible_with");
         let compatible_with = kwargs.get_list("compatible_with");
         let exec_compatible_with = kwargs.get_list("exec_compatible_with");
+        let labels = kwargs.get_list("labels");
         let env = kwargs.get_dict("env");
         let features = kwargs.get_list("features");
         let rustc_flags = kwargs.get_ordered_list("rustc_flags");
@@ -959,6 +963,7 @@ impl RustTest {
             target_compatible_with,
             compatible_with,
             exec_compatible_with,
+            labels,
             env,
             run_env,
             remote_execution,
@@ -2212,6 +2217,7 @@ mod tests {
             target_compatible_with: Set::from(["prelude//os/constraints:windows".to_string()]),
             compatible_with: Set::from(["prelude//os/constraints:linux".to_string()]),
             exec_compatible_with: Set::from(["prelude//os/constraints:macos".to_string()]),
+            labels: Set::new(),
             env: Map::from([("RUST_LOG".to_string(), "debug".to_string())]),
             run_env: Map::new(),
             remote_execution: None,

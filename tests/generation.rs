@@ -975,3 +975,73 @@ fn test_workspace_manifests_through_generation() {
     let root = std::fs::read_to_string(f.ws.join("BUCK")).unwrap();
     assert!(!root.contains("workspace_manifests"), "{root}");
 }
+
+#[test]
+fn test_fixup_test_labels_and_compatibility_through_generation() {
+    let f = fixture();
+    f.migrate(&[]);
+    let app_before = f.buck("app");
+    let shared_before = f.buck("shared");
+    let cross = "select({\"//platforms:cross\": [\"config//:none\"], \"DEFAULT\": []})";
+    assert!(
+        rule(&app_before, "unittest").contains(&format!("    target_compatible_with = {cross},\n")),
+        "{app_before}"
+    );
+
+    // Package-wide labels, and a single test's labels and compatibility, which the
+    // cross-compilation selector is concatenated to.
+    let config = format!(
+        "{BUCKAL_TOML}\n[fixups.app]\ntest_labels = [\"gate-default-excluded\"]\n\n[fixups.app.tests.unittest]\nlabels = [\"live-effect\"]\ntarget_compatible_with = [\"//buck2:gate_excluded\"]\n\n[fixups.shared]\ntest_target_compatible_with = [\"//buck2:gate_excluded\"]\n"
+    );
+    write(&f.ws.join("buckal.toml"), &config);
+    f.migrate(&[]);
+    let app = f.buck("app");
+    let test = rule(&app, "unittest");
+    assert!(
+        test.contains(&format!(
+            "    target_compatible_with = [\"//buck2:gate_excluded\"] + {cross},\n"
+        )),
+        "{test}"
+    );
+    assert!(
+        test.contains(
+            "    labels = [\n        \"gate-default-excluded\",\n        \"live-effect\",\n    ],\n"
+        ),
+        "{test}"
+    );
+    assert_eq!(rule(&app, "app"), rule(&app_before, "app"));
+    let shared = f.buck("shared");
+    assert!(
+        rule(&shared, "unittest").contains(&format!(
+            "    target_compatible_with = [\"//buck2:gate_excluded\"] + {cross},\n"
+        )),
+        "{shared}"
+    );
+    assert!(!shared.contains("labels ="), "{shared}");
+    // Read back and re-emitted unchanged.
+    f.migrate(&["--no-cache"]);
+    assert_eq!(f.buck("app"), app);
+    assert_eq!(f.buck("shared"), shared);
+
+    // A test name that is no test of the package is refused.
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!("{config}\n[fixups.app.tests.unitest]\nlabels = [\"x\"]\n"),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "`[fixups.app.tests.unitest]` names no test of the package (its tests: unittest)"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(f.buck("app"), app);
+
+    // Removing the fixups restores the rules.
+    write(&f.ws.join("buckal.toml"), BUCKAL_TOML);
+    f.migrate(&[]);
+    assert_eq!(f.buck("app"), app_before);
+    assert_eq!(f.buck("shared"), shared_before);
+}

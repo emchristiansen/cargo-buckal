@@ -280,6 +280,31 @@ pub struct PackageFixup {
     /// `{ path = "<path>", visibility = ["<pattern>", ...] }`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub export_files: Vec<ExportFileEntry>,
+    /// Labels of every test of the package (its `rust_test` rules), e.g. a label
+    /// that keeps a test out of default runs.
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub test_labels: Set<String>,
+    /// `target_compatible_with` constraints (or config settings) of every test of
+    /// the package, e.g. one that makes a test incompatible unless a setting is on.
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub test_target_compatible_with: Set<String>,
+    /// Additions to single tests of the package (`[fixups.<pkg>.tests.<name>]`),
+    /// keyed by the `rust_test` rule name (`unittest` for a library's unit tests,
+    /// else the test target's name). A name that is no test of the package is
+    /// refused.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub tests: Map<String, TestFixup>,
+}
+
+/// Additions to one test (`rust_test` rule) of a package, after the package-wide
+/// `test_*` ones.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct TestFixup {
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub labels: Set<String>,
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub target_compatible_with: Set<String>,
 }
 
 /// An entry of `[fixups.<package>] export_files`.

@@ -463,6 +463,27 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
         buckal_error!("{:#}", error);
         std::process::exit(1);
     });
+    // A per-test fixup that names no test would silently not apply (with tests
+    // generated at all).
+    let tests: Set<&str> = rules
+        .iter()
+        .filter_map(|rule| match rule {
+            Rule::RustTest(r) => Some(r.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    if let Some(unknown) = fixup
+        .tests
+        .keys()
+        .find(|name| !ctx.repo_config.ignore_tests && !tests.contains(name.as_str()))
+    {
+        buckal_error!(
+            "`[fixups.{}.tests.{unknown}]` names no test of the package (its tests: {})",
+            node.name,
+            tests.iter().join(", ")
+        );
+        std::process::exit(1);
+    }
     for rule in rules {
         let (env, rustc_flags, mapped_srcs) = match rule {
             Rule::RustLibrary(r) => (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs),
@@ -476,6 +497,14 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
                 }
                 if let Some(runtime_tools) = &fixup.test_runtime_tools {
                     r.runtime_tools = Some(runtime_tools.clone());
+                }
+                r.labels.extend(fixup.test_labels.iter().cloned());
+                r.target_compatible_with
+                    .extend(fixup.test_target_compatible_with.iter().cloned());
+                if let Some(test) = fixup.tests.get(&r.name) {
+                    r.labels.extend(test.labels.iter().cloned());
+                    r.target_compatible_with
+                        .extend(test.target_compatible_with.iter().cloned());
                 }
                 (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs)
             }
@@ -1127,6 +1156,9 @@ mod tests {
                 test_run_env: Default::default(),
                 test_runtime_tools: None,
                 export_files: Default::default(),
+                test_labels: Default::default(),
+                test_target_compatible_with: Default::default(),
+                tests: Default::default(),
             },
         );
 
