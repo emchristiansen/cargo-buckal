@@ -32,8 +32,10 @@ impl BuckalContext {
             metadata_command.manifest_path(manifest);
         }
         // Packages that only the tests' features enable are part of the resolve.
-        if let Some(features) = repo_config.test_features.as_ref().filter(|f| !f.is_empty()) {
-            metadata_command.features(cargo_metadata::CargoOpt::SomeFeatures(features.clone()));
+        if !repo_config.test_features.is_empty() {
+            metadata_command.features(cargo_metadata::CargoOpt::SomeFeatures(
+                repo_config.test_features.clone(),
+            ));
         }
         let cargo_metadata = metadata_command.exec().unwrap();
         let root = cargo_metadata.root_package().map(|p| p.id.clone());
@@ -91,7 +93,7 @@ impl BuckalContext {
                 manifest_path.as_deref(),
                 &repo_config.feature_platforms,
                 &packages_map,
-                repo_config.test_features.as_deref(),
+                &repo_config.test_features,
             )
             .unwrap_or_exit_ctx("failed to resolve per-platform features");
             for (pkg_id, features) in per_platform {

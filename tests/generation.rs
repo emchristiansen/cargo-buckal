@@ -1124,7 +1124,7 @@ fn test_features_fixture(test_features: Option<&str>) -> Fixture {
         &f.ws.join("selfy/Cargo.toml"),
         &manifest(
             "selfy",
-            "[features]\ntest_lib = []\n[dev-dependencies]\nselfy = { path = \".\", features = [\"test_lib\"] }\n[[bin]]\nname = \"tool\"\npath = \"src/bin/tool.rs\"\nrequired-features = [\"test_lib\"]\n",
+            "[features]\ntest_lib = []\nnope = []\n[dev-dependencies]\nselfy = { path = \".\", features = [\"test_lib\"] }\n[[bin]]\nname = \"tool\"\npath = \"src/bin/tool.rs\"\nrequired-features = [\"test_lib\"]\n[[bin]]\nname = \"never\"\npath = \"src/bin/never.rs\"\nrequired-features = [\"nope\"]\n",
         ),
     );
     write(
@@ -1132,6 +1132,7 @@ fn test_features_fixture(test_features: Option<&str>) -> Fixture {
         "#[cfg(feature = \"test_lib\")]\npub mod test_lib {}\n",
     );
     write(&f.ws.join("selfy/src/bin/tool.rs"), "fn main() {}\n");
+    write(&f.ws.join("selfy/src/bin/never.rs"), "fn main() {}\n");
     write(
         &f.ws.join("selfy/tests/t.rs"),
         "use selfy::test_lib as _;\n",
@@ -1161,18 +1162,24 @@ fn test_features_fixture(test_features: Option<&str>) -> Fixture {
 
 #[test]
 fn test_test_features_resolve_tests_apart() {
-    // Without `test_features`, everything is resolved as `cargo test` resolves it:
-    // the self dev-dependency's feature is in the ordinary library.
+    // Without `test_features`, production is still exactly `cargo build`'s: the self
+    // dev-dependency's feature reaches only the tests, through the test variant, and
+    // `gated`'s `test_lib`, which only `--features` enables, is nowhere.
     let f = test_features_fixture(None);
     f.migrate(&[]);
     let selfy = f.buck("selfy");
+    assert!(!rule(&selfy, "selfy").contains("features"), "{selfy}");
     assert!(
-        rule(&selfy, "selfy").contains("    features = [\"test_lib\"],\n"),
+        rule(&selfy, "selfy-test").contains("    features = [\"test_lib\"],\n"),
         "{selfy}"
     );
-    assert!(!selfy.contains("selfy-test"), "{selfy}");
+    // A binary whose required feature nothing enables is not built, as under Cargo.
+    assert!(!selfy.contains("never"), "{selfy}");
+    let gated = f.buck("gated");
+    assert!(!gated.contains("test_lib"), "{gated}");
+    assert!(!gated.contains("gated-test"), "{gated}");
 
-    // With it, the ordinary build is `cargo build`'s and the tests get a variant.
+    // With it, the tests also get the workspace's `--features test_lib`.
     let f = test_features_fixture(Some("\"test_lib\""));
     f.migrate(&[]);
     let selfy = f.buck("selfy");

@@ -310,35 +310,27 @@ impl ContextResolution {
     }
 }
 
-/// Resolve the features of every package for each `(platform name, target triple)`.
+/// Resolve the features of every package for each `(platform name, target triple)`,
+/// as Cargo does, from its unit graphs.
 ///
-/// Edges are normal, build and dev (dev only for workspace members), which is the
-/// resolution `cargo test --workspace --target <triple>` compiles with.
-///
-/// With `test_features` (`Some`, possibly empty), the ordinary build and the tests
-/// are resolved apart, as Cargo builds them: the main resolution is that of `cargo
-/// build --workspace` (no dev-dependency features unified into the libraries), and
-/// the tests' that of `cargo test --workspace --features <test_features>`. A library
-/// the tests need with other features or dependencies gets a test variant.
+/// The ordinary (production) build and the tests are resolved apart, as Cargo builds
+/// them: the main resolution is exactly that of `cargo build --workspace --target
+/// <triple>` (target and host contexts; no feature that only a dev-dependency or
+/// the test features enable), and the tests' that of `cargo test --workspace
+/// --no-run --target <triple> --features <test_features>`. A library the tests need
+/// with other features or dependencies gets a test variant.
 pub fn resolve_platform_features(
     manifest_path: Option<&str>,
     platforms: &BTreeMap<String, String>,
     packages: &HashMap<PackageId, Package>,
-    test_features: Option<&[String]>,
+    test_features: &[String],
 ) -> Result<PlatformFeatures> {
-    let main_shape = match test_features {
-        None => GraphShape::Test(&[]),
-        Some(_) => GraphShape::Build,
-    };
-    let main = resolve_shape(manifest_path, platforms, packages, main_shape)?;
-    let Some(features) = test_features else {
-        return Ok(main);
-    };
+    let main = resolve_shape(manifest_path, platforms, packages, GraphShape::Build)?;
     let tests = resolve_shape(
         manifest_path,
         platforms,
         packages,
-        GraphShape::Test(features),
+        GraphShape::Test(test_features),
     )?;
     Ok(with_test_resolution(main, tests))
 }
@@ -913,22 +905,20 @@ fixtures = { path = "../fixtures", features = ["test_lib"] }
             ("wasm32".to_owned(), "wasm32-unknown-unknown".to_owned()),
         ]);
         let manifest = dir.path().join("Cargo.toml");
-        let resolved = resolve_platform_features(
-            Some(manifest.to_str().unwrap()),
-            &platforms,
-            &packages,
-            None,
-        )
-        .expect("resolve");
+        let resolved =
+            resolve_platform_features(Some(manifest.to_str().unwrap()), &platforms, &packages, &[])
+                .expect("resolve");
 
         assert_eq!(resolved[&sdk].features["linux-x86_64"], set(&["default"]));
         assert_eq!(
             resolved[&sdk].features["wasm32"],
             set(&["browser", "default"])
         );
-        // Dev-dependency features of workspace members are kept, as `cargo test` does.
+        // A dev-dependency's feature is not in the production build, as under `cargo
+        // build`; the tests get it from the test variant, as under `cargo test`.
+        assert_eq!(resolved[&fixtures].features["linux-x86_64"], set(&[]));
         assert_eq!(
-            resolved[&fixtures].features["linux-x86_64"],
+            resolved[&fixtures].test_variant.as_ref().unwrap().features["linux-x86_64"],
             set(&["test_lib"])
         );
 
@@ -1096,13 +1086,9 @@ fixtures = { path = "../fixtures", features = ["test_lib"] }
             "x86_64-unknown-linux-gnu".to_owned(),
         )]);
         let manifest = ws.join("Cargo.toml");
-        let resolved = resolve_platform_features(
-            Some(manifest.to_str().unwrap()),
-            &platforms,
-            &packages,
-            None,
-        )
-        .expect("resolve");
+        let resolved =
+            resolve_platform_features(Some(manifest.to_str().unwrap()), &platforms, &packages, &[])
+                .expect("resolve");
 
         // The target copy of `json` does not get the build dependency's feature.
         let json = &resolved[&id("json")];

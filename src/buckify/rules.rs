@@ -133,10 +133,19 @@ pub fn buckify_dep_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
 
 /// Buckifies workspace package into a list of BUCK rules, including rules for all targets (bin, lib, test) and handling build scripts if present.
 pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
+    // Cargo builds a binary only where its `required-features` are on; one that
+    // neither the production nor the test resolution enables is not built at all.
+    let production = node.platform_features.exec_resolution();
+    let tests = node.platform_features.test_resolution();
     let bin_targets: Vec<_> = node
         .targets
         .iter()
         .filter(|t| t.kind.contains(&TargetKind::Bin))
+        .filter(|t| {
+            let per_platform = !ctx.repo_config.feature_platforms.is_empty();
+            features_enable(&production, &t.required_features, per_platform)
+                || features_enable(&tests, &t.required_features, per_platform)
+        })
         .collect();
 
     let lib_targets: Vec<_> = node
@@ -511,12 +520,23 @@ fn host_variant_rules(
 /// Whether `target`'s `required-features` are on in `node`'s resolution (on some
 /// platform; always without per-platform resolution).
 fn has_required_features(node: &BuckalNode, target: &BuckalTarget) -> bool {
-    let features = &node.platform_features.features;
-    target.required_features.is_empty()
-        || features.is_empty()
-        || features
+    features_enable(&node.platform_features, &target.required_features, false)
+}
+
+/// Whether `required` features are all on in `resolution` (on some platform).
+/// Without per-platform data they are taken to be, unless `per_platform`
+/// resolution is configured: then Cargo builds nothing of the package.
+fn features_enable(
+    resolution: &crate::platform_features::PlatformResolution,
+    required: &[String],
+    per_platform: bool,
+) -> bool {
+    required.is_empty()
+        || resolution.features.is_empty() && !per_platform
+        || resolution
+            .features
             .values()
-            .any(|on| target.required_features.iter().all(|f| on.contains(f)))
+            .any(|on| required.iter().all(|f| on.contains(f)))
 }
 
 /// The rules of `node`'s test variant, if it has one: its library `<lib_name>-test`

@@ -192,16 +192,14 @@ pub struct RepoConfig {
     /// is reserved: with this unset, generation removes such a filegroup.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub workspace_manifests: bool,
-    /// Resolve the tests apart from the ordinary build, as Cargo builds them (with
-    /// `feature_platforms`): the main rules as `cargo build --workspace` resolves
-    /// them, without features that only dev-dependencies (including a package's
-    /// dev-dependency on itself) enable, and the tests as `cargo test --workspace
-    /// --features <these>` does. A library the tests need with other features gets
-    /// a `<lib>-test` variant that the tests, and binaries whose `required-features`
-    /// only the tests enable, use. Unset: everything as `cargo test --workspace`
-    /// resolves it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub test_features: Option<Vec<String>>,
+    /// Features the tests are built with: with `feature_platforms`, the tests are
+    /// resolved as `cargo test --workspace --features <these>` resolves them, apart
+    /// from the ordinary (production) build, which is resolved exactly as `cargo
+    /// build --workspace` resolves it and never gets these features. A library the
+    /// tests need with other features gets a `<lib>-test` variant that the tests,
+    /// and binaries whose `required-features` only the tests enable, use.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub test_features: Vec<String>,
 }
 
 impl RepoConfig {
@@ -227,7 +225,7 @@ impl Default for RepoConfig {
             feature_platforms: Map::new(),
             skip_dev_dependency_cycles: false,
             workspace_manifests: false,
-            test_features: None,
+            test_features: Vec::new(),
         }
     }
 }
