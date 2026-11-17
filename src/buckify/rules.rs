@@ -94,6 +94,8 @@ pub fn buckify_dep_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         buck_rules.push(Rule::BuildscriptRun(buildscript_run));
     }
 
+    apply_fixups(&mut buck_rules, node, ctx);
+
     buck_rules
 }
 
@@ -229,7 +231,30 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         buck_rules.push(Rule::BuildscriptRun(buildscript_run));
     }
 
+    apply_fixups(&mut buck_rules, node, ctx);
+
     buck_rules
+}
+
+/// Add the repository's `[fixups.<package>]` configuration to the package's rules.
+fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
+    let Some(fixup) = ctx.repo_config.fixups.get(&node.name) else {
+        return;
+    };
+    for rule in rules {
+        let (env, rustc_flags) = match rule {
+            Rule::RustLibrary(r) => (&mut r.env, &mut r.rustc_flags),
+            Rule::RustBinary(r) => (&mut r.env, &mut r.rustc_flags),
+            Rule::RustTest(r) => (&mut r.env, &mut r.rustc_flags),
+            Rule::BuildscriptRun(r) => {
+                r.env.extend(fixup.buildscript_env.clone());
+                continue;
+            }
+            _ => continue,
+        };
+        env.extend(fixup.env.clone());
+        rustc_flags.extend(fixup.rustc_flags.iter().cloned());
+    }
 }
 
 /// Vendors the package sources to `third-party` and returns the path.
@@ -610,6 +635,97 @@ mod tests {
                     assert_eq!(r.manifest_dir, ":vendor[crates/rig-core]");
                 }
                 _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn test_fixups_reach_buildscript_run_and_crate_rules() {
+        let manifest_dir = Utf8PathBuf::from("/registry/openssl-sys-0.9.117");
+        let target = |name: &str, kind: TargetKind, file: &str| BuckalTarget {
+            name: name.to_owned(),
+            kind: vec![kind],
+            src_path: manifest_dir.join(file),
+            doctest: true,
+            test: true,
+        };
+        let node = BuckalNode {
+            package_id: PackageId {
+                repr: "registry+https://github.com/rust-lang/crates.io-index#openssl-sys@0.9.117"
+                    .to_owned(),
+            },
+            name: "openssl-sys".to_owned(),
+            version: "0.9.117".to_owned(),
+            features: vec![],
+            kind: NodeKind::ThirdParty,
+            edition: Edition::E2021,
+            manifest_path: manifest_dir.join("Cargo.toml"),
+            targets: vec![
+                target("openssl_sys", TargetKind::Lib, "src/lib.rs"),
+                target(
+                    "build-script-main",
+                    TargetKind::CustomBuild,
+                    "build/main.rs",
+                ),
+            ],
+            source: Some("registry+https://github.com/rust-lang/crates.io-index".to_owned()),
+            links: Some("openssl".to_owned()),
+            checksum: Some("0".repeat(64)),
+        };
+
+        let mut ctx = test_ctx();
+        ctx.repo_config.fixups.insert(
+            "openssl-sys".to_owned(),
+            crate::config::PackageFixup {
+                buildscript_env: [
+                    ("OPENSSL_NO_VENDOR".to_owned(), "1".to_owned()),
+                    ("OPENSSL_LIB_DIR".to_owned(), "/opt/openssl/lib".to_owned()),
+                ]
+                .into(),
+                env: Default::default(),
+                rustc_flags: Set::from(["-Lnative=/opt/openssl/lib".to_owned()]),
+            },
+        );
+
+        let rules = buckify_dep_node(&node, &ctx);
+
+        let run = rules
+            .iter()
+            .find_map(|r| match r {
+                Rule::BuildscriptRun(r) => Some(r),
+                _ => None,
+            })
+            .expect("buildscript_run");
+        assert_eq!(
+            run.env.get("OPENSSL_NO_VENDOR").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            run.env.get("OPENSSL_LIB_DIR").map(String::as_str),
+            Some("/opt/openssl/lib")
+        );
+
+        let lib = rules
+            .iter()
+            .find_map(|r| match r {
+                Rule::RustLibrary(l) => Some(l),
+                _ => None,
+            })
+            .expect("rust_library");
+        assert!(lib.rustc_flags.contains("-Lnative=/opt/openssl/lib"));
+        // The generated flags are kept.
+        assert!(
+            lib.rustc_flags
+                .contains("@$(location :manifest[env_flags])")
+        );
+
+        // Other packages are untouched.
+        let mut other = node.clone();
+        other.name = "libc".to_owned();
+        let other_rules = buckify_dep_node(&other, &ctx);
+        for rule in &other_rules {
+            if let Rule::BuildscriptRun(r) = rule {
+                assert!(r.env.is_empty());
             }
         }
     }

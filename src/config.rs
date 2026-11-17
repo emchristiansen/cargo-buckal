@@ -167,6 +167,10 @@ pub struct RepoConfig {
     pub ignore_tests: bool,
     pub patch_fields: Set<String>,
     pub patch: RepoPatchConfig,
+    /// Per-package additions to the generated rules, keyed by package name
+    /// (`[fixups.<package>]`). Applies to every version of that package.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub fixups: Map<String, PackageFixup>,
 }
 
 impl Default for RepoConfig {
@@ -176,8 +180,27 @@ impl Default for RepoConfig {
             ignore_tests: true,
             patch_fields: Set::new(),
             patch: RepoPatchConfig::default(),
+            fixups: Map::new(),
         }
     }
+}
+
+/// Knowledge about a package that Cargo metadata does not carry, such as how its
+/// build script finds a system library (e.g. a pinned OpenSSL instead of a vendored
+/// copy). Added to the generated rules on every regeneration, so no generated BUCK
+/// file needs a hand edit.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct PackageFixup {
+    /// Environment for running the package's build script (`buildscript_run`).
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub buildscript_env: Map<String, String>,
+    /// Environment for compiling the package's crates (library, binaries, tests).
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub env: Map<String, String>,
+    /// Extra rustc flags for the package's crates (library, binaries, tests).
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub rustc_flags: Set<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -250,5 +273,46 @@ mod tests {
 
         assert_eq!(patch.from, "0.26.0");
         assert_eq!(patch.to, "0.27.2");
+    }
+
+    #[test]
+    fn test_repo_config_deserializes_fixups() {
+        let config: RepoConfig = toml::from_str(
+            r#"
+                [fixups.openssl-sys]
+                buildscript_env = { OPENSSL_NO_VENDOR = "1", OPENSSL_LIB_DIR = "/opt/openssl/lib" }
+                rustc_flags = ["-Lnative=/opt/openssl/lib"]
+            "#,
+        )
+        .expect("failed to deserialize repo config");
+
+        let fixup = config.fixups.get("openssl-sys").expect("missing fixup");
+        assert_eq!(
+            fixup
+                .buildscript_env
+                .get("OPENSSL_NO_VENDOR")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            fixup
+                .buildscript_env
+                .get("OPENSSL_LIB_DIR")
+                .map(String::as_str),
+            Some("/opt/openssl/lib")
+        );
+        assert!(fixup.env.is_empty());
+        assert!(fixup.rustc_flags.contains("-Lnative=/opt/openssl/lib"));
+    }
+
+    #[test]
+    fn test_repo_config_rejects_unknown_fixup_key() {
+        let result = toml::from_str::<RepoConfig>(
+            r#"
+                [fixups.openssl-sys]
+                build_env = { OPENSSL_NO_VENDOR = "1" }
+            "#,
+        );
+        assert!(result.is_err(), "a misspelt fixup key must not be ignored");
     }
 }
