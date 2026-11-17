@@ -576,6 +576,8 @@ fn test_patch_redirects_generated_dependency_label() {
         host_platform_differences: None,
         host_platform_difference_digests: None,
         buildscript_inputs: Default::default(),
+        wasm_modules: Default::default(),
+        declared_test_env: Default::default(),
         root: Some(old_crate.package_id.clone()),
         resolve,
         workspace_root,
@@ -607,6 +609,8 @@ fn test_patch_redirects_generated_dependency_label() {
         host_platform_differences: None,
         host_platform_difference_digests: None,
         buildscript_inputs: Default::default(),
+        wasm_modules: Default::default(),
+        declared_test_env: Default::default(),
         repo_config: RepoConfig {
             patch: RepoPatchConfig {
                 version: [(

@@ -203,6 +203,36 @@ pub struct RepoConfig {
     /// `[platforms]`: roles of the configured `feature_platforms`.
     #[serde(skip_serializing_if = "PlatformsConfig::is_empty")]
     pub platforms: PlatformsConfig,
+    /// `[wasm]`: wasm32 modules built from their own Cargo graph.
+    #[serde(skip_serializing_if = "WasmConfig::is_empty")]
+    pub wasm: WasmConfig,
+}
+
+/// `[wasm]` of `buckal.toml`: the first-party packages whose
+/// `[package.metadata.buck2.wasm]` (`features`, `profile`) generation builds as a
+/// wasm32 cdylib, each from its own Cargo graph (`cargo build -p <package>
+/// --target wasm32-unknown-unknown --features <features>`) with that Cargo
+/// profile's flags. Every library of the graph gets a `<lib>-wasm` variant; the
+/// package gets `configured_alias(name = "lib-wasm-wasm32")` configured for
+/// `platform`, whose `[cdylib]` is the module. A test whose dependency closure
+/// reaches a package declaring `[package.metadata.buck2.test-env]` `VAR = { wasm =
+/// "<package>" }` gets `VAR = "$(location <package>:lib-wasm-wasm32[cdylib])"` in
+/// its `run_env`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct WasmConfig {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub packages: Vec<String>,
+    /// The wasm32 execution target platform, e.g.
+    /// `root//buck2/platforms/wasm:wasm32_unknown_unknown`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+}
+
+impl WasmConfig {
+    pub fn is_empty(&self) -> bool {
+        self.packages.is_empty() && self.platform.is_none()
+    }
 }
 
 /// `[platforms]` of `buckal.toml`.
@@ -228,11 +258,17 @@ impl RepoConfig {
     /// Workspace-level settings that change the rules of every first-party package,
     /// serialized for the cache fingerprints (empty when none is set).
     pub fn first_party_generation_key(&self) -> Vec<u8> {
-        if self.workspace_manifests {
+        let mut key = if self.workspace_manifests {
             b"workspace_manifests".to_vec()
         } else {
             Vec::new()
+        };
+        // Declared test environments reach tests of other packages.
+        if !self.wasm.is_empty() {
+            key.extend(b"wasm");
+            key.extend(serde_json::to_vec(&self.wasm).expect("wasm config serializes"));
         }
+        key
     }
 }
 
@@ -249,6 +285,7 @@ impl Default for RepoConfig {
             workspace_manifests: false,
             test_features: Vec::new(),
             platforms: PlatformsConfig::default(),
+            wasm: WasmConfig::default(),
         }
     }
 }

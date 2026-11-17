@@ -14,6 +14,7 @@ pub mod platform_features;
 pub mod registry;
 pub mod resolve;
 pub mod utils;
+pub mod wasm;
 pub mod workspace_inputs;
 
 use std::sync::OnceLock;

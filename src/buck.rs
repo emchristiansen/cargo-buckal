@@ -25,6 +25,18 @@ pub enum Rule {
     RustBinary(RustBinary),
     RustTest(RustTest),
     BuildscriptRun(BuildscriptRun),
+    ConfiguredAlias(ConfiguredAlias),
+}
+
+/// Buck2's native `configured_alias`: `actual` configured for `platform`.
+#[derive(Serialize, Debug, PartialEq, Clone)]
+#[serde(rename = "configured_alias")]
+pub struct ConfiguredAlias {
+    pub name: String,
+    pub actual: String,
+    pub platform: String,
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub visibility: Set<String>,
 }
 
 impl Rule {
@@ -41,6 +53,7 @@ impl Rule {
             Rule::RustBinary(r) => Some(&r.name),
             Rule::RustTest(r) => Some(&r.name),
             Rule::BuildscriptRun(r) => Some(&r.name),
+            Rule::ConfiguredAlias(r) => Some(&r.name),
         }
     }
 
@@ -1441,6 +1454,7 @@ fn rule_map_key(rule: &Rule) -> String {
         Rule::RustBinary(r) => format!("rust_binary[{}]", r.name),
         Rule::RustTest(r) => format!("rust_test[{}]", r.name),
         Rule::BuildscriptRun(r) => format!("buildscript_run[{}]", r.name),
+        Rule::ConfiguredAlias(r) => format!("configured_alias[{}]", r.name),
     }
 }
 

@@ -224,6 +224,11 @@ pub(super) fn host_variant_name(name: &str) -> String {
     format!("{name}-host")
 }
 
+/// The name (or label) of the variant of the rule `name` in `module`'s graph.
+pub(super) fn wasm_variant_name(name: &str, module: &str) -> String {
+    format!("{name}-wasm-{module}")
+}
+
 /// The name (or label) of the test variant of the rule `name`.
 pub(super) fn test_variant_name(name: &str) -> String {
     format!("{name}-test")
@@ -389,7 +394,20 @@ fn dep_label(
             dep.name, dep_node.name
         )
     })?;
-    if node.platform_features.test_context {
+    if let Some(module) = &node.platform_features.wasm_rules {
+        // A wasm module's own graph: its target dependencies are that module's
+        // variants; build dependencies and proc-macros are host compilations.
+        if !is_host_context(node, kind)
+            && dep_node
+                .platform_features
+                .wasm_variants
+                .contains_key(module)
+        {
+            target_label = wasm_variant_name(&target_label, module);
+        } else if is_host_context(node, kind) && uses_host_variant(node, dep_node) {
+            target_label = host_variant_name(&target_label);
+        }
+    } else if node.platform_features.test_context {
         if let Some(variant) = test_context_variant(node, kind, dep_node) {
             target_label = variant(&target_label);
         }
@@ -536,6 +554,8 @@ mod tests {
             host_platform_differences: None,
             host_platform_difference_digests: None,
             buildscript_inputs: Default::default(),
+            wasm_modules: Default::default(),
+            declared_test_env: Default::default(),
             root: Some(root_id.clone()),
             resolve: BuckalResolve {
                 dag,
@@ -644,6 +664,8 @@ mod tests {
             host_platform_differences: None,
             host_platform_difference_digests: None,
             buildscript_inputs: Default::default(),
+            wasm_modules: Default::default(),
+            declared_test_env: Default::default(),
             root: None,
             resolve: BuckalResolve {
                 dag,
@@ -733,6 +755,8 @@ mod tests {
             host_platform_differences: None,
             host_platform_difference_digests: None,
             buildscript_inputs: Default::default(),
+            wasm_modules: Default::default(),
+            declared_test_env: Default::default(),
             root: None,
             resolve: BuckalResolve {
                 dag,

@@ -13,6 +13,7 @@ use crate::{
     },
     resolve::{BuckalNode, BuckalResolve, NodeKind},
     utils::{UnwrapOrExit, get_buck2_root},
+    wasm::{WASM_TRIPLE, package_dir, resolve_modules, test_env_declaration},
     workspace_inputs::{WorkspaceInputs, resolve_workspace_inputs},
 };
 
@@ -43,6 +44,11 @@ pub struct BuckalContext {
     /// The files outside each first-party package that its build-script runs get
     /// (`[fixups.<pkg>.buildscript.run] inputs`, expanded), by package name.
     pub buildscript_inputs: std::collections::BTreeMap<String, WorkspaceInputs>,
+    /// With `[wasm]`: each module's Buck package directory, by package name.
+    pub wasm_modules: std::collections::BTreeMap<String, String>,
+    /// With `[wasm]`: each first-party package's `[package.metadata.buck2.test-env]`
+    /// (`{variable: wasm package}`), where it declares one.
+    pub declared_test_env: HashMap<PackageId, std::collections::BTreeMap<String, String>>,
 }
 
 impl BuckalContext {
@@ -211,6 +217,68 @@ impl BuckalContext {
 
         let workspace_members = Some(cargo_metadata.workspace_members.iter().cloned().collect());
 
+        let mut wasm_modules = std::collections::BTreeMap::new();
+        let mut declared_test_env = HashMap::new();
+        if !repo_config.wasm.is_empty() {
+            let wasm = &repo_config.wasm;
+            let Some(platform) = repo_config
+                .feature_platforms
+                .iter()
+                .find_map(|(name, triple)| (triple == WASM_TRIPLE).then_some(name.clone()))
+            else {
+                buckal_error!(format!(
+                    "`[wasm]` needs a `feature_platforms` entry for {WASM_TRIPLE}"
+                ));
+                std::process::exit(1);
+            };
+            if wasm.platform.is_none() {
+                buckal_error!(
+                    "`[wasm] platform` is required: the wasm32 target platform the modules are configured for"
+                );
+                std::process::exit(1);
+            }
+            let first_party: std::collections::BTreeMap<String, PackageId> = resolve
+                .nodes()
+                .filter(|n| matches!(n.kind, NodeKind::FirstParty { .. }))
+                .map(|n| (n.name.clone(), n.package_id.clone()))
+                .collect();
+            let manifest_value: toml::Value = toml::from_str(&workspace_content)
+                .unwrap_or_exit_ctx("failed to parse workspace Cargo.toml");
+            let variants = resolve_modules(
+                &wasm.packages,
+                &platform,
+                manifest_path.as_deref(),
+                &manifest_value,
+                &packages_map,
+                &first_party,
+            )
+            .unwrap_or_else(|error| {
+                buckal_error!(format!("{error:#}"));
+                std::process::exit(1);
+            });
+            for (id, by_module) in variants {
+                if let Some(&idx) = resolve.index_map.get(&id) {
+                    resolve.dag[idx].platform_features.wasm_variants = by_module;
+                }
+            }
+            for module in &wasm.packages {
+                let manifest = &packages_map[&first_party[module]].manifest_path;
+                wasm_modules.insert(
+                    module.clone(),
+                    package_dir(manifest, &buck2_root).unwrap_or_default(),
+                );
+            }
+            for id in first_party.values() {
+                let declared = test_env_declaration(&packages_map[id]).unwrap_or_else(|error| {
+                    buckal_error!(format!("{error:#}"));
+                    std::process::exit(1);
+                });
+                if !declared.is_empty() {
+                    declared_test_env.insert(id.clone(), declared);
+                }
+            }
+        }
+
         let inputs = resolve_workspace_inputs(
             &mut repo_config,
             &resolve,
@@ -233,6 +301,8 @@ impl BuckalContext {
             host_platform_differences,
             host_platform_difference_digests,
             buildscript_inputs: inputs.by_package,
+            wasm_modules,
+            declared_test_env,
             workspace_root: cargo_metadata.workspace_root.clone(),
             workspace_inherit,
             no_merge: false,
@@ -391,6 +461,8 @@ mod tests {
             host_platform_differences: None,
             host_platform_difference_digests: None,
             buildscript_inputs: Default::default(),
+            wasm_modules: Default::default(),
+            declared_test_env: Default::default(),
             root: None,
             resolve,
             workspace_root: Utf8PathBuf::from("/tmp"),

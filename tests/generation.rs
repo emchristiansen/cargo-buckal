@@ -3871,3 +3871,130 @@ fn test_per_test_run_env_and_runtime_tools_through_generation() {
     f.migrate(&["--no-cache"]);
     assert_eq!(f.buck("app"), app);
 }
+
+#[test]
+fn test_wasm_modules_from_their_own_graph_through_generation() {
+    // Main built each `[package.metadata.buck2.wasm]` package as a wasm32 cdylib
+    // from its own Cargo graph and profile, and gave tests that reach a
+    // `[package.metadata.buck2.test-env]` declaration its path. `module` uses `d`
+    // with `m` only; `other` uses `d` with `o`, so the workspace's wasm32
+    // resolution of `d` has both, the module's own graph `m` alone.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"module\", \"d\", \"other\", \"testkit\", \"reader\", \"loner\"]\n\n\
+         [profile.release]\noverflow-checks = true\n\n\
+         [profile.wasm-module]\ninherits = \"release\"\nopt-level = \"s\"\nlto = true\ncodegen-units = 1\n",
+    );
+    write(
+        &f.ws.join("module/Cargo.toml"),
+        &manifest(
+            "module",
+            "[lib]\ncrate-type = [\"cdylib\", \"rlib\"]\n[dependencies]\nd = { path = \"../d\", features = [\"m\"] }\n\
+             [package.metadata.buck2.wasm]\nfeatures = []\nprofile = \"wasm-module\"\n",
+        ),
+    );
+    write(
+        &f.ws.join("d/Cargo.toml"),
+        &manifest("d", "[features]\nm = []\no = []\n"),
+    );
+    write(
+        &f.ws.join("other/Cargo.toml"),
+        &manifest(
+            "other",
+            "[dependencies]\nd = { path = \"../d\", features = [\"o\"] }\n",
+        ),
+    );
+    write(
+        &f.ws.join("testkit/Cargo.toml"),
+        &manifest(
+            "testkit",
+            "[package.metadata.buck2.test-env]\nMODULE_WASM = { wasm = \"module\" }\n",
+        ),
+    );
+    write(
+        &f.ws.join("reader/Cargo.toml"),
+        &manifest(
+            "reader",
+            "[dev-dependencies]\ntestkit = { path = \"../testkit\" }\n",
+        ),
+    );
+    write(&f.ws.join("reader/tests/it.rs"), "");
+    write(&f.ws.join("loner/Cargo.toml"), &manifest("loner", ""));
+    for name in ["module", "d", "other", "testkit", "reader", "loner"] {
+        write(&f.ws.join(name).join("src/lib.rs"), "");
+    }
+    let platform = "root//buck2/platforms/wasm:wasm32_unknown_unknown";
+    let config = |packages: &str| {
+        format!(
+            "{}\n[wasm]\npackages = [{packages}]\nplatform = \"{platform}\"\n",
+            BUCKAL_TOML.split("[fixups.extra]").next().unwrap()
+        )
+    };
+    write(&f.ws.join("buckal.toml"), &config("\"module\""));
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+
+    // The module's variant: its own graph's dependencies, the profile's flags with
+    // link-time optimisation, for wasm32 only; the alias configures it.
+    let module = f.buck("module");
+    let variant = rule(&module, "module-wasm-module");
+    assert!(
+        module.contains("rust_library(\n    name = \"module-wasm-module\","),
+        "{module}"
+    );
+    assert_eq!(top_deps(variant), ["//d:d-wasm-module"], "{variant}");
+    for flag in [
+        "\"-Copt-level=s\"",
+        "\"-Coverflow-checks=on\"",
+        "\"-Ccodegen-units=1\"",
+        "\"-Clto=fat\"",
+    ] {
+        assert!(variant.contains(flag), "{flag}: {variant}");
+    }
+    assert!(
+        variant.contains(
+            "\"linux-x86_64\": {\n            \"target_compatible_with\": [\"prelude//:none\"]"
+        ),
+        "{variant}"
+    );
+    assert!(
+        module.contains(&format!(
+            "configured_alias(\n    name = \"lib-wasm-wasm32\",\n    actual = \":module-wasm-module\",\n    platform = \"{platform}\",\n"
+        )),
+        "{module}"
+    );
+    // `d` as the module's graph compiles it: `m` only, the profile without
+    // link-time optimisation; the workspace's own `d` keeps both features.
+    let d = f.buck("d");
+    let d_wasm = rule(&d, "d-wasm-module");
+    assert!(d_wasm.contains("    features = [\"m\"],\n"), "{d_wasm}");
+    assert!(d_wasm.contains("\"-Copt-level=s\""), "{d_wasm}");
+    assert!(!d_wasm.contains("-Clto"), "{d_wasm}");
+    assert!(rule(&d, "d").contains("\"o\""), "{d}");
+    assert!(!f.buck("other").contains("-wasm"), "{}", f.buck("other"));
+
+    // Tests reaching `testkit` (through a dev-dependency, or itself) get the
+    // module's path; others do not.
+    let value = "\"MODULE_WASM\": \"$(location //module:lib-wasm-wasm32[cdylib])\"";
+    let reader = f.buck("reader");
+    for name in ["it", "unittest"] {
+        assert!(rule(&reader, name).contains(value), "{name}: {reader}");
+    }
+    assert!(rule(&f.buck("testkit"), "unittest").contains(value));
+    assert!(!f.buck("loner").contains("MODULE_WASM"));
+    f.migrate(&["--no-cache"]);
+    assert_eq!(f.buck("module"), module);
+    assert_eq!(f.buck("reader"), reader);
+
+    // A declaration naming a module `[wasm]` does not build is refused.
+    write(&f.ws.join("buckal.toml"), &config(""));
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("`MODULE_WASM`, declared by `testkit`, names `module`, which `[wasm] packages` does not build"),
+        "{stderr}"
+    );
+}

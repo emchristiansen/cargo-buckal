@@ -19,12 +19,14 @@ use super::includes::{
     IncludeGap, UnprovidedInclude, in_nested_package, repository_path, unprovided_includes,
 };
 
-use super::deps::{host_variant_name, test_host_variant_name, test_variant_name};
+use super::deps::{
+    host_variant_name, test_host_variant_name, test_variant_name, wasm_variant_name,
+};
 use super::emit::{
     emit_buildscript_build, emit_buildscript_run, emit_cargo_manifest, emit_filegroup,
     emit_git_fetch, emit_http_archive, emit_rust_binary, emit_rust_library, emit_rust_test,
     host_variant_build_target, patch_with_buildscript, test_host_variant_build_target,
-    test_variant_build_target,
+    test_variant_build_target, wasm_variant_build_target,
 };
 
 /// Buckifies a third-party dependency into a list of BUCK rules.
@@ -117,6 +119,13 @@ pub fn buckify_dep_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         ctx,
     ));
     buck_rules.extend(test_host_variant_rules(
+        node,
+        lib_target,
+        &node.name,
+        &manifest_dir,
+        ctx,
+    ));
+    buck_rules.extend(wasm_variant_rules(
         node,
         lib_target,
         &node.name,
@@ -484,9 +493,20 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
             &manifest_dir,
             ctx,
         ));
+        buck_rules.extend(wasm_variant_rules(
+            node,
+            lib_target,
+            lib_name,
+            &manifest_dir,
+            ctx,
+        ));
     }
 
     apply_fixups(&mut buck_rules, node, ctx);
+    if let Err(error) = apply_declared_test_env(&mut buck_rules, node, ctx) {
+        buckal_error!("{:#}", error);
+        std::process::exit(1);
+    }
     match fixup_export_files(node, &buck_rules, ctx) {
         Ok(exports) => buck_rules.extend(exports.into_iter().map(Rule::ExportFile)),
         Err(error) => {
@@ -712,7 +732,7 @@ fn test_variant_rules(
         resolution,
         lib_target,
         &test_variant_name(lib_name),
-        test_variant_build_target,
+        &test_variant_build_target,
         manifest_dir,
         ctx,
     )
@@ -738,10 +758,165 @@ fn test_host_variant_rules(
         resolution,
         lib_target,
         &test_host_variant_name(lib_name),
-        test_host_variant_build_target,
+        &test_host_variant_build_target,
         manifest_dir,
         ctx,
     )
+}
+
+/// The rules of `node`'s wasm variant, if a `[wasm]` module's own graph compiles
+/// it: `<lib_name>-wasm` (and its build script rules) with that graph's
+/// resolution and the module's profile flags, for the wasm32 platform only. The
+/// module itself also gets `configured_alias(name = "lib-wasm-wasm32")`, configured
+/// for `[wasm] platform`, whose `[cdylib]` is the module.
+fn wasm_variant_rules(
+    node: &BuckalNode,
+    lib_target: &BuckalTarget,
+    lib_name: &str,
+    manifest_dir: &Utf8PathBuf,
+    ctx: &BuckalContext,
+) -> Vec<Rule> {
+    use crate::platform_features::{Edges, PlatformResolution};
+    let mut rules = Vec::new();
+    for (module, wasm) in &node.platform_features.wasm_variants {
+        let on = |set: &Set<String>| {
+            std::collections::BTreeMap::from([(wasm.platform.clone(), set.clone())])
+        };
+        let resolution = PlatformResolution {
+            features: on(&wasm.features),
+            deps: Edges {
+                normal: on(&wasm.normal),
+                build: if wasm.build.is_empty() {
+                    Default::default()
+                } else {
+                    on(&wasm.build)
+                },
+                dev: Default::default(),
+            },
+            host_variant_deps: node.platform_features.host_variant_deps.clone(),
+            wasm_rules: Some(module.clone()),
+            ..Default::default()
+        };
+        let name = wasm_variant_name(lib_name, module);
+        let mut variant = variant_rules(
+            node,
+            resolution,
+            lib_target,
+            &name,
+            &|target| wasm_variant_build_target(target, module),
+            manifest_dir,
+            ctx,
+        );
+        if let Some(Rule::RustLibrary(library)) = variant.first_mut() {
+            library.rustc_flags.extend(wasm.rustc_flags.iter().cloned());
+        }
+        if wasm.root
+            && let Some(platform) = &ctx.repo_config.wasm.platform
+        {
+            variant.push(Rule::ConfiguredAlias(crate::buck::ConfiguredAlias {
+                name: crate::wasm::MODULE_ALIAS.to_owned(),
+                actual: format!(":{name}"),
+                platform: platform.clone(),
+                visibility: Set::from(["PUBLIC".to_owned()]),
+            }));
+        }
+        rules.extend(variant);
+    }
+    rules
+}
+
+/// Give every test of `node` the `[package.metadata.buck2.test-env]` variables its
+/// dependency closure declares (the package itself, its dependencies and
+/// dev-dependencies, and their dependencies): `VAR = { wasm = "<module>" }` becomes
+/// `run_env` `VAR = "$(location //<module dir>:lib-wasm-wasm32[cdylib])"`. A module
+/// that `[wasm] packages` does not build, two declarations of one variable with
+/// different modules, and a variable the test's `run_env` already sets are refused.
+fn apply_declared_test_env(
+    rules: &mut [Rule],
+    node: &BuckalNode,
+    ctx: &BuckalContext,
+) -> anyhow::Result<()> {
+    if ctx.declared_test_env.is_empty() || !rules.iter().any(|r| matches!(r, Rule::RustTest(_))) {
+        return Ok(());
+    }
+    let mut reached = std::collections::BTreeSet::from([node.package_id.clone()]);
+    let mut pending: Vec<&cargo_metadata::PackageId> = Vec::new();
+    for (dep, dep_node) in ctx.resolve.deps_of(&node.package_id) {
+        if dep.dep_kinds.iter().any(|k| {
+            matches!(
+                k.kind,
+                cargo_metadata::DependencyKind::Normal
+                    | cargo_metadata::DependencyKind::Development
+            )
+        }) && reached.insert(dep_node.package_id.clone())
+        {
+            pending.push(&dep_node.package_id);
+        }
+    }
+    // Dev edges kept for the tests only (closing a package cycle).
+    if let Some(&idx) = ctx.resolve.index_map.get(&node.package_id) {
+        for (dep_idx, _) in ctx.resolve.test_only_edges.get(&idx).into_iter().flatten() {
+            let dep_node = &ctx.resolve.dag[*dep_idx];
+            if reached.insert(dep_node.package_id.clone()) {
+                pending.push(&dep_node.package_id);
+            }
+        }
+    }
+    while let Some(id) = pending.pop() {
+        for (dep, dep_node) in ctx.resolve.deps_of(id) {
+            if dep
+                .dep_kinds
+                .iter()
+                .any(|k| matches!(k.kind, cargo_metadata::DependencyKind::Normal))
+                && reached.insert(dep_node.package_id.clone())
+            {
+                pending.push(&dep_node.package_id);
+            }
+        }
+    }
+    let tested = &node.name;
+    let mut values: std::collections::BTreeMap<String, (String, String)> = Default::default();
+    for id in &reached {
+        let Some(declared) = ctx.declared_test_env.get(id) else {
+            continue;
+        };
+        let reader = ctx
+            .resolve
+            .nodes()
+            .find(|n| &n.package_id == id)
+            .map_or(id.repr.clone(), |n| n.name.clone());
+        for (variable, module) in declared {
+            let where_ = format!("`{tested}`: `{variable}`, declared by `{reader}`");
+            let Some(dir) = ctx.wasm_modules.get(module) else {
+                anyhow::bail!("{where_}, names `{module}`, which `[wasm] packages` does not build");
+            };
+            let value = format!("$(location //{dir}:{}[cdylib])", crate::wasm::MODULE_ALIAS);
+            match values.get(variable) {
+                Some((other, by)) if *other != value => {
+                    anyhow::bail!("{where_} and by `{by}` with different modules")
+                }
+                Some(_) => {}
+                None => {
+                    values.insert(variable.clone(), (value, reader.clone()));
+                }
+            }
+        }
+    }
+    for rule in rules {
+        let Rule::RustTest(test) = rule else {
+            continue;
+        };
+        for (variable, (value, reader)) in &values {
+            if test.run_env.contains_key(variable) {
+                anyhow::bail!(
+                    "`{tested}` test `{}`: `{variable}`, declared by `{reader}`, is already in its `run_env`",
+                    test.name
+                );
+            }
+            test.run_env.insert(variable.clone(), value.clone());
+        }
+    }
+    Ok(())
 }
 
 /// A variant `name` of `node`'s library compiled with `resolution`, with its own
@@ -751,7 +926,7 @@ fn variant_rules(
     resolution: crate::platform_features::PlatformResolution,
     lib_target: &BuckalTarget,
     name: &str,
-    build_target_of: fn(&BuckalTarget) -> BuckalTarget,
+    build_target_of: &dyn Fn(&BuckalTarget) -> BuckalTarget,
     manifest_dir: &Utf8PathBuf,
     ctx: &BuckalContext,
 ) -> Vec<Rule> {
@@ -1415,6 +1590,8 @@ mod tests {
             host_platform_differences: None,
             host_platform_difference_digests: None,
             buildscript_inputs: Default::default(),
+            wasm_modules: Default::default(),
+            declared_test_env: Default::default(),
             root: None,
             resolve: empty_resolve(),
             repo_config: RepoConfig {
@@ -1453,6 +1630,8 @@ mod tests {
             host_platform_differences: None,
             host_platform_difference_digests: None,
             buildscript_inputs: Default::default(),
+            wasm_modules: Default::default(),
+            declared_test_env: Default::default(),
             root: None,
             resolve: empty_resolve(),
             repo_config: RepoConfig {
@@ -1489,6 +1668,8 @@ mod tests {
             host_platform_differences: None,
             host_platform_difference_digests: None,
             buildscript_inputs: Default::default(),
+            wasm_modules: Default::default(),
+            declared_test_env: Default::default(),
             root: None,
             resolve: empty_resolve(),
             repo_config: RepoConfig {

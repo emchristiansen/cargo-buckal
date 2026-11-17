@@ -526,6 +526,15 @@ pub(super) fn test_variant_build_target(build_target: &BuckalTarget) -> BuckalTa
     }
 }
 
+/// The build script target of a package's variant in `module`'s wasm graph:
+/// `build-script-build` becomes `build-script-wasm-<module>-build`.
+pub(super) fn wasm_variant_build_target(build_target: &BuckalTarget, module: &str) -> BuckalTarget {
+    BuckalTarget {
+        name: format!("{}-wasm-{module}-build", get_build_name(&build_target.name)),
+        ..build_target.clone()
+    }
+}
+
 /// The build script target of a package's test host variant: `build-script-build`
 /// becomes `build-script-test-host-build`, so its rules are
 /// `build-script-test-host-build` and `build-script-test-host-run`.

@@ -319,6 +319,8 @@ mod tests {
             host_platform_differences: None,
             host_platform_difference_digests: None,
             buildscript_inputs: Default::default(),
+            wasm_modules: Default::default(),
+            declared_test_env: Default::default(),
             root: None,
             resolve: BuckalResolve {
                 dag,

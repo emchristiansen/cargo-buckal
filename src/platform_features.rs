@@ -224,6 +224,71 @@ pub struct PlatformResolution {
     /// for comparison with the plain rules' resolution on the execution platform.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plain_host_needs: Vec<HostVariant>,
+    /// The library as each wasm32 module's own Cargo graph compiles it (`[wasm]`),
+    /// by module package: emitted as the `<lib>-wasm-<module>` variants.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub wasm_variants: BTreeMap<String, WasmVariant>,
+    /// Set on the resolution `<lib>-wasm-<module>` rules are emitted from: the
+    /// module, whose variants their target dependencies are too. Never stored.
+    #[serde(skip)]
+    pub wasm_rules: Option<String>,
+}
+
+/// A library in a wasm32 module's own Cargo graph (target context).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WasmVariant {
+    /// The `feature_platforms` name of wasm32-unknown-unknown.
+    pub platform: String,
+    pub features: BTreeSet<String>,
+    /// Normal dependencies (target libraries of the graph, or proc-macros).
+    pub normal: BTreeSet<String>,
+    /// Build dependencies (host compilations).
+    pub build: BTreeSet<String>,
+    /// The Cargo profile's rustc flags.
+    pub rustc_flags: Vec<String>,
+    /// The module itself (the graph's root): built as the cdylib, with the
+    /// profile's link-time flags.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub root: bool,
+}
+
+/// A library of a package's own graph: `(features, normal deps, build deps)`.
+pub type PackageGraphLib = (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>);
+
+/// The target-context libraries of `cargo build -p <package> --target <triple>
+/// --features <features>`: `(features, normal deps, build deps)` by package.
+pub fn resolve_package_graph(
+    manifest_path: Option<&str>,
+    packages: &HashMap<PackageId, Package>,
+    package: &str,
+    features: &[String],
+    triple: &str,
+) -> Result<HashMap<PackageId, PackageGraphLib>> {
+    let output = run_unit_graph(
+        manifest_path,
+        triple,
+        GraphShape::Package(package, features),
+    )
+    .with_context(|| format!("failed to resolve `{package}`'s own graph for `{triple}`"))?;
+    let parsed = parse_unit_graph(&output, packages)
+        .with_context(|| format!("failed to read Cargo's unit graph of `{package}`"))?;
+    let target = parsed.target;
+    Ok(target
+        .features
+        .iter()
+        .filter(|(id, _)| target.libs.contains(*id))
+        .map(|(id, features)| {
+            let deps = target.deps.get(id).cloned().unwrap_or_default();
+            (
+                id.clone(),
+                (
+                    features.clone(),
+                    deps.role(EdgeRole::Normal).clone(),
+                    deps.role(EdgeRole::Build).clone(),
+                ),
+            )
+        })
+        .collect())
 }
 
 /// The resolution of one more compilation context of a package: the host variant of
@@ -490,6 +555,8 @@ enum GraphShape<'a> {
     Build,
     /// `cargo test --workspace --no-run`, with these `--features`.
     Test(&'a [String]),
+    /// `cargo build -p <package>`, with these `--features`: the package's own graph.
+    Package(&'a str, &'a [String]),
 }
 
 /// What a unit graph compiles besides each package's resolution.
@@ -914,6 +981,13 @@ fn run_unit_graph(manifest_path: Option<&str>, triple: &str, shape: GraphShape) 
                 cmd.args(["--features", &features.join(",")]);
             }
             "cargo test"
+        }
+        GraphShape::Package(package, features) => {
+            cmd.args(["build", "-p", package]);
+            if !features.is_empty() {
+                cmd.args(["--features", &features.join(",")]);
+            }
+            "cargo build -p"
         }
     };
     cmd.args(["--target", triple, "-Z", "unstable-options", "--unit-graph"]);

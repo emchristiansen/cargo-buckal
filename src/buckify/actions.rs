@@ -375,6 +375,7 @@ impl OwnedNames {
         match (function, name) {
             ("filegroup", Some(name)) => self.filegroups.contains(name),
             ("export_file", Some(name)) => self.exports.contains(name),
+            ("configured_alias", Some(name)) => name == crate::wasm::MODULE_ALIAS,
             _ => GENERATED_RULE_KINDS.contains(&function),
         }
     }
@@ -676,6 +677,8 @@ mod tests {
             host_platform_differences: None,
             host_platform_difference_digests: None,
             buildscript_inputs: Default::default(),
+            wasm_modules: Default::default(),
+            declared_test_env: Default::default(),
             root: Some(package_id),
             resolve,
             workspace_root: tmp_path.clone(),
