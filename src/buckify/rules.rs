@@ -192,10 +192,15 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
 
             let mut rust_test = emit_rust_test(node, test_target, &manifest_dir, &buckal_name, ctx);
 
-            // `CARGO_BIN_EXE_<name>` is not emitted here: the runtime path environment of a
-            // test has a single writer, the Buck2 fork's prelude, which resolves it to an
-            // absolute path when the test runs. A `$(location)` in `env` would be both
-            // relative and baked into `env!` at compile time.
+            // Cargo gives integration tests `CARGO_BIN_EXE_<name>` for every binary of the
+            // package, named after the binary (hyphens kept). The Buck2 fork's prelude is
+            // the single writer of that environment (compile time and run time); this
+            // only names the binaries.
+            for bin_target in &bin_targets {
+                rust_test
+                    .cargo_bin_exes
+                    .insert(bin_target.name.clone(), format!(":{}", bin_target.name));
+            }
 
             // Integration tests may use the package's library under its crate name.
             if let Some(lib_name) = &lib_buck_name {
@@ -528,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn test_integration_test_depends_on_library_and_gets_no_path_env() {
+    fn test_integration_test_names_binaries_and_gets_no_path_env() {
         // Package `my-tool` whose binaries are not named after the package
         // (as in a package `observatory_db_feedback_cli` with binary `observatory-feedback`).
         let lib = mock_target("my_tool", TargetKind::Lib);
@@ -541,7 +546,15 @@ mod tests {
 
         let test_rule = find_test(&rules, "cli");
         assert!(test_rule.deps.contains(":my_tool"));
-        // CARGO_BIN_EXE_* is the prelude's to write at run time, not a `$(location)` here.
+        // The binaries are named for the prelude, which writes CARGO_BIN_EXE_*.
+        assert_eq!(
+            test_rule.cargo_bin_exes,
+            [
+                ("helper".to_owned(), ":helper".to_owned()),
+                ("my-cli".to_owned(), ":my-cli".to_owned()),
+            ]
+            .into()
+        );
         assert!(
             !test_rule
                 .env
@@ -549,8 +562,15 @@ mod tests {
                 .any(|k| k.starts_with("CARGO_BIN_EXE_"))
         );
         assert!(test_rule.run_env.is_empty());
+        let content = gen_buck_content(&rules);
+        assert!(
+            content.contains("    cargo_bin_exes = {\n        \"helper\": \":helper\",\n        \"my-cli\": \":my-cli\",\n    },\n"),
+            "{content}"
+        );
 
+        // Cargo sets CARGO_BIN_EXE_* for integration tests (and benches) only.
         let unit = find_test(&rules, "unittest");
+        assert!(unit.cargo_bin_exes.is_empty());
         assert!(!unit.env.keys().any(|k| k.starts_with("CARGO_BIN_EXE_")));
     }
 

@@ -208,6 +208,11 @@ pub struct RustTest {
     /// Files the test reads at run time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resources: Option<Glob>,
+    /// The package's binaries by Cargo binary name, for `CARGO_BIN_EXE_<name>`.
+    /// The prelude derives the compile-time and the absolute run-time values from it;
+    /// the binaries are dependencies of the test through it.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub cargo_bin_exes: Map<String, String>,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub features: Set<String>,
     /// Per-platform attributes for the prelude's `platform` argument
@@ -816,6 +821,7 @@ impl RustTest {
         let deps = kwargs.get_list("deps");
         let run_env = kwargs.get_dict("run_env");
         let resources = kwargs.get_glob_opt("resources");
+        let cargo_bin_exes = kwargs.get_dict("cargo_bin_exes");
         Ok(RustTest {
             name,
             srcs,
@@ -829,6 +835,7 @@ impl RustTest {
             env,
             run_env,
             resources,
+            cargo_bin_exes,
             features,
             platform: Map::new(),
             rustc_flags,
@@ -1981,6 +1988,7 @@ mod tests {
             env: Map::from([("RUST_LOG".to_string(), "debug".to_string())]),
             run_env: Map::new(),
             resources: None,
+            cargo_bin_exes: Map::new(),
             features: Set::from(["default".to_string()]),
             platform: Map::new(),
             rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
