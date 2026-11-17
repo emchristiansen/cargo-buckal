@@ -209,6 +209,10 @@ pub struct RustTest {
     /// Environment for running the test only (not for compiling it).
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub run_env: Map<String, String>,
+    /// How the test executes (`[fixups.<pkg>] test_remote_execution`): a remote test
+    /// execution profile name, or `"disabled"`. Absent: the toolchain's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_execution: Option<String>,
     /// Files the test reads at run time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resources: Option<Glob>,
@@ -881,6 +885,7 @@ impl RustTest {
         let visibility = kwargs.get_list("visibility");
         let deps = kwargs.get_list("deps");
         let run_env = kwargs.get_dict("run_env");
+        let remote_execution = kwargs.get_str_opt("remote_execution");
         let resources = kwargs.get_glob_opt("resources");
         let cargo_bin_exes = kwargs.get_dict("cargo_bin_exes");
         let extra_resources = kwargs.get_list("extra_resources");
@@ -896,6 +901,7 @@ impl RustTest {
             exec_compatible_with,
             env,
             run_env,
+            remote_execution,
             resources,
             cargo_bin_exes,
             extra_resources,
@@ -2050,6 +2056,7 @@ mod tests {
             exec_compatible_with: Set::from(["prelude//os/constraints:macos".to_string()]),
             env: Map::from([("RUST_LOG".to_string(), "debug".to_string())]),
             run_env: Map::new(),
+            remote_execution: None,
             resources: None,
             cargo_bin_exes: Map::new(),
             extra_resources: Set::new(),
