@@ -291,13 +291,10 @@ impl BuckalContext {
                 .filter(|n| matches!(n.kind, NodeKind::FirstParty { .. }))
                 .map(|n| (n.name.clone(), n.package_id.clone()))
                 .collect();
-            let manifest_value: toml::Value = toml::from_str(&workspace_content)
-                .unwrap_or_exit_ctx("failed to parse workspace Cargo.toml");
             let variants = resolve_modules(
                 &wasm.packages,
                 &platform,
                 manifest_path.as_deref(),
-                &manifest_value,
                 &packages_map,
                 &first_party,
             )

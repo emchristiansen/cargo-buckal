@@ -252,43 +252,58 @@ pub struct WasmVariant {
     pub root: bool,
 }
 
-/// A library of a package's own graph: `(features, normal deps, build deps)`.
-pub type PackageGraphLib = (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>);
+/// A library of a package's own graph.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackageGraphLib {
+    pub features: BTreeSet<String>,
+    pub normal: BTreeSet<String>,
+    pub build: BTreeSet<String>,
+    /// The profile Cargo resolved for the library's unit (with the profile's
+    /// per-package overrides and Cargo's defaults applied).
+    pub profile: UnitProfile,
+}
 
 /// The target-context libraries of `cargo build -p <package> --target <triple>
-/// --features <features>`: `(features, normal deps, build deps)` by package.
+/// --features <features> --profile <profile>`, by package.
 pub fn resolve_package_graph(
     manifest_path: Option<&str>,
     packages: &HashMap<PackageId, Package>,
     package: &str,
     features: &[String],
+    profile: &str,
     triple: &str,
 ) -> Result<HashMap<PackageId, PackageGraphLib>> {
     let output = run_unit_graph(
         manifest_path,
         triple,
-        GraphShape::Package(package, features),
+        GraphShape::Package(package, features, profile),
     )
     .with_context(|| format!("failed to resolve `{package}`'s own graph for `{triple}`"))?;
     let parsed = parse_unit_graph(&output, packages)
         .with_context(|| format!("failed to read Cargo's unit graph of `{package}`"))?;
     let target = parsed.target;
-    Ok(target
+    target
         .features
         .iter()
         .filter(|(id, _)| target.libs.contains(*id))
         .map(|(id, features)| {
             let deps = target.deps.get(id).cloned().unwrap_or_default();
-            (
+            let profile = target
+                .profiles
+                .get(id)
+                .cloned()
+                .with_context(|| format!("Cargo's unit graph gives `{id}` no profile"))?;
+            Ok((
                 id.clone(),
-                (
-                    features.clone(),
-                    deps.role(EdgeRole::Normal).clone(),
-                    deps.role(EdgeRole::Build).clone(),
-                ),
-            )
+                PackageGraphLib {
+                    features: features.clone(),
+                    normal: deps.role(EdgeRole::Normal).clone(),
+                    build: deps.role(EdgeRole::Build).clone(),
+                    profile,
+                },
+            ))
         })
-        .collect())
+        .collect()
 }
 
 /// The resolution of one more compilation context of a package: the host variant of
@@ -591,8 +606,9 @@ enum GraphShape<'a> {
     Build,
     /// `cargo test --workspace --no-run`, with these `--features`.
     Test(&'a [String]),
-    /// `cargo build -p <package>`, with these `--features`: the package's own graph.
-    Package(&'a str, &'a [String]),
+    /// `cargo build -p <package>`, with these `--features` and this `--profile`:
+    /// the package's own graph.
+    Package(&'a str, &'a [String], &'a str),
 }
 
 /// What a unit graph compiles besides each package's resolution.
@@ -1018,8 +1034,8 @@ fn run_unit_graph(manifest_path: Option<&str>, triple: &str, shape: GraphShape) 
             }
             "cargo test"
         }
-        GraphShape::Package(package, features) => {
-            cmd.args(["build", "-p", package]);
+        GraphShape::Package(package, features, profile) => {
+            cmd.args(["build", "-p", package, "--profile", profile]);
             if !features.is_empty() {
                 cmd.args(["--features", &features.join(",")]);
             }
@@ -1080,6 +1096,25 @@ pub(crate) struct ContextTree {
     pub deps: HashMap<PackageId, RoleDeps>,
     /// Packages whose library (or proc-macro) is compiled in this context.
     pub libs: HashSet<PackageId>,
+    /// The profile of each package's library unit in this context.
+    pub profiles: HashMap<PackageId, UnitProfile>,
+}
+
+/// The profile Cargo resolved for one unit (`--unit-graph`'s `profile`).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct UnitProfile {
+    pub opt_level: String,
+    /// `"false"`, `"true"`, `"thin"`, `"fat"` or `"off"`.
+    pub lto: String,
+    pub codegen_units: Option<u32>,
+    /// A level (0, 1, 2) or a name (`"line-tables-only"`, ...).
+    pub debuginfo: serde_json::Value,
+    pub debug_assertions: bool,
+    pub overflow_checks: bool,
+    pub incremental: bool,
+    pub panic: String,
+    /// `{"resolved": "None" | {"Named": <level>}}` (or `"deferred"`).
+    pub strip: serde_json::Value,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -1105,6 +1140,7 @@ struct Unit {
     mode: String,
     features: Vec<String>,
     dependencies: Vec<UnitDep>,
+    profile: Option<UnitProfile>,
 }
 
 #[derive(Deserialize)]
@@ -1201,6 +1237,9 @@ pub(crate) fn parse_unit_graph(
             .extend(u.features.iter().cloned());
         if u.is_lib_build() {
             context.libs.insert(id.clone());
+            if let Some(profile) = &u.profile {
+                context.profiles.insert(id.clone(), profile.clone());
+            }
         }
         let deps = context.deps.entry(id).or_default();
         let role = u.edge_role();

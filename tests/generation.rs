@@ -4135,6 +4135,73 @@ fn test_a_changed_test_env_declaration_reaches_a_cached_migrate() {
 }
 
 #[test]
+fn test_wasm_flags_are_each_units_resolved_profile() {
+    // Fable N16: Cargo strips debuginfo by default when a profile has none (a
+    // release-derived profile without `strip`), and a per-package override
+    // changes that package's units only. Both come from each unit's profile in
+    // the module's `--profile` unit graph.
+    let f = fixture();
+    let workspace = |overrides: &str| {
+        format!(
+            "[workspace]\nresolver = \"2\"\nmembers = [\"module\", \"d\"]\n\n\
+             [profile.wasm-module]\ninherits = \"release\"\nopt-level = \"s\"\n{overrides}"
+        )
+    };
+    write(&f.ws.join("Cargo.toml"), &workspace(""));
+    write(
+        &f.ws.join("module/Cargo.toml"),
+        &manifest(
+            "module",
+            "[lib]\ncrate-type = [\"cdylib\", \"rlib\"]\n[dependencies]\nd = { path = \"../d\" }\n\
+             [package.metadata.buck2.wasm]\nfeatures = []\nprofile = \"wasm-module\"\n",
+        ),
+    );
+    write(&f.ws.join("d/Cargo.toml"), &manifest("d", ""));
+    for name in ["module", "d"] {
+        write(&f.ws.join(name).join("src/lib.rs"), "");
+    }
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!(
+            "{}\n[wasm]\npackages = [\"module\"]\nplatform = \"root//buck2/platforms/wasm:wasm32_unknown_unknown\"\n",
+            BUCKAL_TOML.split("[fixups.extra]").next().unwrap()
+        ),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let module = f.buck("module");
+    let variant = rule(&module, "module-wasm-module");
+    for flag in [
+        "\"-Copt-level=s\"",
+        "\"-Cdebuginfo=0\"",
+        "\"-Cstrip=debuginfo\"",
+        "\"-Ccodegen-units=16\"",
+    ] {
+        assert!(variant.contains(flag), "{flag}: {variant}");
+    }
+    let d = f.buck("d");
+    let d_wasm = rule(&d, "d-wasm-module");
+    assert!(d_wasm.contains("\"-Copt-level=s\""), "{d_wasm}");
+    assert!(d_wasm.contains("\"-Cstrip=debuginfo\""), "{d_wasm}");
+
+    // A per-package override: `d`'s units only.
+    write(
+        &f.ws.join("Cargo.toml"),
+        &workspace("\n[profile.wasm-module.package.d]\nopt-level = 1\n"),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(rule(&f.buck("module"), "module-wasm-module"), variant);
+    let d = f.buck("d");
+    let d_wasm = rule(&d, "d-wasm-module");
+    assert!(d_wasm.contains("\"-Copt-level=1\""), "{d_wasm}");
+    assert!(!d_wasm.contains("\"-Copt-level=s\""), "{d_wasm}");
+    assert!(d_wasm.contains("\"-Cstrip=debuginfo\""), "{d_wasm}");
+}
+
+#[test]
 fn test_per_test_unset_run_env_through_generation() {
     // N14: a single test can drop a key of the package's `test_run_env` (an empty
     // string stays a value).

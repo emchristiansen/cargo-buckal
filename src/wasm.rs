@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use anyhow::{Context, Result, bail};
 use cargo_metadata::{Package, PackageId, camino::Utf8PathBuf};
 
-use crate::platform_features::{WasmVariant, resolve_package_graph};
+use crate::platform_features::{UnitProfile, WasmVariant, resolve_package_graph};
 
 /// The target triple of the modules.
 pub const WASM_TRIPLE: &str = "wasm32-unknown-unknown";
@@ -115,108 +115,64 @@ pub fn test_env_declaration(package: &Package) -> Result<BTreeMap<String, String
         .collect()
 }
 
-/// The rustc flags of Cargo profile `name` defined (or built in) in the workspace
-/// manifest `manifest`: `(every crate's, the linked module's own)`. Cargo passes
-/// `-C opt-level`, `-C debuginfo`, `-C debug-assertions`, `-C overflow-checks`
-/// and `-C codegen-units` to every crate, `-C panic=abort` and `-C strip` when
-/// set, and `-C lto` to the final artifact.
-pub fn profile_flags(manifest: &toml::Value, name: &str) -> Result<(Vec<String>, Vec<String>)> {
-    let profiles = manifest.get("profile").and_then(|p| p.as_table());
-    let mut chain: Vec<&toml::value::Table> = Vec::new();
-    let mut current = name.to_owned();
-    let base = loop {
-        let defined = profiles
-            .and_then(|p| p.get(&current))
-            .and_then(|p| p.as_table());
-        match (current.as_str(), defined) {
-            ("dev" | "release", defined) => {
-                chain.extend(defined);
-                break current.clone();
-            }
-            (_, Some(table)) => {
-                chain.push(table);
-                let Some(parent) = table.get("inherits").and_then(|i| i.as_str()) else {
-                    bail!("Cargo profile `{current}` has no `inherits`");
-                };
-                if chain.len() > 16 {
-                    bail!("Cargo profile `{name}` inherits in a cycle");
-                }
-                current = parent.to_owned();
-            }
-            (_, None) => {
-                bail!("Cargo profile `{current}` is not defined in the workspace manifest")
-            }
-        }
+/// The rustc flags of a unit compiled with `profile`, as Cargo resolved it:
+/// `(the unit's, the linked module's own)`. Cargo passes `-C opt-level`, `-C
+/// debuginfo`, `-C debug-assertions`, `-C overflow-checks` and `-C codegen-units`
+/// (its default when unset: 256 for an incremental profile, else 16) to every
+/// unit, `-C panic=abort` and `-C strip` when not off, and `-C lto` to the final
+/// artifact. A strip Cargo left deferred is resolved as Cargo does: `debuginfo`
+/// when the unit has no debuginfo.
+pub fn profile_flags(profile: &UnitProfile) -> Result<(Vec<String>, Vec<String>)> {
+    let debuginfo = match &profile.debuginfo {
+        serde_json::Value::Number(level) => level.to_string(),
+        serde_json::Value::String(name) => name.clone(),
+        other => bail!("unknown debuginfo `{other}` in Cargo's unit profile"),
     };
-    let release = base == "release";
-    let mut settings: BTreeMap<&str, toml::Value> = BTreeMap::from([
-        (
-            "opt-level",
-            toml::Value::Integer(if release { 3 } else { 0 }),
-        ),
-        ("debug", toml::Value::Boolean(!release)),
-        ("debug-assertions", toml::Value::Boolean(!release)),
-        ("overflow-checks", toml::Value::Boolean(!release)),
-        (
-            "codegen-units",
-            toml::Value::Integer(if release { 16 } else { 256 }),
-        ),
-        ("lto", toml::Value::Boolean(false)),
-        ("panic", toml::Value::String("unwind".to_owned())),
-    ]);
-    // The base first, then each profile that inherits it.
-    for table in chain.iter().rev() {
-        for (key, value) in table.iter() {
-            settings.insert(key.as_str(), value.clone());
-        }
-    }
-    if let Some(packages) = chain.iter().find_map(|t| t.get("package")) {
-        bail!("Cargo profile `{name}`: per-package overrides (`{packages}`) are not supported");
-    }
-    let text = |v: &toml::Value| match v {
-        toml::Value::String(s) => s.clone(),
-        other => other.to_string(),
-    };
-    let on_off = |key: &str| match &settings[key] {
-        toml::Value::Boolean(true) => "on",
-        _ => "off",
-    };
-    let debuginfo = match &settings["debug"] {
-        toml::Value::Boolean(true) => "2".to_owned(),
-        toml::Value::Boolean(false) => "0".to_owned(),
-        toml::Value::String(s) => match s.as_str() {
-            "none" => "0".to_owned(),
-            "limited" => "1".to_owned(),
-            "full" => "2".to_owned(),
-            other => other.to_owned(),
-        },
-        other => text(other),
-    };
+    let codegen_units = profile
+        .codegen_units
+        .unwrap_or(if profile.incremental { 256 } else { 16 });
+    let on_off = |on: bool| if on { "on" } else { "off" };
     let mut flags = vec![
-        format!("-Copt-level={}", text(&settings["opt-level"])),
+        format!("-Copt-level={}", profile.opt_level),
         format!("-Cdebuginfo={debuginfo}"),
-        format!("-Cdebug-assertions={}", on_off("debug-assertions")),
-        format!("-Coverflow-checks={}", on_off("overflow-checks")),
-        format!("-Ccodegen-units={}", text(&settings["codegen-units"])),
+        format!("-Cdebug-assertions={}", on_off(profile.debug_assertions)),
+        format!("-Coverflow-checks={}", on_off(profile.overflow_checks)),
+        format!("-Ccodegen-units={codegen_units}"),
     ];
-    if text(&settings["panic"]) == "abort" {
+    if profile.panic == "abort" {
         flags.push("-Cpanic=abort".to_owned());
     }
-    if let Some(strip) = settings.get("strip") {
-        let strip = match strip {
-            toml::Value::Boolean(true) => "symbols".to_owned(),
-            toml::Value::Boolean(false) => "none".to_owned(),
-            other => text(other),
-        };
-        if strip != "none" {
-            flags.push(format!("-Cstrip={strip}"));
-        }
+    let strip_level = |inner: &serde_json::Value| match inner {
+        serde_json::Value::String(none) if none == "None" => Some(None),
+        serde_json::Value::Object(named) => named
+            .get("Named")
+            .and_then(|n| n.as_str())
+            .map(|n| (n != "none").then(|| n.to_owned())),
+        _ => None,
+    };
+    let strip = match &profile.strip {
+        serde_json::Value::Object(strip) => match (strip.get("resolved"), strip.get("deferred")) {
+            (Some(inner), None) => strip_level(inner),
+            (None, Some(inner)) if debuginfo == "0" => {
+                strip_level(inner).map(|level| level.or_else(|| Some("debuginfo".to_owned())))
+            }
+            (None, Some(inner)) => strip_level(inner),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(strip) = strip else {
+        bail!("unknown strip `{}` in Cargo's unit profile", profile.strip);
+    };
+    if let Some(strip) = strip {
+        flags.push(format!("-Cstrip={strip}"));
     }
-    let root = match &settings["lto"] {
-        toml::Value::Boolean(true) => vec!["-Clto=fat".to_owned()],
-        toml::Value::String(s) if s == "fat" || s == "thin" => vec![format!("-Clto={s}")],
-        toml::Value::String(s) if s == "off" => vec!["-Clto=off".to_owned()],
-        _ => Vec::new(),
+    let root = match profile.lto.as_str() {
+        "true" | "fat" => vec!["-Clto=fat".to_owned()],
+        "thin" => vec!["-Clto=thin".to_owned()],
+        "off" => vec!["-Clto=off".to_owned()],
+        "false" => Vec::new(),
+        other => bail!("unknown lto `{other}` in Cargo's unit profile"),
     };
     Ok((flags, root))
 }
@@ -229,7 +185,6 @@ pub fn resolve_modules(
     modules: &[String],
     platform: &str,
     manifest_path: Option<&str>,
-    workspace_manifest: &toml::Value,
     packages: &HashMap<PackageId, Package>,
     first_party: &BTreeMap<String, PackageId>,
 ) -> Result<HashMap<PackageId, BTreeMap<String, WasmVariant>>> {
@@ -245,13 +200,12 @@ pub fn resolve_modules(
         let Some(declaration) = module_declaration(&packages[id])? else {
             bail!("`[wasm] packages`: `{module}` declares no `[package.metadata.buck2.wasm]`");
         };
-        let (flags, root_flags) = profile_flags(workspace_manifest, &declaration.profile)
-            .with_context(|| format!("`[wasm] packages`: `{module}`"))?;
         let graph = resolve_package_graph(
             manifest_path,
             packages,
             module,
             &declaration.features,
+            &declaration.profile,
             WASM_TRIPLE,
         )?;
         if !graph.contains_key(id) {
@@ -259,18 +213,19 @@ pub fn resolve_modules(
                 "`[wasm] packages`: `{module}`'s own graph does not compile its library for {WASM_TRIPLE}"
             );
         }
-        for (pkg, (features, normal, build)) in graph {
+        for (pkg, lib) in graph {
             let root = &pkg == id;
+            let (mut rustc_flags, root_flags) = profile_flags(&lib.profile)
+                .with_context(|| format!("`[wasm] packages`: `{module}`: `{pkg}`"))?;
+            if root {
+                rustc_flags.extend(root_flags);
+            }
             let variant = WasmVariant {
                 platform: platform.to_owned(),
-                features,
-                normal,
-                build,
-                rustc_flags: if root {
-                    flags.iter().chain(&root_flags).cloned().collect()
-                } else {
-                    flags.clone()
-                },
+                features: lib.features,
+                normal: lib.normal,
+                build: lib.build,
+                rustc_flags,
                 root,
             };
             variants
@@ -294,15 +249,19 @@ pub fn package_dir(manifest: &Utf8PathBuf, root: &Utf8PathBuf) -> Option<String>
 #[cfg(test)]
 mod tests {
     use super::profile_flags;
+    use crate::platform_features::UnitProfile;
+
+    fn unit_profile(json: &str) -> UnitProfile {
+        serde_json::from_str(json).unwrap()
+    }
 
     #[test]
-    fn test_profile_flags_follow_inheritance() {
-        let manifest: toml::Value = toml::from_str(
-            "[profile.release]\ndebug = 0\noverflow-checks = true\nstrip = \"debuginfo\"\n\n\
-             [profile.module]\ninherits = \"release\"\nopt-level = \"s\"\nlto = true\ncodegen-units = 1\n",
-        )
-        .unwrap();
-        let (flags, root) = profile_flags(&manifest, "module").unwrap();
+    fn test_profile_flags_from_a_units_resolved_profile() {
+        // As `cargo build --profile <p> --unit-graph` (cargo 1.100) gives it.
+        let module = unit_profile(
+            r#"{"name": "module", "opt_level": "s", "lto": "true", "codegen_backend": null, "codegen_units": 1, "debuginfo": 0, "split_debuginfo": null, "debug_assertions": false, "overflow_checks": true, "rpath": false, "incremental": false, "panic": "unwind", "strip": {"resolved": {"Named": "debuginfo"}}, "trim_paths": "none"}"#,
+        );
+        let (flags, root) = profile_flags(&module).unwrap();
         assert_eq!(
             flags,
             [
@@ -315,9 +274,33 @@ mod tests {
             ]
         );
         assert_eq!(root, ["-Clto=fat"]);
-        let (flags, root) = profile_flags(&manifest, "release").unwrap();
-        assert_eq!(flags[0], "-Copt-level=3");
+        // The dev profile: debuginfo, no strip, incremental's default codegen units.
+        let dev = unit_profile(
+            r#"{"opt_level": "0", "lto": "false", "codegen_units": null, "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "incremental": true, "panic": "abort", "strip": {"resolved": "None"}}"#,
+        );
+        let (flags, root) = profile_flags(&dev).unwrap();
+        assert_eq!(
+            flags,
+            [
+                "-Copt-level=0",
+                "-Cdebuginfo=2",
+                "-Cdebug-assertions=on",
+                "-Coverflow-checks=on",
+                "-Ccodegen-units=256",
+                "-Cpanic=abort",
+            ]
+        );
         assert!(root.is_empty());
-        assert!(profile_flags(&manifest, "missing").is_err());
+        // A deferred strip without debuginfo is `debuginfo`, as Cargo resolves it.
+        let deferred = unit_profile(
+            r#"{"opt_level": "3", "lto": "thin", "codegen_units": null, "debuginfo": 0, "debug_assertions": false, "overflow_checks": false, "incremental": false, "panic": "unwind", "strip": {"deferred": "None"}}"#,
+        );
+        let (flags, root) = profile_flags(&deferred).unwrap();
+        assert_eq!(flags.last().unwrap(), "-Cstrip=debuginfo");
+        assert_eq!(root, ["-Clto=thin"]);
+        let unknown = unit_profile(
+            r#"{"opt_level": "3", "lto": "maybe", "codegen_units": null, "debuginfo": 0, "debug_assertions": false, "overflow_checks": false, "incremental": false, "panic": "unwind", "strip": {"resolved": "None"}}"#,
+        );
+        assert!(profile_flags(&unknown).is_err());
     }
 }
