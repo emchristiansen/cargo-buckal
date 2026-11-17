@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use anyhow::bail;
@@ -55,6 +55,12 @@ pub struct BuckalNode {
     pub name: String,
     pub version: String,
     pub features: Vec<String>,
+    /// Features Cargo enables for this package on each configured platform
+    /// (Reindeer platform name -> features), when `feature_platforms` is set in
+    /// buckal.toml. Empty otherwise, in which case `features` (the union over every
+    /// platform that `cargo metadata` reports) is used everywhere.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub platform_features: BTreeMap<String, BTreeSet<String>>,
     pub kind: NodeKind,
     pub edition: Edition,
     // -- Fields from Package --
@@ -153,6 +159,7 @@ impl BuckalResolve {
                 name: package.name.to_string(),
                 version: package.version.to_string(),
                 features: node.features.iter().map(|f| f.to_string()).collect(),
+                platform_features: Default::default(),
                 kind,
                 edition: package.edition,
                 manifest_path: package.manifest_path.clone(),
@@ -373,6 +380,18 @@ impl BuckalResolve {
         for f in &sorted_features {
             hasher.update(f.as_bytes());
         }
+        // Per-platform features (BTree order is deterministic). Hashed only when present,
+        // so fingerprints of repositories that do not configure them are unchanged.
+        if !node.platform_features.is_empty() {
+            hasher.update(b"platform_features");
+            for (platform, features) in &node.platform_features {
+                hasher.update(platform.as_bytes());
+                hasher.update(&(features.len() as u64).to_le_bytes());
+                for f in features {
+                    hasher.update(f.as_bytes());
+                }
+            }
+        }
 
         // 4. NodeKind (FirstParty already stores relative_path)
         match &node.kind {
@@ -523,6 +542,7 @@ mod tests {
             name: name.to_string(),
             version: version.to_string(),
             features: vec![],
+            platform_features: Default::default(),
             kind: NodeKind::ThirdParty,
             edition: Edition::E2021,
             manifest_path: Utf8PathBuf::from(format!("/tmp/{}/Cargo.toml", name)),
@@ -1208,6 +1228,7 @@ mod tests {
             name: "foo".to_string(),
             version: "1.0.0".to_string(),
             features: vec![],
+            platform_features: Default::default(),
             kind: NodeKind::FirstParty {
                 relative_path: "".to_string(),
             },
@@ -1358,6 +1379,7 @@ mod tests {
                 name: "serde".to_string(),
                 version: "1.0.200".to_string(),
                 features: vec!["derive".to_string(), "std".to_string()],
+                platform_features: Default::default(),
                 kind: NodeKind::ThirdParty,
                 edition: Edition::E2021,
                 manifest_path: Utf8PathBuf::from(format!(

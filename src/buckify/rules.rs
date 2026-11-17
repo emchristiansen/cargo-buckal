@@ -369,6 +369,7 @@ mod tests {
             name: name.to_string(),
             version: "0.1.0".to_string(),
             features: vec![],
+            platform_features: Default::default(),
             kind: NodeKind::FirstParty {
                 relative_path: "".to_string(),
             },
@@ -586,6 +587,7 @@ mod tests {
             name: "rig-core".to_owned(),
             version: "0.42.0".to_owned(),
             features: vec![],
+            platform_features: Default::default(),
             kind: NodeKind::ThirdParty,
             edition: Edition::E2021,
             manifest_path: manifest_dir.join("Cargo.toml"),
@@ -657,6 +659,7 @@ mod tests {
             name: "openssl-sys".to_owned(),
             version: "0.9.117".to_owned(),
             features: vec![],
+            platform_features: Default::default(),
             kind: NodeKind::ThirdParty,
             edition: Edition::E2021,
             manifest_path: manifest_dir.join("Cargo.toml"),
@@ -728,5 +731,57 @@ mod tests {
                 assert!(r.env.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn test_per_platform_features_emit_platform_attribute() {
+        let lib = mock_target("sdk", TargetKind::Lib);
+        let mut node = mock_node("sdk", vec![lib]);
+        // What `cargo metadata` reports: the union, including the wasm-only feature.
+        node.features = vec!["browser".to_owned(), "default".to_owned()];
+        node.platform_features = [
+            ("linux-x86_64".to_owned(), Set::from(["default".to_owned()])),
+            (
+                "wasm32".to_owned(),
+                Set::from(["browser".to_owned(), "default".to_owned()]),
+            ),
+        ]
+        .into();
+
+        let rules = buckify_root_node(&node, &test_ctx());
+        let lib_rule = rules
+            .iter()
+            .find_map(|r| match r {
+                Rule::RustLibrary(l) => Some(l),
+                _ => None,
+            })
+            .expect("rust_library");
+        assert_eq!(lib_rule.features, Set::from(["default".to_owned()]));
+        assert_eq!(
+            lib_rule.platform["wasm32"]["features"],
+            Set::from(["browser".to_owned()])
+        );
+        assert!(!lib_rule.platform.contains_key("linux-x86_64"));
+
+        let unit = find_test(&rules, "unittest");
+        assert_eq!(unit.features, Set::from(["default".to_owned()]));
+
+        let content = gen_buck_content(&rules);
+        assert!(
+            content.contains("    platform = {\n        \"wasm32\": {\n            \"features\": [\"browser\"],\n        },\n    },\n"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn test_without_per_platform_features_output_is_unchanged() {
+        let lib = mock_target("sdk", TargetKind::Lib);
+        let mut node = mock_node("sdk", vec![lib]);
+        node.features = vec!["browser".to_owned(), "default".to_owned()];
+
+        let rules = buckify_root_node(&node, &test_ctx());
+        let content = gen_buck_content(&rules);
+        assert!(!content.contains("platform = "), "{content}");
+        assert!(content.contains("\"browser\""), "{content}");
     }
 }

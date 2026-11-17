@@ -282,6 +282,7 @@ mod tests {
                 name: name.to_string(),
                 version: (*version).to_string(),
                 features: vec![],
+                platform_features: Default::default(),
                 kind: NodeKind::ThirdParty,
                 edition: Edition::E2021,
                 manifest_path: Utf8PathBuf::from(format!("/tmp/{name}/{version}/Cargo.toml")),

@@ -6,6 +6,7 @@ use cargo_util_schemas::{lockfile::TomlLockfile, manifest::TomlManifest};
 
 use crate::{
     config::RepoConfig,
+    platform_features::resolve_platform_features,
     resolve::{BuckalNode, BuckalResolve, NodeKind},
     utils::{UnwrapOrExit, get_buck2_root},
 };
@@ -25,7 +26,7 @@ pub struct BuckalContext {
 
 impl BuckalContext {
     pub fn new(manifest_path: Option<String>) -> Self {
-        let cargo_metadata = if let Some(manifest) = manifest_path {
+        let cargo_metadata = if let Some(manifest) = manifest_path.as_deref() {
             MetadataCommand::new()
                 .manifest_path(manifest)
                 .exec()
@@ -75,7 +76,7 @@ impl BuckalContext {
                 .is_some();
 
         let buck2_root = get_buck2_root().unwrap_or_exit_ctx("failed to get Buck2 project root");
-        let resolve = BuckalResolve::from_metadata(
+        let mut resolve = BuckalResolve::from_metadata(
             &nodes_map,
             &packages_map,
             &checksums_map,
@@ -83,6 +84,20 @@ impl BuckalContext {
             false,
         )
         .unwrap_or_exit_ctx("failed to resolve dependency graph");
+
+        if !repo_config.feature_platforms.is_empty() {
+            let per_platform = resolve_platform_features(
+                manifest_path.as_deref(),
+                &repo_config.feature_platforms,
+                &packages_map,
+            )
+            .unwrap_or_exit_ctx("failed to resolve per-platform features");
+            for (pkg_id, features) in per_platform {
+                if let Some(&idx) = resolve.index_map.get(&pkg_id) {
+                    resolve.dag[idx].platform_features = features;
+                }
+            }
+        }
 
         Self {
             root,
@@ -155,6 +170,7 @@ mod tests {
             name: name.to_string(),
             version: version.to_string(),
             features: vec![],
+            platform_features: Default::default(),
             kind: NodeKind::ThirdParty,
             edition: Edition::E2021,
             manifest_path: Utf8PathBuf::from(format!("/tmp/{}/Cargo.toml", name)),

@@ -192,6 +192,7 @@ mod tests {
             name: name.to_string(),
             version: "0.1.0".to_string(),
             features: vec![],
+            platform_features: Default::default(),
             kind: NodeKind::FirstParty {
                 relative_path: "".to_string(),
             },

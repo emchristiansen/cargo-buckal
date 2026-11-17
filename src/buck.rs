@@ -7,6 +7,7 @@ use starlark_syntax::syntax::ast::{ArgumentP, AstExpr, AstNoPayload, AstStmt, Ex
 use starlark_syntax::syntax::{AstModule, Dialect};
 
 use crate::buckal_error;
+use crate::platform_features::PlatformAttrs;
 
 #[derive(Serialize, Debug, PartialEq, Clone)]
 #[serde(untagged)]
@@ -119,6 +120,10 @@ pub struct RustLibrary {
     pub env: Map<String, String>,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub features: Set<String>,
+    /// Per-platform attributes for the prelude's `platform` argument
+    /// (`{platform name: {attribute: values}}`), e.g. features one platform adds.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub platform: PlatformAttrs,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub rustc_flags: Set<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -153,6 +158,10 @@ pub struct RustBinary {
     pub env: Map<String, String>,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub features: Set<String>,
+    /// Per-platform attributes for the prelude's `platform` argument
+    /// (`{platform name: {attribute: values}}`), e.g. features one platform adds.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub platform: PlatformAttrs,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub rustc_flags: Set<String>,
     #[serde(skip_serializing_if = "Map::is_empty")]
@@ -185,6 +194,10 @@ pub struct RustTest {
     pub env: Map<String, String>,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub features: Set<String>,
+    /// Per-platform attributes for the prelude's `platform` argument
+    /// (`{platform name: {attribute: values}}`), e.g. features one platform adds.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub platform: PlatformAttrs,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub rustc_flags: Set<String>,
     #[serde(skip_serializing_if = "Map::is_empty")]
@@ -210,6 +223,10 @@ pub struct BuildscriptRun {
     pub env_srcs: Set<String>,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub features: Set<String>,
+    /// Per-platform attributes for the prelude's `platform` argument
+    /// (`{platform name: {attribute: values}}`), e.g. features one platform adds.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub platform: PlatformAttrs,
     pub version: String,
     pub manifest_dir: String,
     #[serde(skip_serializing_if = "Set::is_empty")]
@@ -657,6 +674,7 @@ impl RustLibrary {
             exec_compatible_with,
             env,
             features,
+            platform: Map::new(),
             rustc_flags,
             proc_macro,
             named_deps,
@@ -697,6 +715,7 @@ impl RustBinary {
             exec_compatible_with,
             env,
             features,
+            platform: Map::new(),
             rustc_flags,
             named_deps,
             os_named_deps,
@@ -736,6 +755,7 @@ impl RustTest {
             exec_compatible_with,
             env,
             features,
+            platform: Map::new(),
             rustc_flags,
             named_deps,
             os_named_deps,
@@ -764,6 +784,7 @@ impl BuildscriptRun {
             env,
             env_srcs,
             features,
+            platform: Map::new(),
             version,
             manifest_dir,
             visibility,
@@ -1790,6 +1811,7 @@ mod tests {
             exec_compatible_with: Set::from(["prelude//os/constraints:macos".to_string()]),
             env: Map::from([("RUST_LOG".to_string(), "debug".to_string())]),
             features: Set::from(["default".to_string()]),
+            platform: Map::new(),
             rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
             proc_macro: Some(true),
             named_deps: Map::from([("serde".to_string(), ":serde_dep".to_string())]),
@@ -1827,6 +1849,7 @@ mod tests {
             exec_compatible_with: Set::from(["prelude//os/constraints:macos".to_string()]),
             env: Map::from([("RUST_LOG".to_string(), "debug".to_string())]),
             features: Set::from(["default".to_string()]),
+            platform: Map::new(),
             rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
             deps: Set::from([":dep".to_string()]),
             os_deps: Map::from([("linux".to_string(), Set::from([":linux_dep".to_string()]))]),
@@ -1863,6 +1886,7 @@ mod tests {
             exec_compatible_with: Set::from(["prelude//os/constraints:macos".to_string()]),
             env: Map::from([("RUST_LOG".to_string(), "debug".to_string())]),
             features: Set::from(["default".to_string()]),
+            platform: Map::new(),
             rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
             deps: Set::from([":dep".to_string()]),
             os_deps: Map::from([("linux".to_string(), Set::from([":linux_dep".to_string()]))]),
@@ -1898,6 +1922,7 @@ mod tests {
                 ":manifest[env_dict]".to_string(),
             ]),
             features: Set::from(["alloc".to_string(), "default".to_string()]),
+            platform: Map::new(),
             version: "1.2.3".to_string(),
             manifest_dir: ":vendor".to_string(),
             visibility: Set::from(["PUBLIC".to_string()]),

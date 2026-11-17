@@ -1,4 +1,7 @@
-use std::{borrow::Cow, collections::BTreeSet as Set};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap as Map, BTreeSet as Set},
+};
 
 use cargo_metadata::{
     TargetKind,
@@ -14,6 +17,7 @@ use crate::{
     buckify::actions::is_third_party,
     context::BuckalContext,
     platform::{buck_labels, lookup_platforms},
+    platform_features::{PlatformAttrs, split_features},
     resolve::{BuckalDepKind, BuckalNode, BuckalTarget},
     utils::{UnwrapOrExit, get_buck2_root, get_cfgs, get_target, get_vendor_path_relative},
 };
@@ -29,12 +33,14 @@ pub(super) fn emit_rust_library(
     ctx: &BuckalContext,
 ) -> RustLibrary {
     let vendor = vendor_ref(node);
+    let (features, platform) = node_features(node);
     let mut rust_library = RustLibrary {
         name: buckal_name.to_owned(),
         srcs: Set::from([vendor.label.clone()]),
         crate_name: lib_target.name.to_owned().replace("-", "_"),
         edition: node.edition.to_string(),
-        features: Set::from_iter(node.features.iter().map(|f| f.to_string())),
+        features,
+        platform,
         rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_owned()]),
         visibility: Set::from(["PUBLIC".to_owned()]),
         ..Default::default()
@@ -79,12 +85,14 @@ pub(super) fn emit_rust_binary(
     ctx: &BuckalContext,
 ) -> RustBinary {
     let vendor = vendor_ref(node);
+    let (features, platform) = node_features(node);
     let mut rust_binary = RustBinary {
         name: buckal_name.to_owned(),
         srcs: Set::from([vendor.label.clone()]),
         crate_name: bin_target.name.to_owned().replace("-", "_"),
         edition: node.edition.to_string(),
-        features: Set::from_iter(node.features.iter().map(|f| f.to_string())),
+        features,
+        platform,
         rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_owned()]),
         visibility: Set::from(["PUBLIC".to_owned()]),
         ..Default::default()
@@ -124,12 +132,14 @@ pub(super) fn emit_rust_test(
     ctx: &BuckalContext,
 ) -> RustTest {
     let vendor = vendor_ref(node);
+    let (features, platform) = node_features(node);
     let mut rust_test = RustTest {
         name: buckal_name.to_owned(),
         srcs: Set::from([vendor.label.clone()]),
         crate_name: test_target.name.to_owned().replace("-", "_"),
         edition: node.edition.to_string(),
-        features: Set::from_iter(node.features.iter().map(|f| f.to_string())),
+        features,
+        platform,
         rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_owned()]),
         visibility: Set::from(["PUBLIC".to_owned()]),
         ..Default::default()
@@ -168,13 +178,15 @@ pub(super) fn emit_buildscript_build(
     ctx: &BuckalContext,
 ) -> RustBinary {
     let vendor = vendor_ref(node);
+    let (features, platform) = node_features(node);
     // create the build script rule
     let mut buildscript_build = RustBinary {
         name: build_target.name.to_owned(),
         srcs: Set::from([vendor.label.clone()]),
         crate_name: build_target.name.to_owned().replace("-", "_"),
         edition: node.edition.to_string(),
-        features: Set::from_iter(node.features.iter().map(|f| f.to_string())),
+        features,
+        platform,
         rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_owned()]),
         ..Default::default()
     };
@@ -217,12 +229,14 @@ pub(super) fn emit_buildscript_run(
     // create the build script run rule
     let build_name = get_build_name(&build_target.name);
     let vendor = vendor_ref(node);
+    let (features, platform) = node_features(node);
     let mut buildscript_run = BuildscriptRun {
         name: format!("{}-run", build_name),
         package_name: node.name.to_string(),
         buildscript_rule: format!(":{}", build_target.name),
         env_srcs: Set::from([":manifest[env_dict]".to_owned()]),
-        features: Set::from_iter(node.features.iter().map(|f| f.to_string())),
+        features,
+        platform,
         version: node.version.to_string(),
         manifest_dir: vendor.label.clone(),
         visibility: Set::from(["PUBLIC".to_owned()]),
@@ -397,6 +411,18 @@ fn get_vendor_name() -> Cow<'static, str> {
 /// Get the label of the vendor target
 fn get_vendor_target() -> String {
     format!(":{}", get_vendor_name())
+}
+
+/// The features to emit for `node`: the features shared by every platform, and the
+/// per-platform remainder for the prelude's `platform` attribute. Without per-platform
+/// data (no `feature_platforms` configured) this is the merged feature set and no
+/// `platform` attribute, exactly as before.
+pub(super) fn node_features(node: &BuckalNode) -> (Set<String>, PlatformAttrs) {
+    if node.platform_features.is_empty() {
+        (node.features.iter().cloned().collect(), Map::new())
+    } else {
+        split_features(&node.platform_features)
+    }
 }
 
 /// Where a package's sources are found relative to its BUCK file.

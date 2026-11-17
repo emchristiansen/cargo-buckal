@@ -171,6 +171,13 @@ pub struct RepoConfig {
     /// (`[fixups.<package>]`). Applies to every version of that package.
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub fixups: Map<String, PackageFixup>,
+    /// Platforms to resolve features for separately, as Reindeer platform name
+    /// (the keys of the prelude's `platform` attribute, e.g. `linux-x86_64`) to Rust
+    /// target triple. When set, each package's features are resolved per platform with
+    /// Cargo's own resolver and emitted through `platform = {...}`, instead of the union
+    /// over all platforms that `cargo metadata` reports.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub feature_platforms: Map<String, String>,
 }
 
 impl Default for RepoConfig {
@@ -181,6 +188,7 @@ impl Default for RepoConfig {
             patch_fields: Set::new(),
             patch: RepoPatchConfig::default(),
             fixups: Map::new(),
+            feature_platforms: Map::new(),
         }
     }
 }

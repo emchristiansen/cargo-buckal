@@ -331,6 +331,7 @@ mod tests {
             name: "root".to_string(),
             version: "0.1.0".to_string(),
             features: vec![],
+            platform_features: Default::default(),
             kind: NodeKind::FirstParty {
                 relative_path: "".to_string(),
             },
@@ -347,6 +348,7 @@ mod tests {
             name: "foo".to_string(),
             version: "0.1.0".to_string(),
             features: vec![],
+            platform_features: Default::default(),
             kind: NodeKind::ThirdParty,
             edition: Edition::E2021,
             manifest_path: Utf8PathBuf::from("/tmp/vendor/foo/0.1.0/Cargo.toml"),
@@ -361,6 +363,7 @@ mod tests {
             name: "foo".to_string(),
             version: "0.2.0".to_string(),
             features: vec![],
+            platform_features: Default::default(),
             kind: NodeKind::ThirdParty,
             edition: Edition::E2021,
             manifest_path: Utf8PathBuf::from("/tmp/vendor/foo/0.2.0/Cargo.toml"),
