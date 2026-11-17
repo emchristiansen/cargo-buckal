@@ -1158,3 +1158,56 @@ fn test_dev_dev_cycle_rejected() {
         err_msg
     );
 }
+
+/// Adding, changing or removing only a package's `[fixups]` changes exactly that
+/// package's fingerprint, so an ordinary cached migration regenerates its rules.
+#[test]
+fn test_fixup_changes_invalidate_only_their_package() {
+    let resolve = resolve_from_fixture("diamond-deps");
+    let ws = cargo_metadata::camino::Utf8PathBuf::from(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/diamond-deps")
+            .to_str()
+            .unwrap(),
+    );
+    let cache = |fixups: &std::collections::BTreeMap<
+        String,
+        cargo_buckal::config::PackageFixup,
+    >| {
+        BuckalCache::from_resolve_with_fixups(&resolve, &ws, &RepoPatchConfig::default(), fixups)
+    };
+    let fixup = |flags: &[&str]| cargo_buckal::config::PackageFixup {
+        rustc_flags: flags.iter().map(|f| f.to_string()).collect(),
+        ..Default::default()
+    };
+    let none = std::collections::BTreeMap::new();
+    let one =
+        std::collections::BTreeMap::from([("itoa".to_owned(), fixup(&["-C", "opt-level=2"]))]);
+    let other =
+        std::collections::BTreeMap::from([("itoa".to_owned(), fixup(&["-C", "opt-level=3"]))]);
+
+    // Without fixups the fingerprints are the plain ones.
+    assert!(
+        cache(&none)
+            .diff(
+                &BuckalCache::from_resolve(&resolve, &ws, &RepoPatchConfig::default()),
+                &ws
+            )
+            .changes
+            .is_empty()
+    );
+    for (from, to) in [(&none, &one), (&one, &other), (&one, &none)] {
+        let changes = cache(to).diff(&cache(from), &ws).changes;
+        let changed: Vec<_> = changes
+            .keys()
+            .filter(|id| id.repr.contains("itoa@"))
+            .collect();
+        assert!(!changed.is_empty(), "an itoa version must be regenerated");
+        assert_eq!(
+            changed.len(),
+            changes.len(),
+            "only itoa changes: {changes:?}"
+        );
+        assert!(changes.values().all(|c| matches!(c, ChangeType::Changed)));
+    }
+}

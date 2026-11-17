@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::buckal_error;
 use crate::utils::{UnwrapOrExit, get_cache_path};
 
-use crate::config::RepoPatchConfig;
+use crate::config::{PackageFixup, RepoPatchConfig};
 use crate::resolve::BuckalResolve;
 
 // type Fingerprint = [u8; 32];
@@ -17,11 +17,17 @@ use crate::resolve::BuckalResolve;
 /// Version 2: Added multi-platform support to the cache format.
 /// Version 3: Switched to BuckalNode-based fingerprinting (DAG refactor).
 /// Version 4: Include version patch config in fingerprints.
+/// Version 5: Include each package's effective `[fixups]` and its full per-platform,
+///            per-context resolution in fingerprints; first-party crates compile from
+///            their checkout paths, tests declare their package's files and integration
+///            tests name their binaries, host variants and ordered `rustc_flags`. A
+///            version 4 cache holds fingerprints of rules generated without these, so it
+///            is stale and everything is regenerated.
 ///
 /// Migration strategy:
 /// - If found < expected (stale cache from older Buckal): ignore the old cache and rebuild.
 /// - If found > expected (cache from newer Buckal): exit immediately and prompt the user to upgrade.
-const CACHE_VERSION: u32 = 4;
+const CACHE_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fingerprint([u8; 32]);
@@ -112,13 +118,35 @@ impl BuckalCache {
         workspace_root: &Utf8PathBuf,
         patch_config: &RepoPatchConfig,
     ) -> Self {
+        Self::from_resolve_with_fixups(resolve, workspace_root, patch_config, &BTreeMap::new())
+    }
+
+    /// Fingerprints that also cover each package's effective `[fixups.<package>]`
+    /// (none, or the configured one), so that adding, changing or removing a fixup
+    /// regenerates exactly that package's rules in an ordinary cached migration.
+    pub fn from_resolve_with_fixups(
+        resolve: &BuckalResolve,
+        workspace_root: &Utf8PathBuf,
+        patch_config: &RepoPatchConfig,
+        fixups: &BTreeMap<String, PackageFixup>,
+    ) -> Self {
         let fingerprints = resolve
             .nodes()
             .map(|node| {
-                (
-                    node.package_id.canonicalize(workspace_root),
-                    resolve.fingerprint_of(&node.package_id, workspace_root, patch_config),
-                )
+                let base = resolve.fingerprint_of(&node.package_id, workspace_root, patch_config);
+                let fingerprint = match fixups.get(&node.name) {
+                    None => base,
+                    Some(fixup) => {
+                        let mut hasher = blake3::Hasher::new();
+                        hasher.update(&base.0);
+                        hasher.update(b"fixup");
+                        hasher.update(
+                            &serde_json::to_vec(fixup).expect("a fixup serializes to JSON"),
+                        );
+                        Fingerprint(*hasher.finalize().as_bytes())
+                    }
+                };
+                (node.package_id.canonicalize(workspace_root), fingerprint)
             })
             .collect();
         Self {

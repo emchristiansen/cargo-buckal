@@ -68,7 +68,13 @@ pub fn execute(args: &PatchArgs) {
     );
 
     changes.apply(&ctx);
-    BuckalCache::from_resolve(&ctx.resolve, &ctx.workspace_root, &ctx.repo_config.patch).save();
+    BuckalCache::from_resolve_with_fixups(
+        &ctx.resolve,
+        &ctx.workspace_root,
+        &ctx.repo_config.patch,
+        &ctx.repo_config.fixups,
+    )
+    .save();
 }
 
 fn select_patch_for_spec(ctx: &BuckalContext, spec: &str) -> Result<SelectedPatch> {

@@ -388,26 +388,15 @@ impl BuckalResolve {
         for f in &sorted_features {
             hasher.update(f.as_bytes());
         }
-        // Per-platform features (BTree order is deterministic). Hashed only when present,
-        // so fingerprints of repositories that do not configure them are unchanged.
+        // Per-platform, per-context resolution: features, edges, host context and host
+        // variants (BTree order is deterministic). Hashed only when present, so
+        // fingerprints of repositories that do not configure it are unchanged.
         if !node.platform_features.is_empty() {
-            for (tag, per_platform) in [
-                (
-                    b"platform_features".as_slice(),
-                    &node.platform_features.features,
-                ),
-                (b"platform_deps".as_slice(), &node.platform_features.deps),
-            ] {
-                hasher.update(tag);
-                for (platform, values) in per_platform {
-                    hasher.update(platform.as_bytes());
-                    hasher.update(&(values.len() as u64).to_le_bytes());
-                    for value in values {
-                        hasher.update(value.as_bytes());
-                        hasher.update(&[0]);
-                    }
-                }
-            }
+            hasher.update(b"platform_resolution");
+            hasher.update(
+                &serde_json::to_vec(&node.platform_features)
+                    .expect("a platform resolution serializes to JSON"),
+            );
         }
 
         // 4. NodeKind (FirstParty already stores relative_path)
