@@ -3287,3 +3287,28 @@ fn test_host_differences_guard_compares_resolutions() {
     assert!(f.buck("pm").contains("\"v\""), "{}", f.buck("pm"));
     f.migrate(&[]);
 }
+
+#[test]
+fn test_a_refusal_writes_no_file_of_the_run() {
+    // Fable P3: a refusal for one package exited after the BUCK files of the
+    // packages generated before it were written. Generation now writes nothing
+    // until every package's rules are known.
+    let f = fixture();
+    write(&f.ws.join("wasmonly/wasmonly"), "data\n");
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!("{BUCKAL_TOML}\n[fixups.wasmonly]\nexport_files = [\"wasmonly\"]\n"),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("wasmonly"), "{stderr}");
+    for package in ["app", "shared", "extra", "extra2", "sdk", "wasmonly"] {
+        assert!(
+            !f.ws.join(package).join("BUCK").exists(),
+            "{package}/BUCK written: {stderr}"
+        );
+    }
+    assert!(!f.ws.join("BUCK").exists(), "{stderr}");
+    assert!(!f.ws.join("buckal.snap").exists(), "{stderr}");
+}

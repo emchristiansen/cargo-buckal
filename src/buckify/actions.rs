@@ -1,4 +1,4 @@
-use cargo_metadata::camino::Utf8Path;
+use cargo_metadata::camino::{Utf8Path, Utf8PathBuf};
 use regex::Regex;
 
 use crate::{
@@ -17,7 +17,7 @@ use crate::{
 use super::{
     buckify_dep_node, buckify_root_node, cross, gen_buck_content, gen_buck_content_preserving,
     rules::{MANIFEST_EXPORT, build_script_names, fixup_set_contributions},
-    vendor_package, windows,
+    windows,
 };
 
 impl BuckalChange {
@@ -28,6 +28,10 @@ impl BuckalChange {
         let skip_pattern = format!("path+file://{}", ctx.workspace_root);
 
         let mut workspace_emitted = false;
+        // Nothing is written until every package's rules are known: a refusal
+        // (which exits) leaves every file as it was.
+        let mut writes: Vec<(Utf8PathBuf, String)> = Vec::new();
+        let mut removals: Vec<Utf8PathBuf> = Vec::new();
 
         for (id, change_type) in &self.changes {
             match change_type {
@@ -48,7 +52,8 @@ impl BuckalChange {
                         let vendor_dir = if !is_third_party_pkg {
                             node.manifest_path.parent().unwrap().to_owned()
                         } else {
-                            vendor_package(node)
+                            get_vendor_dir(&node.package_id)
+                                .unwrap_or_exit_ctx("failed to get vendor directory")
                         };
 
                         // Generate BUCK rules
@@ -137,8 +142,7 @@ impl BuckalChange {
                                 windows::patch_root_windows_rustc_flags(buck_content, ctx, node);
                         }
                         buck_content = cross::patch_rust_test_target_compatible_with(buck_content);
-                        std::fs::write(&buck_path, buck_content)
-                            .expect("Failed to write BUCK file");
+                        writes.push((buck_path, buck_content));
                     }
                 }
                 ChangeType::Removed => {
@@ -152,19 +156,9 @@ impl BuckalChange {
                     let version = &caps[4];
 
                     buckal_log!("Removing", format!("{} v{}", name, version));
-                    let vendor_dir =
-                        get_vendor_dir(id).unwrap_or_exit_ctx("failed to get vendor directory");
-                    if vendor_dir.exists() {
-                        std::fs::remove_dir_all(&vendor_dir)
-                            .expect("Failed to remove vendor directory");
-                    }
-                    if let Some(package_dir) = vendor_dir.parent()
-                        && package_dir.exists()
-                        && package_dir.read_dir().unwrap().next().is_none()
-                    {
-                        std::fs::remove_dir_all(package_dir)
-                            .expect("Failed to remove empty package directory");
-                    }
+                    removals.push(
+                        get_vendor_dir(id).unwrap_or_exit_ctx("failed to get vendor directory"),
+                    );
                 }
             }
         }
@@ -191,9 +185,14 @@ impl BuckalChange {
             &[("filegroup", WORKSPACE_MANIFESTS)]
         };
         let buck_path = ctx.workspace_root.join("BUCK");
-        if buck_path.exists() {
-            let existing = std::fs::read_to_string(&buck_path)
-                .unwrap_or_exit_ctx(format!("Failed to read {}", buck_path));
+        // The root package's BUCK file of this run, if it was generated above.
+        let pending_root = writes.iter().rposition(|(path, _)| *path == buck_path);
+        if pending_root.is_some() || buck_path.exists() {
+            let existing = match pending_root {
+                Some(at) => writes[at].1.clone(),
+                None => std::fs::read_to_string(&buck_path)
+                    .unwrap_or_exit_ctx(format!("Failed to read {}", buck_path)),
+            };
             let (statements, _) = top_level_statements(buck_path.as_str(), &existing)
                 .unwrap_or_exit_ctx(format!("Failed to parse {}", buck_path));
             for (function, name, _) in &owned {
@@ -224,13 +223,34 @@ impl BuckalChange {
                 removed,
             )
             .unwrap_or_exit_ctx(format!("Failed to parse {}", buck_path));
-            if buck_content != existing {
-                std::fs::write(&buck_path, buck_content).expect("Failed to write BUCK file");
+            match pending_root {
+                Some(at) => writes[at].1 = buck_content,
+                None if buck_content != existing => writes.push((buck_path, buck_content)),
+                None => {}
             }
         } else if !owned.is_empty() {
             let texts: Vec<&str> = owned.iter().map(|(_, _, text)| text.as_str()).collect();
             let buck_content = format!("{PARTLY_GENERATED_HEADER}\n\n{}", texts.join("\n"));
-            std::fs::write(&buck_path, buck_content).expect("Failed to write BUCK file");
+            writes.push((buck_path, buck_content));
+        }
+
+        for (path, content) in writes {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).expect("Failed to create the package directory");
+            }
+            std::fs::write(&path, content).expect("Failed to write BUCK file");
+        }
+        for vendor_dir in removals {
+            if vendor_dir.exists() {
+                std::fs::remove_dir_all(&vendor_dir).expect("Failed to remove vendor directory");
+            }
+            if let Some(package_dir) = vendor_dir.parent()
+                && package_dir.exists()
+                && package_dir.read_dir().unwrap().next().is_none()
+            {
+                std::fs::remove_dir_all(package_dir)
+                    .expect("Failed to remove empty package directory");
+            }
         }
     }
 }
@@ -532,6 +552,8 @@ fn merge_rules(
     fixup_flags: FixupFlags,
     previous_sets: Option<&std::collections::BTreeMap<String, FixupSets>>,
 ) {
+    // A package without a BUCK file has nothing to merge; the file is written
+    // with the others once every package's rules are known.
     if buck_path.exists() {
         // Skip merging manual changes if `--no-merge` is set
         if !ctx.no_merge && !ctx.repo_config.patch_fields.is_empty() {
@@ -545,9 +567,6 @@ fn merge_rules(
                 previous_sets,
             );
         }
-    } else {
-        std::fs::File::create(buck_path)
-            .unwrap_or_exit_ctx(format!("Failed to create {}", buck_path));
     }
 }
 
