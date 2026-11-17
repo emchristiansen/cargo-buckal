@@ -317,6 +317,7 @@ mod tests {
         }
 
         BuckalContext {
+            workspace_members: None,
             root: None,
             resolve: BuckalResolve {
                 dag,

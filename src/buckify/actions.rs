@@ -647,6 +647,7 @@ mod tests {
 
         // BuckalContext with root set to our package (this is the key scenario)
         let ctx = BuckalContext {
+            workspace_members: None,
             root: Some(package_id),
             resolve,
             workspace_root: tmp_path.clone(),

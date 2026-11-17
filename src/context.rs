@@ -23,6 +23,10 @@ pub struct BuckalContext {
     pub no_merge: bool,
     /// Repository configuration
     pub repo_config: RepoConfig,
+    /// The workspace's members, whose binaries and tests `cargo build --workspace`
+    /// and `cargo test --workspace` build; `None` takes every first-party package
+    /// for one.
+    pub workspace_members: Option<std::collections::BTreeSet<PackageId>>,
 }
 
 impl BuckalContext {
@@ -129,14 +133,24 @@ impl BuckalContext {
             }
         }
 
+        let workspace_members = Some(cargo_metadata.workspace_members.iter().cloned().collect());
+
         Self {
             root,
             resolve,
+            workspace_members,
             workspace_root: cargo_metadata.workspace_root.clone(),
             workspace_inherit,
             no_merge: false,
             repo_config,
         }
+    }
+
+    /// Whether `id` is a member of the workspace (with no member list, any package).
+    pub fn is_workspace_member(&self, id: &PackageId) -> bool {
+        self.workspace_members
+            .as_ref()
+            .is_none_or(|members| members.contains(id))
     }
 
     pub fn patched_node<'a>(&'a self, node: &'a BuckalNode) -> Result<&'a BuckalNode> {
@@ -213,6 +227,7 @@ mod tests {
 
     fn make_context(resolve: BuckalResolve, patch: RepoPatchConfig) -> BuckalContext {
         BuckalContext {
+            workspace_members: None,
             root: None,
             resolve,
             workspace_root: Utf8PathBuf::from("/tmp"),

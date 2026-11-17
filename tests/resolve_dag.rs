@@ -572,6 +572,7 @@ fn test_patch_redirects_generated_dependency_label() {
     let workspace_root = Utf8PathBuf::from(fixture_dir.to_str().unwrap());
 
     let base_ctx = BuckalContext {
+        workspace_members: None,
         root: Some(old_crate.package_id.clone()),
         resolve,
         workspace_root,
@@ -599,6 +600,7 @@ fn test_patch_redirects_generated_dependency_label() {
     );
 
     let patched_ctx = BuckalContext {
+        workspace_members: None,
         repo_config: RepoConfig {
             patch: RepoPatchConfig {
                 version: [(

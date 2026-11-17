@@ -532,6 +532,7 @@ mod tests {
         index_map.insert(new_id, new_idx);
 
         let ctx = BuckalContext {
+            workspace_members: None,
             root: Some(root_id.clone()),
             resolve: BuckalResolve {
                 dag,
@@ -636,6 +637,7 @@ mod tests {
             .unwrap();
         }
         let ctx = BuckalContext {
+            workspace_members: None,
             root: None,
             resolve: BuckalResolve {
                 dag,
@@ -721,6 +723,7 @@ mod tests {
         )
         .unwrap();
         let ctx = BuckalContext {
+            workspace_members: None,
             root: None,
             resolve: BuckalResolve {
                 dag,

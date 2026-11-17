@@ -2895,3 +2895,49 @@ fn test_no_test_variant_for_a_library_the_tests_do_not_build() {
         "{wasmlib}"
     );
 }
+
+#[test]
+fn test_a_path_dependency_outside_the_workspace_gets_its_library_only() {
+    // b807 r36/r37 F1, Fable N4: `ext` is a path dependency in the workspace's
+    // `exclude`. `cargo build --workspace` and `cargo test --workspace` build its
+    // library for `app` and nothing else of it: no binary, no unit or integration
+    // test, no binary unit test.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"shared\"]\nexclude = [\"ext\"]\n",
+    );
+    write(
+        &f.ws.join("app/Cargo.toml"),
+        &manifest("app", "[dependencies]\next = { path = \"../ext\" }\n"),
+    );
+    write(&f.ws.join("app/src/lib.rs"), "");
+    write(
+        &f.ws.join("ext/Cargo.toml"),
+        &manifest(
+            "ext",
+            "[workspace]\n[dependencies]\nshared = { path = \"../shared\" }\n\
+             [dev-dependencies]\nshared = { path = \"../shared\" }\n\
+             [[bin]]\nname = \"ext-tool\"\npath = \"src/main.rs\"\n",
+        ),
+    );
+    write(
+        &f.ws.join("ext/src/lib.rs"),
+        "pub fn f() {\n    shared::one();\n}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn inline() {}\n}\n",
+    );
+    write(&f.ws.join("ext/src/main.rs"), "fn main() {}\n");
+    write(&f.ws.join("ext/tests/it.rs"), "");
+    write(&f.ws.join("shared/Cargo.toml"), &manifest("shared", ""));
+    write(&f.ws.join("shared/src/lib.rs"), "pub fn one() {}\n");
+    write(
+        &f.ws.join("buckal.toml"),
+        BUCKAL_TOML.split("[fixups.extra]").next().unwrap(),
+    );
+    f.migrate(&[]);
+    let ext = f.buck("ext");
+    assert_eq!(top_deps(rule(&ext, "ext")), ["//shared:shared"], "{ext}");
+    assert!(!ext.contains("rust_test("), "{ext}");
+    assert!(!ext.contains("rust_binary("), "{ext}");
+    let app = f.buck("app");
+    rule(&app, "unittest");
+}

@@ -145,10 +145,13 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
     // neither the production nor the test resolution enables is not built at all.
     let production = node.platform_features.exec_resolution();
     let tests = node.platform_features.test_resolution();
+    // Cargo builds the binaries and tests of workspace members only: of a path
+    // dependency outside the workspace, only the library.
+    let member = ctx.is_workspace_member(&node.package_id);
     let bin_targets: Vec<_> = node
         .targets
         .iter()
-        .filter(|t| t.kind.contains(&TargetKind::Bin))
+        .filter(|t| member && t.kind.contains(&TargetKind::Bin))
         .filter(|t| {
             let per_platform = !ctx.repo_config.feature_platforms.is_empty();
             features_enable(&production, &t.required_features, per_platform)
@@ -167,7 +170,7 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
     let test_targets: Vec<_> = node
         .targets
         .iter()
-        .filter(|t| t.kind.contains(&TargetKind::Test))
+        .filter(|t| member && t.kind.contains(&TargetKind::Test))
         .filter(|t| {
             let per_platform = !ctx.repo_config.feature_platforms.is_empty();
             features_enable(&tests, &t.required_features, per_platform)
@@ -307,7 +310,7 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
 
         buck_rules.push(Rule::RustLibrary(rust_library));
 
-        if !ctx.repo_config.ignore_tests && lib_target.test {
+        if member && !ctx.repo_config.ignore_tests && lib_target.test {
             // If the library target has inline tests, emit a rust_test rule for it
             let rust_test =
                 emit_rust_test(&unit_test_node, lib_target, &manifest_dir, "unittest", ctx);
@@ -1315,6 +1318,7 @@ mod tests {
         let node = mock_node("foo", vec![lib, bin]);
 
         let ctx = BuckalContext {
+            workspace_members: None,
             root: None,
             resolve: empty_resolve(),
             repo_config: RepoConfig {
@@ -1349,6 +1353,7 @@ mod tests {
         let node = mock_node("foo", vec![lib, bin, test]);
 
         let ctx = BuckalContext {
+            workspace_members: None,
             root: None,
             resolve: empty_resolve(),
             repo_config: RepoConfig {
@@ -1381,6 +1386,7 @@ mod tests {
 
     fn test_ctx() -> BuckalContext {
         BuckalContext {
+            workspace_members: None,
             root: None,
             resolve: empty_resolve(),
             repo_config: RepoConfig {
