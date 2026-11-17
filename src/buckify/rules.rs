@@ -312,8 +312,13 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
 
         if member && !ctx.repo_config.ignore_tests && lib_target.test {
             // If the library target has inline tests, emit a rust_test rule for it
-            let rust_test =
+            let mut rust_test =
                 emit_rust_test(&unit_test_node, lib_target, &manifest_dir, "unittest", ctx);
+            // rustc puts `proc_macro` in the extern prelude only of a crate compiled
+            // as a proc-macro; Cargo passes it to a proc-macro's test harness as well.
+            if lib_target.kind.contains(&TargetKind::ProcMacro) {
+                rust_test.rustc_flags.push("--extern=proc_macro".to_owned());
+            }
             test_context_rules.insert("unittest".to_owned());
 
             buck_rules.push(Rule::RustTest(rust_test));

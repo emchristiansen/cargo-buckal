@@ -2941,3 +2941,21 @@ fn test_a_path_dependency_outside_the_workspace_gets_its_library_only() {
     let app = f.buck("app");
     rule(&app, "unittest");
 }
+
+#[test]
+fn test_proc_macro_unit_tests_have_the_proc_macro_crate() {
+    // Fable R18, b807 r36 F3: rustc puts `proc_macro` in a crate's extern prelude
+    // only when compiling a proc-macro; Cargo passes `--extern proc_macro` to a
+    // proc-macro's test harness too. Its integration test is an ordinary crate.
+    let f = pm_contexts_fixture(true);
+    f.migrate(&[]);
+    let pm = f.buck("pm");
+    assert!(
+        rustc_flags(rule(&pm, "unittest")).contains(&"--extern=proc_macro".to_owned()),
+        "{pm}"
+    );
+    assert!(!rule(&pm, "pm").contains("--extern"), "{pm}");
+    assert!(!rule(&pm, "api").contains("--extern"), "{pm}");
+    let app = f.buck("app");
+    assert!(!app.contains("--extern"), "{app}");
+}
