@@ -574,6 +574,50 @@ fn test_merge_keeps_ordered_manual_groups_equal_to_generated_ones() {
 }
 
 #[test]
+fn test_no_cache_keeps_the_record_of_generated_fixup_flags() {
+    // R6-NOCACHE-1: `--no-cache` regenerates every package, but a valid cache still
+    // records the fixup flags the previous generation emitted.
+    let f = fixture();
+    let config = |fixup: &str| {
+        format!("ignore_tests = false\npatch_fields = [\"rustc_flags\"]\n[fixups.extra]\n{fixup}")
+    };
+    let flags = |opt: &str| format!("rustc_flags = [\"-C\", \"opt-level={opt}\"]\n");
+    let manifest_flag = "@$(location :manifest[env_flags])";
+    let extra_flags = || rustc_flags(rule(&f.buck("extra"), "extra"));
+
+    write(&f.ws.join("buckal.toml"), &config(&flags("2")));
+    f.migrate(&[]);
+    assert_eq!(extra_flags(), [manifest_flag, "-C", "opt-level=2"]);
+
+    // Change under `--no-cache`: only the new group.
+    write(&f.ws.join("buckal.toml"), &config(&flags("3")));
+    f.migrate(&["--no-cache", "--merge"]);
+    assert_eq!(extra_flags(), [manifest_flag, "-C", "opt-level=3"]);
+
+    // Then removal in an ordinary run: neither group.
+    write(
+        &f.ws.join("buckal.toml"),
+        &config("env = { EXTRA = \"1\" }\n"),
+    );
+    f.migrate(&["--merge"]);
+    assert_eq!(extra_flags(), [manifest_flag]);
+
+    // Removal under `--no-cache`, then an ordinary regeneration: neither group.
+    write(&f.ws.join("buckal.toml"), &config(&flags("2")));
+    f.migrate(&["--merge"]);
+    assert_eq!(extra_flags(), [manifest_flag, "-C", "opt-level=2"]);
+    write(&f.ws.join("buckal.toml"), &config(""));
+    f.migrate(&["--no-cache", "--merge"]);
+    assert_eq!(extra_flags(), [manifest_flag]);
+    write(
+        &f.ws.join("buckal.toml"),
+        &config("env = { EXTRA = \"2\" }\n"),
+    );
+    f.migrate(&["--merge"]);
+    assert_eq!(extra_flags(), [manifest_flag]);
+}
+
+#[test]
 fn test_fixup_test_execution_through_generation() {
     let f = fixture();
     f.migrate(&[]);

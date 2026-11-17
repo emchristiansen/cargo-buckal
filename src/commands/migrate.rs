@@ -117,14 +117,23 @@ pub fn execute(args: &MigrateArgs) {
     // For migrate, a missing/stale cache means "first run" — use empty so everything
     // is treated as Added and BUCK files are generated from scratch. This differs from
     // add/remove/update which use get_last_cache() to rebuild from metadata for diffing.
-    let last_cache = if args.no_cache || BuckalCache::load().is_err() {
-        BuckalCache::new_empty()
-    } else {
-        BuckalCache::load().unwrap_or_exit_ctx("failed to load existing cache")
-    };
+    // `--no-cache` regenerates everything too.
+    let recorded = BuckalCache::load().ok();
+    let empty = BuckalCache::new_empty();
+    let last_cache = recorded
+        .as_ref()
+        .filter(|_| !args.no_cache)
+        .unwrap_or(&empty);
     let new_cache =
         BuckalCache::from_resolve_with_config(&ctx.resolve, &ctx.workspace_root, &ctx.repo_config);
-    let changes = new_cache.diff(&last_cache, &ctx.workspace_root);
+    let mut changes = new_cache.diff(last_cache, &ctx.workspace_root);
+    // Which packages to regenerate is one question; what the previous generation
+    // emitted is another. A compatible cache records the fixup flags that generation
+    // added, so `--merge` does not take them for manual edits under `--no-cache`
+    // either.
+    changes.previous_fixup_rustc_flags = recorded
+        .as_ref()
+        .and_then(BuckalCache::previous_fixup_record);
 
     // Apply changes to BUCK files
     changes.apply(&ctx);
