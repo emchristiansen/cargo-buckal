@@ -304,8 +304,8 @@ fn test_cached_migrate_follows_fixups_and_old_caches() {
     // rules are regenerated even though the packages did not change.
     let snap = f.ws.join("buckal.snap");
     let cache = std::fs::read_to_string(&snap).unwrap();
-    assert!(cache.contains("version = 6"), "{cache}");
-    std::fs::write(&snap, cache.replace("version = 6", "version = 4")).unwrap();
+    assert!(cache.contains("version = 7"), "{cache}");
+    std::fs::write(&snap, cache.replace("version = 7", "version = 4")).unwrap();
     let stale = "# stale rules from an older generator\n";
     write(&f.ws.join("extra/BUCK"), stale);
     f.migrate(&[]);
@@ -447,7 +447,7 @@ fn test_update_after_an_old_cache_regenerates_before_certifying() {
     // Rules and cache from an older generator (cache version 4).
     let snap = f.ws.join("buckal.snap");
     let cache = std::fs::read_to_string(&snap).unwrap();
-    std::fs::write(&snap, cache.replace("version = 6", "version = 4")).unwrap();
+    std::fs::write(&snap, cache.replace("version = 7", "version = 4")).unwrap();
     let stale = "# stale rules from v4\n";
     write(&f.ws.join("extra/BUCK"), stale);
 
@@ -457,7 +457,7 @@ fn test_update_after_an_old_cache_regenerates_before_certifying() {
     assert!(
         std::fs::read_to_string(&snap)
             .unwrap()
-            .contains("version = 6")
+            .contains("version = 7")
     );
     assert_eq!(f.buck("extra"), current);
     // ...so that an ordinary migrate afterwards finds current rules.
@@ -687,4 +687,108 @@ fn test_fixup_export_files_through_generation() {
         );
         assert_eq!(f.buck("app"), app_before, "{paths}");
     }
+}
+
+#[test]
+fn test_mapped_srcs_repository_destinations_through_generation() {
+    let f = fixture();
+    // `app` includes a file of its nested Buck package `vocab` and, through `../`, a
+    // file of the `shared` package.
+    write(
+        &f.ws.join("app/vocab/BUCK"),
+        "export_file(name = \"words.txt\")\n",
+    );
+    write(&f.ws.join("app/vocab/words.txt"), "");
+    write(&f.ws.join("shared/data.txt"), "");
+    write(
+        &f.ws.join("app/src/lib.rs"),
+        "pub const W: &str = include_str!(\"../vocab/words.txt\");\n\
+         pub const D: &str = include_str!(\"../../shared/data.txt\");\n",
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    // The scanner suggests the entries that declare both includes.
+    assert!(
+        stderr.contains("Package `app` includes 2 file(s) that its sources do not contain (1 from nested Buck packages, 1 from outside its directory)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("`\"//app/vocab:words.txt\" = \"vocab/words.txt\"`"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("`\"//shared:data.txt\" = \"../shared/data.txt\"`"),
+        "{stderr}"
+    );
+    let app_before = f.buck("app");
+    assert!(!app_before.contains("mapped_srcs"), "{app_before}");
+
+    // Declared as written relative to the package, the destinations are emitted as
+    // repository paths, and the owning package exports the file.
+    let with = |entries: &str| {
+        format!(
+            "{BUCKAL_TOML}\n[fixups.shared]\nexport_files = [\"data.txt\"]\n\n[fixups.app.mapped_srcs]\n{entries}"
+        )
+    };
+    let declared = "\"//app/vocab:words.txt\" = \"vocab/words.txt\"\n\"//shared:data.txt\" = \"../shared/data.txt\"\n";
+    write(&f.ws.join("buckal.toml"), &with(declared));
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("Package `app` includes"), "{stderr}");
+    let app = f.buck("app");
+    let mapped = "    mapped_srcs = {\n        \"//app/vocab:words.txt\": \"app/vocab/words.txt\",\n        \"//shared:data.txt\": \"shared/data.txt\",\n    },\n";
+    for name in ["app", "unittest"] {
+        assert!(rule(&app, name).contains(mapped), "{}", rule(&app, name));
+    }
+    // Every rule that gets them (the build script's too, as before) has exactly
+    // these repository destinations.
+    assert_eq!(
+        app.matches("mapped_srcs = {").count(),
+        app.matches(mapped).count(),
+        "{app}"
+    );
+    assert!(
+        f.buck("shared")
+            .contains("export_file(\n    name = \"data.txt\","),
+        "{}",
+        f.buck("shared")
+    );
+
+    // Destinations that are absolute, leave the repository, land on a file of the
+    // package's own sources or collide are refused, and the BUCK file is kept.
+    for (entries, why) in [
+        ("\"//x:a\" = \"/etc/hostname\"\n", "is not a relative path"),
+        (
+            "\"//x:a\" = \"../../outside.txt\"\n",
+            "leaves the repository",
+        ),
+        (
+            "\"//x:a\" = \"src/lib.rs\"\n",
+            "is a file of the package's own sources",
+        ),
+        (
+            "\"//x:a\" = \"../shared/data.txt\"\n\"//x:b\" = \"./../shared/data.txt\"\n",
+            "`shared/data.txt` is also the destination of `//x:a`",
+        ),
+    ] {
+        write(&f.ws.join("buckal.toml"), &with(entries));
+        let output = f.output(&["migrate"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{entries} was accepted:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("`[fixups.app] mapped_srcs`: `//x:") && stderr.contains(why),
+            "{entries}:\n{stderr}"
+        );
+        assert_eq!(f.buck("app"), app, "{entries}");
+    }
+
+    // Removing the declarations restores the original BUCK file.
+    write(&f.ws.join("buckal.toml"), BUCKAL_TOML);
+    f.migrate(&[]);
+    assert_eq!(f.buck("app"), app_before);
 }

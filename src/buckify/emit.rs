@@ -475,11 +475,15 @@ impl VendorRef {
 
 /// The vendored location of `node`'s package directory.
 ///
-/// A first-party package compiles its own files at their own package-relative paths
-/// (`srcs = glob(["**/**"])`, `crate_root = "src/lib.rs"`). The prelude remaps the
-/// sources directory to the package path, so `file!()` is the checkout path
-/// (`<package>/src/...`), as under Cargo. Tools that locate files from `file!()` at run
-/// time, such as insta snapshots, then find them where they are checked in. The
+/// A first-party package compiles its own files (`srcs = glob(["**/**"])`,
+/// `crate_root = "src/lib.rs"`). The prelude places them at their repository paths
+/// (`<package>/<path>`) in the crate's sources directory, next to `mapped_srcs` at
+/// their repository-path destinations, and remaps that directory away, so `file!()`
+/// is the path relative to the repository checkout (`<package>/src/...`), as Cargo
+/// gives it for a member of a workspace at the repository root. Includes that climb
+/// out of the package (`../`) then resolve to the mapped files. Tools that locate
+/// files from `file!()` at run time, such as insta snapshots, find them where they
+/// are checked in. The
 /// `vendor` filegroup remains the input of `cargo_manifest` and `buildscript_run`.
 ///
 /// A registry archive is the `vendor` target itself. A git

@@ -25,11 +25,13 @@ use crate::resolve::BuckalResolve;
 ///            is stale and everything is regenerated.
 /// Version 6: Record the fixup `rustc_flags` each generation added, so that `--merge`
 ///            tells them from manual edits after the fixup changes or is removed.
+/// Version 7: `mapped_srcs` destinations are emitted as repository paths. A version 6
+///            cache vouches for package-relative destinations, so it is stale.
 ///
 /// Migration strategy:
 /// - If found < expected (stale cache from older Buckal): ignore the old cache and rebuild.
 /// - If found > expected (cache from newer Buckal): exit immediately and prompt the user to upgrade.
-const CACHE_VERSION: u32 = 6;
+const CACHE_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fingerprint([u8; 32]);

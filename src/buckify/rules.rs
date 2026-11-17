@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet as Set, vec};
 
 use cargo_metadata::TargetKind;
-use cargo_metadata::camino::Utf8PathBuf;
+use cargo_metadata::camino::{Utf8Path, Utf8PathBuf};
 use cargo_util_schemas::core::{PackageIdSpec, SourceKind};
 use itertools::Itertools;
 
@@ -9,11 +9,13 @@ use crate::{
     buck::{ExportFile, Load, Rule, RustRule},
     buckal_error, buckal_note, buckal_warn,
     context::BuckalContext,
-    resolve::{BuckalNode, BuckalTarget, is_lib_like},
-    utils::{UnwrapOrExit, get_vendor_dir},
+    resolve::{BuckalNode, BuckalTarget, NodeKind, is_lib_like},
+    utils::{UnwrapOrExit, get_buck2_root, get_vendor_dir},
 };
 
-use super::includes::{IncludeGap, UnprovidedInclude, unprovided_includes};
+use super::includes::{
+    IncludeGap, UnprovidedInclude, in_nested_package, repository_path, unprovided_includes,
+};
 
 use super::deps::host_variant_name;
 use super::emit::{
@@ -408,6 +410,10 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
     let Some(fixup) = ctx.repo_config.fixups.get(&node.name) else {
         return;
     };
+    let mapped = fixup_mapped_srcs(node, fixup).unwrap_or_else(|error| {
+        buckal_error!("{:#}", error);
+        std::process::exit(1);
+    });
     for rule in rules {
         let (env, rustc_flags, mapped_srcs) = match rule {
             Rule::RustLibrary(r) => (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs),
@@ -432,51 +438,205 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
         };
         env.extend(fixup.env.clone());
         rustc_flags.extend(fixup.rustc_flags.iter().cloned());
-        mapped_srcs.extend(fixup.mapped_srcs.clone());
+        mapped_srcs.extend(mapped.clone());
     }
 }
 
 /// Report compile-time includes of a first-party package that its sources do not
-/// provide and that no `mapped_srcs` fixup declares.
+/// provide and that no `mapped_srcs` fixup declares, suggesting the entries that
+/// would declare them.
 fn report_unprovided_includes(node: &BuckalNode, ctx: &BuckalContext) {
     let package_dir = node.manifest_path.parent().unwrap();
-    let declared: Set<&str> = ctx
+    let includes = unprovided_includes(package_dir);
+    if includes.is_empty() {
+        return;
+    }
+    let (_, package) = package_location(node).unwrap_or_exit();
+    let root = get_buck2_root().unwrap_or_exit_ctx("failed to get Buck2 root");
+    // A refused fixup is reported when the fixups are applied.
+    let declared: Set<String> = ctx
         .repo_config
         .fixups
         .get(&node.name)
-        .map(|fixup| fixup.mapped_srcs.values().map(String::as_str).collect())
+        .and_then(|fixup| fixup_mapped_srcs(node, fixup).ok())
+        .map(|mapped| mapped.into_values().collect())
         .unwrap_or_default();
-    let missing: Vec<_> = unprovided_includes(package_dir)
-        .into_iter()
-        .filter(|include| !declared.contains(include.resolved.as_str()))
-        .collect();
-    let (nested, outside): (Vec<_>, Vec<_>) = missing
-        .iter()
-        .partition(|include| include.kind == IncludeGap::NestedPackage);
-    let sample = |includes: &[&UnprovidedInclude]| {
-        includes
+    let mut suggestions = Vec::new();
+    let mut unreachable = Vec::new();
+    for include in &includes {
+        match repository_path(&package, &include.resolved) {
+            Ok(path) if declared.contains(path.as_str()) => {}
+            Ok(path) => suggestions.push((include, path)),
+            Err(_) => unreachable.push(include),
+        }
+    }
+    let at = |include: &UnprovidedInclude| format!("`{}` in {}", include.written, include.from);
+    if !suggestions.is_empty() {
+        let nested = suggestions
+            .iter()
+            .filter(|(include, _)| include.kind == IncludeGap::NestedPackage)
+            .count();
+        let examples = suggestions
             .iter()
             .take(3)
-            .map(|i| format!("`{}` in {}", i.written, i.from))
-            .join(", ")
+            .map(|(include, path)| {
+                format!(
+                    "{} as `\"{}\" = \"{}\"`",
+                    at(include),
+                    export_label_hint(&root, path),
+                    include.resolved
+                )
+            })
+            .join(", ");
+        buckal_warn!(
+            "Package `{}` includes {} file(s) that its sources do not contain ({} from nested Buck packages, {} from outside its directory). Declare each with `mapped_srcs` under `[fixups.{}]` in buckal.toml, as a label exporting the file (e.g. through `export_files` of its package) mapped to the path as included, e.g. {}.",
+            node.name,
+            suggestions.len(),
+            nested,
+            suggestions.len() - nested,
+            node.name,
+            examples
+        );
+    }
+    if !unreachable.is_empty() {
+        buckal_warn!(
+            "Package `{}` includes {} file(s) from outside the repository (e.g. {}), which no build input can provide.",
+            node.name,
+            unreachable.len(),
+            unreachable
+                .iter()
+                .take(3)
+                .map(|include| at(include))
+                .join(", ")
+        );
+    }
+}
+
+/// A label that would export the file at repository path `path`: its name relative
+/// to the nearest enclosing Buck package, a directory with a BUCK file or a Cargo
+/// package (whose BUCK file generation writes).
+fn export_label_hint(root: &Utf8Path, path: &Utf8Path) -> String {
+    let owner = path
+        .ancestors()
+        .skip(1)
+        .find(|dir| {
+            let dir = root.join(dir);
+            dir.join("BUCK").exists() || dir.join("Cargo.toml").exists()
+        })
+        .unwrap_or(Utf8Path::new(""));
+    let name = path.strip_prefix(owner).expect("ancestor of the path");
+    format!("//{owner}:{name}")
+}
+
+/// The package's directory and its repository path: the first-party package
+/// directory, or the vendor directory holding a third-party package's BUCK file.
+fn package_location(node: &BuckalNode) -> anyhow::Result<(Utf8PathBuf, Utf8PathBuf)> {
+    let root = get_buck2_root()?;
+    let dir = if matches!(node.kind, NodeKind::FirstParty { .. }) {
+        node.manifest_path
+            .parent()
+            .expect("manifest has a parent")
+            .to_owned()
+    } else {
+        get_vendor_dir(&node.package_id)?
     };
-    if !nested.is_empty() {
-        buckal_warn!(
-            "Package `{}` includes {} file(s) from a nested Buck package, which its sources do not contain (e.g. {}). Declare them with `mapped_srcs` under `[fixups.{}]` in buckal.toml.",
-            node.name,
-            nested.len(),
-            sample(&nested),
-            node.name
-        );
+    let package = dir
+        .strip_prefix(&root)
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "package `{}` at `{dir}` is outside the repository `{root}`",
+                node.name
+            )
+        })?
+        .to_owned();
+    Ok((dir, package))
+}
+
+/// The package's `[fixups] mapped_srcs` with destinations as repository paths,
+/// refusing a destination that is absolute, leaves the repository, is the package
+/// directory, repeats, or clashes with the package's own sources or another
+/// destination (the same path, or one a directory prefix of the other).
+fn fixup_mapped_srcs(
+    node: &BuckalNode,
+    fixup: &crate::config::PackageFixup,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    if fixup.mapped_srcs.is_empty() {
+        return Ok(Default::default());
     }
-    if !outside.is_empty() {
-        buckal_warn!(
-            "Package `{}` includes {} file(s) from outside its directory (e.g. {}); a crate compiled from its package cannot reach them.",
-            node.name,
-            outside.len(),
-            sample(&outside)
-        );
+    let (package_dir, package) = package_location(node)?;
+    repository_mapped_srcs(&node.name, &fixup.mapped_srcs, &package_dir, &package)
+}
+
+/// `mapped_srcs` written relative to the package at `package_dir` (repository path
+/// `package`), with repository-path destinations; see [`fixup_mapped_srcs`].
+fn repository_mapped_srcs(
+    name: &str,
+    written_srcs: &std::collections::BTreeMap<String, String>,
+    package_dir: &Utf8Path,
+    package: &Utf8Path,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let mut mapped = std::collections::BTreeMap::new();
+    let mut destinations: std::collections::BTreeMap<Utf8PathBuf, &str> = Default::default();
+    for (label, written) in written_srcs {
+        let refuse = |why: String| {
+            anyhow::anyhow!("`[fixups.{name}] mapped_srcs`: `{label}` = `{written}`: {why}")
+        };
+        let destination = repository_path(package, written).map_err(refuse)?;
+        if let Ok(own) = destination.strip_prefix(package) {
+            if own.as_str().is_empty() {
+                return Err(refuse(
+                    "the destination is the package directory".to_owned(),
+                ));
+            }
+            // The package glob provides every file outside nested Buck packages:
+            // the destination may be neither such a file, nor a directory holding
+            // them, nor below such a file.
+            let on_disk = package_dir.join(own);
+            let globbed = !in_nested_package(package_dir, own)
+                && !(on_disk.is_dir() && on_disk.join("BUCK").exists());
+            if globbed && on_disk.is_file() {
+                return Err(refuse(format!(
+                    "`{destination}` is a file of the package's own sources"
+                )));
+            }
+            if globbed && on_disk.is_dir() {
+                return Err(refuse(format!(
+                    "`{destination}` is a directory of the package's own sources"
+                )));
+            }
+            if let Some(file) = own
+                .ancestors()
+                .skip(1)
+                .filter(|dir| !dir.as_str().is_empty())
+                .find(|dir| package_dir.join(dir).is_file())
+            {
+                return Err(refuse(format!(
+                    "`{destination}` is below `{package}/{file}`, a file of the package's own sources"
+                )));
+            }
+        }
+        if let Some(other) = destinations.insert(destination.clone(), label) {
+            return Err(refuse(format!(
+                "`{destination}` is also the destination of `{other}`"
+            )));
+        }
+        mapped.insert(label.clone(), destination.to_string());
     }
+    // A destination that is a directory prefix of another would need to be both a
+    // file and a directory.
+    for (destination, label) in &destinations {
+        if let Some((prefix, prefix_label)) = destination
+            .ancestors()
+            .skip(1)
+            .find_map(|dir| destinations.get_key_value(dir))
+        {
+            anyhow::bail!(
+                "`[fixups.{name}] mapped_srcs`: `{label}` = `{}`: `{destination}` is below `{prefix}`, the destination of `{prefix_label}`",
+                written_srcs[*label]
+            );
+        }
+    }
+    Ok(mapped)
 }
 
 /// Vendors the package sources to `third-party` and returns the path.
@@ -1200,8 +1360,8 @@ mod tests {
                 _ => None,
             })
             .expect("rust_library");
-        // file!() becomes `conta/wire/src/lib.rs`: the prelude remaps the sources
-        // directory to the package path, and the sources sit at their own paths.
+        // file!() becomes `conta/wire/src/lib.rs`: the prelude places the sources at
+        // their repository paths and remaps the sources directory away.
         assert_eq!(lib.crate_root, "src/lib.rs");
         assert!(
             content.contains("    srcs = glob([\"**/**\"]),\n"),
@@ -1257,10 +1417,11 @@ mod tests {
     }
 
     #[test]
-    fn test_nested_package_include_declared_through_mapped_srcs() {
-        // As text/glyph_vocab: `src/internal/sources.rs` includes `../../vocab/bpe-52.toml`,
-        // and `vocab/` is its own Buck package that exports the file.
-        let (_dir, mut node) = first_party_package(
+    fn test_includes_declared_through_repository_mapped_srcs() {
+        // As text/glyph_vocab: `src/internal.rs` includes `../vocab/bpe-52.toml`, and
+        // `vocab/` is its own Buck package that exports the file; `src/types.rs`
+        // includes a file of another package through `../`.
+        let (_dir, node) = first_party_package(
             "text/glyph_vocab",
             &[
                 "src/lib.rs",
@@ -1275,47 +1436,90 @@ mod tests {
             "pub const A: &str = include_str!(\"../vocab/bpe-52.toml\");",
         )
         .unwrap();
-        node.name = "text_glyph_vocab".to_owned();
+        std::fs::write(
+            pkg.join("src/types.rs"),
+            "include!(\"../../../callosum/client/src/types/e.rs\");",
+        )
+        .unwrap();
         assert_eq!(
             super::super::includes::unprovided_includes(&pkg)
                 .into_iter()
                 .map(|i| (i.resolved, i.kind))
                 .collect::<Vec<_>>(),
-            vec![("vocab/bpe-52.toml".to_owned(), IncludeGap::NestedPackage)]
+            vec![
+                ("vocab/bpe-52.toml".to_owned(), IncludeGap::NestedPackage),
+                (
+                    "../../callosum/client/src/types/e.rs".to_owned(),
+                    IncludeGap::OutsidePackage
+                ),
+            ]
         );
 
-        let mut ctx = test_ctx();
-        ctx.repo_config.fixups.insert(
-            "text_glyph_vocab".to_owned(),
-            crate::config::PackageFixup {
-                mapped_srcs: [(
-                    "//text/glyph_vocab/vocab:compiler_input/bpe-52.toml".to_owned(),
-                    "vocab/bpe-52.toml".to_owned(),
-                )]
-                .into(),
-                ..Default::default()
-            },
+        let package = Utf8Path::new("text/glyph_vocab");
+        let written = |entries: &[(&str, &str)]| -> std::collections::BTreeMap<String, String> {
+            entries
+                .iter()
+                .map(|(label, path)| (label.to_string(), path.to_string()))
+                .collect()
+        };
+        let declared = written(&[
+            (
+                "//text/glyph_vocab/vocab:compiler_input/bpe-52.toml",
+                "vocab/bpe-52.toml",
+            ),
+            (
+                "//callosum/client:src/types/e.rs",
+                "../../callosum/client/src/types/e.rs",
+            ),
+        ]);
+        assert_eq!(
+            repository_mapped_srcs("text_glyph_vocab", &declared, &pkg, package).unwrap(),
+            written(&[
+                (
+                    "//text/glyph_vocab/vocab:compiler_input/bpe-52.toml",
+                    "text/glyph_vocab/vocab/bpe-52.toml",
+                ),
+                (
+                    "//callosum/client:src/types/e.rs",
+                    "callosum/client/src/types/e.rs",
+                ),
+            ])
         );
 
-        let rules = buckify_root_node(&node, &ctx);
-        for rule in &rules {
-            let mapped = match rule {
-                Rule::RustLibrary(r) => &r.mapped_srcs,
-                Rule::RustTest(r) => &r.mapped_srcs,
-                _ => continue,
-            };
-            assert_eq!(
-                mapped
-                    .get("//text/glyph_vocab/vocab:compiler_input/bpe-52.toml")
-                    .map(String::as_str),
-                Some("vocab/bpe-52.toml")
+        for (refused, why) in [
+            (written(&[("//x:a", "/abs/a.rs")]), "is not a relative path"),
+            (
+                written(&[("//x:a", "../../../a.rs")]),
+                "leaves the repository",
+            ),
+            (written(&[("//x:a", ".")]), "is the package directory"),
+            (written(&[("//x:a", "src/lib.rs")]), "own sources"),
+            (
+                written(&[("//x:a", "src")]),
+                "is a directory of the package's own sources",
+            ),
+            (
+                written(&[("//x:a", "src/lib.rs/x.rs")]),
+                "a file of the package's own sources",
+            ),
+            (
+                written(&[("//x:a", "../x/a.rs"), ("//x:b", "../x/./a.rs")]),
+                "is also the destination of `//x:a`",
+            ),
+            (
+                written(&[("//x:a", "../x/a"), ("//x:b", "../x/a/b.rs")]),
+                "`text/x/a/b.rs` is below `text/x/a`, the destination of `//x:a`",
+            ),
+        ] {
+            let error = repository_mapped_srcs("text_glyph_vocab", &refused, &pkg, package)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.starts_with("`[fixups.text_glyph_vocab] mapped_srcs`: `//x:")
+                    && error.contains(why),
+                "{error}"
             );
         }
-        let content = gen_buck_content(&rules);
-        assert!(
-            content.contains("    mapped_srcs = {\n        \"//text/glyph_vocab/vocab:compiler_input/bpe-52.toml\": \"vocab/bpe-52.toml\",\n    },\n"),
-            "{content}"
-        );
     }
 
     #[test]

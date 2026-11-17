@@ -216,9 +216,13 @@ pub struct PackageFixup {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rustc_flags: Vec<String>,
     /// Extra compile inputs for the package's crates, as the prelude's `mapped_srcs`:
-    /// a label (e.g. an `export_file` of a nested package) to its path inside the
-    /// crate's sources, relative to the package directory. For files that
-    /// `include_str!`/`include_bytes!` reads but the package glob does not provide.
+    /// a label (e.g. an `export_file` of a nested package, or of another package
+    /// through its `export_files` fixup) to the file's path, written relative to the
+    /// package directory and possibly climbing out of it with `..`, as an include
+    /// resolves it. For files that `include!`/`include_str!`/`include_bytes!` reads
+    /// but the package glob does not provide. Emitted as the repository path; a
+    /// destination that is absolute, leaves the repository, repeats or lands on a
+    /// file of the package's own sources is refused.
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub mapped_srcs: Map<String, String>,
     /// Extra run-time inputs of the package's tests, as labels (e.g. an `export_file`
@@ -359,10 +363,14 @@ mod tests {
 
     #[test]
     fn test_repo_config_deserializes_fixup_mapped_srcs() {
+        // Destinations are written relative to the package, as an include resolves
+        // them (possibly with `../`); generation emits them as repository paths
+        // (`text/glyph_vocab/vocab/bpe-52.toml`), see `buckify::rules`.
         let config: RepoConfig = toml::from_str(
             r#"
                 [fixups.text_glyph_vocab.mapped_srcs]
                 "//text/glyph_vocab/vocab:compiler_input/bpe-52.toml" = "vocab/bpe-52.toml"
+                "//text/lexicon:words.txt" = "../lexicon/words.txt"
             "#,
         )
         .expect("failed to deserialize repo config");
@@ -376,6 +384,13 @@ mod tests {
                 .get("//text/glyph_vocab/vocab:compiler_input/bpe-52.toml")
                 .map(String::as_str),
             Some("vocab/bpe-52.toml")
+        );
+        assert_eq!(
+            fixup
+                .mapped_srcs
+                .get("//text/lexicon:words.txt")
+                .map(String::as_str),
+            Some("../lexicon/words.txt")
         );
     }
 

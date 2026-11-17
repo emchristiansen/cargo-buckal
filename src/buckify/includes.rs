@@ -3,12 +3,18 @@
 //!
 //! `include_str!`, `include_bytes!` and `include!` resolve a relative path against
 //! the including file. A first-party crate compiles its package's files at their
-//! package-relative paths, so an included file is present only if the package glob
-//! matches it. It does not when the file
+//! repository paths (`<package>/<path>` in the prelude's sources directory), so an
+//! included file is present only if the package glob or a `mapped_srcs` entry
+//! provides it. The glob does not when the file
 //! - lies in a nested Buck package (a subdirectory with its own BUCK file), which a
-//!   glob does not enter; such a file can be declared through `mapped_srcs`, or
-//! - lies outside the package directory (`../`), which no package-relative
-//!   destination can express.
+//!   glob does not enter, or
+//! - lies outside the package directory (`../`).
+//!
+//! Both are declared through `mapped_srcs`, whose destinations are repository paths.
+//!
+//! The scan is lexical and only advisory: it finds string-literal includes in the
+//! package's `.rs` files, whether or not the code is compiled, and misses paths built
+//! with `concat!`/`env!`, generated code (e.g. in `OUT_DIR`) and macro expansions.
 
 use std::collections::BTreeSet;
 
@@ -98,7 +104,7 @@ fn package_files(package_dir: &Utf8Path) -> Vec<Utf8PathBuf> {
 
 /// Whether `relative` (inside the package) is in a directory below the package that
 /// has its own BUCK file.
-fn in_nested_package(package_dir: &Utf8Path, relative: &Utf8Path) -> bool {
+pub(crate) fn in_nested_package(package_dir: &Utf8Path, relative: &Utf8Path) -> bool {
     relative
         .ancestors()
         .skip(1)
@@ -106,8 +112,25 @@ fn in_nested_package(package_dir: &Utf8Path, relative: &Utf8Path) -> bool {
         .any(|dir| package_dir.join(dir).join("BUCK").exists())
 }
 
+/// The repository path of `written`, a path relative to the package at repository
+/// path `package`. Refuses an empty or absolute path and one that leaves the
+/// repository.
+pub(crate) fn repository_path(package: &Utf8Path, written: &str) -> Result<Utf8PathBuf, String> {
+    let path = Utf8Path::new(written);
+    if written.is_empty() || path.has_root() || path.is_absolute() {
+        return Err(format!("`{written}` is not a relative path"));
+    }
+    let resolved = normalize(&package.join(path));
+    if resolved.as_str().is_empty() || resolved.starts_with("..") {
+        return Err(format!(
+            "`{written}` (from package `{package}`) leaves the repository"
+        ));
+    }
+    Ok(resolved)
+}
+
 /// Lexically normalize a relative path (`a/b/../c` -> `a/c`), keeping leading `..`.
-fn normalize(path: &Utf8Path) -> Utf8PathBuf {
+pub(crate) fn normalize(path: &Utf8Path) -> Utf8PathBuf {
     let mut parts: Vec<&str> = Vec::new();
     for component in path.components() {
         match component {
@@ -147,6 +170,23 @@ mod tests {
             "../lean/p.txt"
         );
         assert_eq!(normalize(Utf8Path::new("./a/./b")), "a/b");
+    }
+
+    #[test]
+    fn test_repository_path() {
+        let pkg = Utf8Path::new("codegen/ccc");
+        assert_eq!(
+            repository_path(pkg, "vocab/a.toml").unwrap(),
+            "codegen/ccc/vocab/a.toml"
+        );
+        assert_eq!(
+            repository_path(pkg, "../../callosum/client/src/types/e.rs").unwrap(),
+            "callosum/client/src/types/e.rs"
+        );
+        assert_eq!(repository_path(Utf8Path::new(""), "./a/../b").unwrap(), "b");
+        for refused in ["", "/etc/hostname", "../../../x", "../..", "a/../../.."] {
+            assert!(repository_path(pkg, refused).is_err(), "{refused}");
+        }
     }
 
     #[test]
