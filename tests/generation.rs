@@ -2065,3 +2065,83 @@ fn test_merge_drops_changed_and_removed_set_fixups_and_keeps_manual_values() {
         ("unittest", &["//manual:c"]),
     ]);
 }
+
+#[test]
+fn test_tests_consume_their_build_script_output() {
+    // BIN-BS-1 (t_7c72255f): Cargo gives every compilation of a package (its
+    // library, binaries and all their tests) the build script's output
+    // (`cargo:rustc-env`, cfgs, link flags, OUT_DIR). With a test variant, the tests
+    // use the test build script, compiled with the tests' features.
+    for test_features in [false, true] {
+        let f = fixture();
+        write(
+            &f.ws.join("Cargo.toml"),
+            "[workspace]\nresolver = \"2\"\nmembers = [\"tool\"]\n",
+        );
+        write(
+            &f.ws.join("tool/Cargo.toml"),
+            &manifest(
+                "tool",
+                "[features]\nt = []\n[[bin]]\nname = \"app\"\npath = \"src/main.rs\"\n",
+            ),
+        );
+        write(
+            &f.ws.join("tool/build.rs"),
+            "fn main() {\n    println!(\"cargo:rustc-env=BIN_BUILD_VALUE=correct\");\n}\n",
+        );
+        write(
+            &f.ws.join("tool/src/lib.rs"),
+            "#[test]\nfn lib_build_env() {\n    assert_eq!(env!(\"BIN_BUILD_VALUE\"), \"correct\");\n}\n",
+        );
+        write(
+            &f.ws.join("tool/src/main.rs"),
+            "fn main() {}\n#[test]\nfn build_env() {\n    assert_eq!(env!(\"BIN_BUILD_VALUE\"), \"correct\");\n}\n",
+        );
+        write(
+            &f.ws.join("tool/tests/it.rs"),
+            "#[test]\nfn it_build_env() {\n    assert_eq!(env!(\"BIN_BUILD_VALUE\"), \"correct\");\n}\n",
+        );
+        let config = BUCKAL_TOML.split("[fixups.extra]").next().unwrap();
+        let config = if test_features {
+            format!("test_features = [\"tool/t\"]\n{config}")
+        } else {
+            config.to_owned()
+        };
+        write(&f.ws.join("buckal.toml"), &config);
+        f.migrate(&[]);
+        let tool = f.buck("tool");
+        let run = if test_features {
+            "build-script-test-run"
+        } else {
+            "build-script-run"
+        };
+        for name in ["unittest", "app-unittest", "it"] {
+            let r = rule(&tool, name);
+            let flags = rustc_flags(r);
+            let response = format!("@$(location :{run}[rustc_flags])");
+            assert_eq!(
+                flags.iter().filter(|f| **f == response).count(),
+                1,
+                "{name}:\n{r}"
+            );
+            assert!(
+                !flags.iter().any(|f| f.contains("build-script")
+                    && f.contains("[rustc_flags]")
+                    && *f != response),
+                "{name}:\n{r}"
+            );
+            assert!(
+                r.contains(&format!("\"OUT_DIR\": \"$(location :{run}[out_dir])\"")),
+                "{name}:\n{r}"
+            );
+        }
+        // Production keeps the production build script.
+        for name in ["tool", "app"] {
+            let r = rule(&tool, name);
+            assert!(
+                rustc_flags(r).contains(&"@$(location :build-script-run[rustc_flags])".to_owned()),
+                "{name}:\n{r}"
+            );
+        }
+    }
+}
