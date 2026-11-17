@@ -1670,3 +1670,121 @@ fn test_headers_claim_only_generated_rules() {
     );
     assert_eq!(f.buck("extra"), extra);
 }
+
+/// A package with binaries: `tool` (same name as the library, with an inline
+/// test), `quiet` (`test = false`), `gated` (required feature `off`, which nothing
+/// enables) and `enabled` (required feature `on`, a default feature); a
+/// dev-dependency `devonly`.
+fn bins_fixture() -> Fixture {
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"tool\", \"devonly\"]\n",
+    );
+    write(
+        &f.ws.join("tool/Cargo.toml"),
+        &manifest(
+            "tool",
+            "[features]\ndefault = [\"on\"]\non = []\noff = []\n\
+             [dev-dependencies]\ndevonly = { path = \"../devonly\" }\n\
+             [[bin]]\nname = \"tool\"\npath = \"src/main.rs\"\n\
+             [[bin]]\nname = \"quiet\"\npath = \"src/bin/quiet.rs\"\ntest = false\n\
+             [[bin]]\nname = \"gated\"\npath = \"src/bin/gated.rs\"\nrequired-features = [\"off\"]\n\
+             [[bin]]\nname = \"enabled\"\npath = \"src/bin/enabled.rs\"\nrequired-features = [\"on\"]\n",
+        ),
+    );
+    write(&f.ws.join("tool/src/lib.rs"), "pub fn one() -> u32 { 1 }\n");
+    write(
+        &f.ws.join("tool/src/main.rs"),
+        "fn main() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn inline() {\n        assert_eq!(tool::one(), devonly::one());\n    }\n}\n",
+    );
+    for bin in ["quiet", "gated", "enabled"] {
+        write(
+            &f.ws.join(format!("tool/src/bin/{bin}.rs")),
+            "fn main() {}\n",
+        );
+    }
+    write(&f.ws.join("devonly/Cargo.toml"), &manifest("devonly", ""));
+    write(
+        &f.ws.join("devonly/src/lib.rs"),
+        "pub fn one() -> u32 { 1 }\n",
+    );
+    f
+}
+
+#[test]
+fn test_binary_unit_tests_through_generation() {
+    let f = bins_fixture();
+    f.migrate(&[]);
+    let tool = f.buck("tool");
+    let unittest = rule(&tool, "tool-unittest");
+    assert!(
+        tool.contains("rust_test(\n    name = \"tool-unittest\",\n"),
+        "{tool}"
+    );
+    assert!(
+        unittest.contains("crate_root = \"src/main.rs\""),
+        "{unittest}"
+    );
+    assert!(unittest.contains("crate = \"tool\""), "{unittest}");
+    assert!(unittest.contains("\":tool-lib\""), "{unittest}");
+    assert!(unittest.contains("\"//devonly:devonly\""), "{unittest}");
+    assert!(!unittest.contains("cargo_bin_exes"), "{unittest}");
+    rule(&tool, "enabled-unittest");
+    for absent in ["quiet-unittest", "gated-unittest"] {
+        assert!(
+            !tool.contains(&format!("name = \"{absent}\"")),
+            "{absent}:\n{tool}"
+        );
+    }
+    // The binaries themselves do not see dev-dependencies.
+    assert!(!rule(&tool, "tool").contains("devonly"), "{tool}");
+}
+
+#[test]
+fn test_binary_unit_tests_match_cargo_unit_graph() {
+    // Parity: the binaries whose unit tests Cargo builds for `cargo test
+    // --workspace` (units with mode `test` and kind `bin`) are exactly those with a
+    // `<bin>-unittest` rule.
+    let f = bins_fixture();
+    f.migrate(&[]);
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
+    let output = Command::new(cargo)
+        .args([
+            "test",
+            "--workspace",
+            "--no-run",
+            "--target",
+            "x86_64-unknown-linux-gnu",
+            "-Z",
+            "unstable-options",
+            "--unit-graph",
+        ])
+        .current_dir(&f.ws)
+        .env("RUSTC_BOOTSTRAP", "1")
+        .env("CARGO_NET_OFFLINE", "true")
+        .output()
+        .expect("run cargo");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let graph: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let from_cargo: std::collections::BTreeSet<String> = graph["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|u| u["mode"] == "test" && u["target"]["kind"][0] == "bin")
+        .map(|u| u["target"]["name"].as_str().unwrap().to_owned())
+        .collect();
+    let tool = f.buck("tool");
+    let emitted: std::collections::BTreeSet<String> = tool
+        .lines()
+        .filter_map(|line| line.strip_prefix("    name = \""))
+        .filter_map(|name| name.strip_suffix("-unittest\","))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(from_cargo, ["enabled", "tool"].map(str::to_owned).into());
+    assert_eq!(emitted, from_cargo, "{tool}");
+}

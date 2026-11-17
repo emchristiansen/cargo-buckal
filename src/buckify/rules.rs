@@ -305,6 +305,44 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         }
     }
 
+    // Cargo also runs the unit tests of each binary target whose `test` is on (the
+    // default) and whose `required-features` the tests' resolution enables: a test
+    // harness over the binary's crate root, compiled in the test context (like the
+    // library's), with the dev-dependencies and the package's library. Cargo gives
+    // it no `CARGO_BIN_EXE_*` (only integration tests and benches get those).
+    if !ctx.repo_config.ignore_tests {
+        let per_platform = !ctx.repo_config.feature_platforms.is_empty();
+        for bin_target in bin_targets
+            .iter()
+            .filter(|b| b.test && features_enable(&tests, &b.required_features, per_platform))
+        {
+            let buckal_name = bin_unittest_name(&bin_target.name);
+            if buck_rules
+                .iter()
+                .any(|rule| rule.name() == Some(buckal_name.as_str()))
+            {
+                buckal_error!(
+                    "`{}`: the unit tests of binary `{}` would be the rule `{buckal_name}`, which the package already has",
+                    node.name,
+                    bin_target.name
+                );
+                std::process::exit(1);
+            }
+            let mut rust_test =
+                emit_rust_test(&test_node, bin_target, &manifest_dir, &buckal_name, ctx);
+            if let Some(lib_name) = &lib_buck_name {
+                let lib = if has_test_variant {
+                    test_variant_name(lib_name)
+                } else {
+                    lib_name.clone()
+                };
+                rust_test.deps_mut().insert(format!(":{lib}"));
+            }
+            test_context_rules.insert(buckal_name);
+            buck_rules.push(Rule::RustTest(rust_test));
+        }
+    }
+
     // Check if the package has a build script
     let custom_build_target = node
         .targets
@@ -554,6 +592,11 @@ fn host_variant_rules(
 /// platform; always without per-platform resolution).
 fn has_required_features(node: &BuckalNode, target: &BuckalTarget) -> bool {
     features_enable(&node.platform_features, &target.required_features, false)
+}
+
+/// The `rust_test` rule of a binary target's unit tests: `<bin>-unittest`.
+pub(super) fn bin_unittest_name(bin: &str) -> String {
+    format!("{bin}-unittest")
 }
 
 /// Whether `required` features are all on in `resolution` (on some platform).
