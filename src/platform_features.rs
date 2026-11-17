@@ -692,20 +692,12 @@ fn combine_contexts(
                 ..Default::default()
             },
             (t, Some(h)) => {
-                let exec_context = t.map(|t| {
-                    // A host-only library's unit tests run on the host and its
-                    // integration tests on the target: the tests see both dev edges.
-                    let mut deps = t.deps;
-                    for (platform, on) in &h.deps.dev {
-                        deps.dev
-                            .entry(platform.clone())
-                            .or_default()
-                            .extend(on.iter().cloned());
-                    }
-                    HostVariant {
-                        features: t.features,
-                        deps,
-                    }
+                // A host-only library's unit tests are host compilations, with the
+                // host context's dev edges (in `h`); its integration tests and
+                // binaries are target compilations, with the target's alone.
+                let exec_context = t.map(|t| HostVariant {
+                    features: t.features,
+                    deps: t.deps,
                 });
                 PlatformResolution {
                     features: h.features,

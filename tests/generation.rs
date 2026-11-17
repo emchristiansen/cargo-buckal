@@ -1374,6 +1374,19 @@ fn labels(list: &str) -> Vec<&str> {
         .collect()
 }
 
+/// The labels of `platform[<platform>]["deps"]` in a rule.
+fn platform_deps<'a>(rule: &'a str, platform: &str) -> Vec<&'a str> {
+    let key = format!("\"{platform}\": {{");
+    let Some(at) = rule.find(&key) else {
+        return Vec::new();
+    };
+    let section = &rule[at..];
+    let section = &section[..section.find('}').unwrap()];
+    section
+        .find("\"deps\": [")
+        .map_or_else(Vec::new, |deps| labels(&section[deps + 9..]))
+}
+
 /// The labels of a rule's top-level `deps` list.
 fn top_deps(rule: &str) -> Vec<&str> {
     rule.find("\n    deps = [")
@@ -1402,12 +1415,33 @@ fn test_proc_macro_unit_tests_are_host_compilations() {
         let unittest = rule(&pm, "unittest");
         assert!(unittest.contains("\"//shared:shared-host\""), "{unittest}");
         assert!(!unittest.contains("\"//shared:shared\""), "{unittest}");
-        // The host unit tests have the host's unix-only dev-dependency on every
-        // platform (the host is unix), and no wasm32-only one.
+        // CTX-DEV-1: the host unit tests keep the host's unix-only dev-dependency on
+        // every platform (the host is unix), and have no wasm32-only one.
         assert!(
             top_deps(unittest).contains(&"//nativeonly:nativeonly"),
             "{unittest}"
         );
         assert!(!unittest.contains("wasmonly"), "{unittest}");
+
+        if with_integration_test {
+            // CTX-DEV-1: the integration test is a target compilation: on wasm32 it
+            // has `wasmonly` and not `nativeonly`; on linux the reverse.
+            let api = rule(&pm, "api");
+            assert!(
+                !top_deps(api).iter().any(|d| d.contains("nativeonly")),
+                "{api}"
+            );
+            assert!(
+                !top_deps(api).iter().any(|d| d.contains("wasmonly")),
+                "{api}"
+            );
+            let wasm = platform_deps(api, "wasm32");
+            assert!(wasm.contains(&"//wasmonly:wasmonly"), "{api}");
+            assert!(!wasm.iter().any(|d| d.contains("nativeonly")), "{api}");
+            let linux = platform_deps(api, "linux-x86_64");
+            assert!(linux.contains(&"//nativeonly:nativeonly"), "{api}");
+            assert!(!linux.iter().any(|d| d.contains("wasmonly")), "{api}");
+            assert!(api.contains("\":pm\""), "{api}");
+        }
     }
 }
