@@ -371,11 +371,33 @@ impl BuckalContext {
             &self.resolve,
             &self.workspace_root,
             &self.repo_config,
+            &self.declared_test_env_key(),
         )
         .with_host_platform_differences(
             self.host_platform_differences.clone(),
             self.host_platform_difference_digests.clone(),
         )
+    }
+
+    /// The declared test environments, by package name, serialized (empty when
+    /// none is declared): a declaration reaches the tests of every package whose
+    /// dependency closure contains its package, so a change to one regenerates
+    /// every first-party package (Fable N15).
+    fn declared_test_env_key(&self) -> Vec<u8> {
+        if self.declared_test_env.is_empty() {
+            return Vec::new();
+        }
+        let by_name: std::collections::BTreeMap<&str, &std::collections::BTreeMap<String, String>> =
+            self.declared_test_env
+                .iter()
+                .map(|(id, declared)| {
+                    (
+                        self.resolve.dag[self.resolve.index_map[id]].name.as_str(),
+                        declared,
+                    )
+                })
+                .collect();
+        serde_json::to_vec(&by_name).expect("declared test environments serialize")
     }
 
     /// Stop, writing nothing, when the host compilations that resolve differently

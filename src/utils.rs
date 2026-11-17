@@ -528,7 +528,7 @@ pub fn get_last_cache(manifest_path: Option<&str>) -> BuckalCache {
             }
         };
         let repo_config = load_repo_config(&metadata.workspace_root);
-        BuckalCache::from_resolve_with_config(&resolve, &metadata.workspace_root, &repo_config)
+        BuckalCache::from_resolve_with_config(&resolve, &metadata.workspace_root, &repo_config, &[])
         .into_unverified_inventory()
     })
 }

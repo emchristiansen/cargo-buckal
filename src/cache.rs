@@ -204,18 +204,26 @@ impl BuckalCache {
 
     /// Fingerprints for the repository configuration `config`: its fixups (see
     /// [`Self::from_resolve_with_fixups`]) and the workspace-level settings that
-    /// change first-party packages' rules.
+    /// change first-party packages' rules, with `workspace_inputs`: what else of
+    /// the workspace reaches every first-party package's rules (the declared test
+    /// environments), serialized; empty when nothing does.
     pub fn from_resolve_with_config(
         resolve: &BuckalResolve,
         workspace_root: &Utf8PathBuf,
         config: &RepoConfig,
+        workspace_inputs: &[u8],
     ) -> Self {
+        let mut key = config.first_party_generation_key();
+        if !workspace_inputs.is_empty() {
+            key.extend(b"workspace_inputs");
+            key.extend(workspace_inputs);
+        }
         Self::from_resolve_with_options(
             resolve,
             workspace_root,
             &config.patch,
             &config.fixups,
-            &config.first_party_generation_key(),
+            &key,
         )
     }
 

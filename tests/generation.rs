@@ -4072,6 +4072,69 @@ fn test_wasm_module_features_select_its_own_graph() {
 }
 
 #[test]
+fn test_a_changed_test_env_declaration_reaches_a_cached_migrate() {
+    // Fable N15 (f40 b): `reader`'s tests get `MODULE_WASM` through its
+    // dev-dependency on `testkit`, which declares it. A cached migrate must see
+    // the declaration change, though neither `reader` nor its edges changed.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"module\", \"testkit\", \"reader\"]\n",
+    );
+    write(
+        &f.ws.join("module/Cargo.toml"),
+        &manifest(
+            "module",
+            "[lib]\ncrate-type = [\"cdylib\", \"rlib\"]\n[package.metadata.buck2.wasm]\nfeatures = []\nprofile = \"release\"\n",
+        ),
+    );
+    let testkit = |declaration: &str| manifest("testkit", declaration);
+    write(
+        &f.ws.join("testkit/Cargo.toml"),
+        &testkit("[package.metadata.buck2.test-env]\nMODULE_WASM = { wasm = \"module\" }\n"),
+    );
+    write(
+        &f.ws.join("reader/Cargo.toml"),
+        &manifest(
+            "reader",
+            "[dev-dependencies]\ntestkit = { path = \"../testkit\" }\n",
+        ),
+    );
+    write(&f.ws.join("reader/tests/it.rs"), "");
+    for name in ["module", "testkit", "reader"] {
+        write(&f.ws.join(name).join("src/lib.rs"), "");
+    }
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!(
+            "{}\n[wasm]\npackages = [\"module\"]\nplatform = \"root//buck2/platforms/wasm:wasm32_unknown_unknown\"\n",
+            BUCKAL_TOML.split("[fixups.extra]").next().unwrap()
+        ),
+    );
+    f.migrate(&[]);
+    assert!(rule(&f.buck("reader"), "it").contains("MODULE_WASM"));
+
+    // The declaration is removed: a cached migrate drops the variable.
+    write(&f.ws.join("testkit/Cargo.toml"), &testkit(""));
+    f.migrate(&[]);
+    let cached = f.buck("reader");
+    assert!(!cached.contains("MODULE_WASM"), "{cached}");
+    f.migrate(&["--no-cache"]);
+    assert_eq!(f.buck("reader"), cached);
+
+    // Declared again under another name: a cached migrate picks it up.
+    write(
+        &f.ws.join("testkit/Cargo.toml"),
+        &testkit("[package.metadata.buck2.test-env]\nOTHER_WASM = { wasm = \"module\" }\n"),
+    );
+    f.migrate(&[]);
+    let cached = f.buck("reader");
+    assert!(rule(&cached, "it").contains("OTHER_WASM"), "{cached}");
+    f.migrate(&["--no-cache"]);
+    assert_eq!(f.buck("reader"), cached);
+}
+
+#[test]
 fn test_per_test_unset_run_env_through_generation() {
     // N14: a single test can drop a key of the package's `test_run_env` (an empty
     // string stays a value).
