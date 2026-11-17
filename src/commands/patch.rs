@@ -44,18 +44,15 @@ pub fn execute(args: &PatchArgs) {
     // a failure here does not leave a partially-written config file.
     let mut changes = targeted_patch_changes(&ctx, &selected)
         .unwrap_or_exit_ctx("failed to compute patched BUCK updates");
-    // The cache saved below certifies every package's rules. Without a compatible
-    // record of generated rules, regenerate all of them first.
+    // The cache saved below certifies every package's rules, so every package whose
+    // rules are not current is regenerated too, not only the patched ones: those
+    // the full diff against the last cache finds (all of them without a compatible
+    // record of generated rules), such as one whose fixup changed since.
     let last_cache = get_last_cache(args.manifest_path.as_deref());
-    let full =
+    changes.merge(
         BuckalCache::from_resolve_with_config(&ctx.resolve, &ctx.workspace_root, &ctx.repo_config)
-            .diff(&last_cache, &ctx.workspace_root);
-    if last_cache.is_unverified_inventory() {
-        changes.merge(full);
-    } else {
-        // Only what the previous generation emitted, for merging manual edits.
-        changes.previous_fixup_rustc_flags = full.previous_fixup_rustc_flags;
-    }
+            .diff(&last_cache, &ctx.workspace_root),
+    );
 
     upsert_version_patch(
         &RepoConfig::repo_config_path(),

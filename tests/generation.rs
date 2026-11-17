@@ -617,6 +617,74 @@ fn test_no_cache_keeps_the_record_of_generated_fixup_flags() {
     assert_eq!(extra_flags(), [manifest_flag]);
 }
 
+/// Make `itoa` 0.4.8 and 1.0.0 available offline to the fixture, from a directory
+/// source replacing crates.io, and have `consumer` use both.
+fn two_itoa_versions(f: &Fixture) {
+    let registry = f.ws.parent().unwrap().join("registry");
+    // A directory source gives Cargo.lock the `package` checksum its
+    // `.cargo-checksum.json` states; generation emits it as the archive's sha256.
+    // These are fixture values, not the real crates' checksums: nothing is fetched.
+    for (n, version) in ["0.4.8", "1.0.0"].into_iter().enumerate() {
+        let dir = registry.join(format!("itoa-{version}"));
+        write(
+            &dir.join("Cargo.toml"),
+            &format!("[package]\nname = \"itoa\"\nversion = \"{version}\"\nedition = \"2015\"\n"),
+        );
+        write(&dir.join("src/lib.rs"), "");
+        write(
+            &dir.join(".cargo-checksum.json"),
+            &format!("{{\"files\":{{}},\"package\":\"{:064x}\"}}", n + 1),
+        );
+    }
+    write(
+        &f.ws.join(".cargo/config.toml"),
+        &format!(
+            "[source.crates-io]\nreplace-with = \"fixture\"\n[source.fixture]\ndirectory = {:?}\n",
+            registry.to_str().unwrap()
+        ),
+    );
+    write(
+        &f.ws.join("consumer/Cargo.toml"),
+        &manifest(
+            "consumer",
+            "[dependencies]\nold = { package = \"itoa\", version = \"0.4\" }\nnew = { package = \"itoa\", version = \"1.0\" }\n",
+        ),
+    );
+    write(&f.ws.join("consumer/src/lib.rs"), "");
+}
+
+#[test]
+fn test_targeted_patch_regenerates_unrelated_dirty_packages() {
+    // R4-PATCH-1: `extra`'s fixup changes after the last generation, then a
+    // targeted `patch itoa` (for `consumer`) saves a cache that certifies every
+    // package. `extra` must be regenerated then, or stay dirty for the next run.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"extra\", \"consumer\"]\n",
+    );
+    two_itoa_versions(&f);
+    let config = |opt: &str| {
+        format!(
+            "ignore_tests = false\npatch_fields = [\"rustc_flags\"]\n[fixups.extra]\nrustc_flags = [\"-C\", \"opt-level={opt}\"]\n"
+        )
+    };
+    let manifest_flag = "@$(location :manifest[env_flags])";
+    let extra_flags = || rustc_flags(rule(&f.buck("extra"), "extra"));
+    write(&f.ws.join("buckal.toml"), &config("2"));
+    f.migrate(&[]);
+    assert_eq!(extra_flags(), [manifest_flag, "-C", "opt-level=2"]);
+
+    write(&f.ws.join("buckal.toml"), &config("3"));
+    f.run(&["patch", "itoa"]);
+    let patched = std::fs::read_to_string(f.ws.join("buckal.toml")).unwrap();
+    assert!(patched.contains("opt-level=3"), "{patched}");
+    assert_eq!(extra_flags(), [manifest_flag, "-C", "opt-level=3"]);
+
+    f.migrate(&["--merge"]);
+    assert_eq!(extra_flags(), [manifest_flag, "-C", "opt-level=3"]);
+}
+
 #[test]
 fn test_fixup_test_execution_through_generation() {
     let f = fixture();
