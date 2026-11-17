@@ -355,7 +355,7 @@ mod tests {
         BuckalTarget {
             name: name.to_string(),
             kind: vec![kind],
-            src_path: Utf8PathBuf::from("/tmp/dummy.rs"),
+            src_path: Utf8PathBuf::from("/nonexistent-buckal-test-package/dummy.rs"),
             doctest: true,
             test: true,
         }
@@ -374,7 +374,7 @@ mod tests {
                 relative_path: "".to_string(),
             },
             edition: Edition::E2021,
-            manifest_path: Utf8PathBuf::from("/tmp/Cargo.toml"),
+            manifest_path: Utf8PathBuf::from("/nonexistent-buckal-test-package/Cargo.toml"),
             targets,
             source: None,
             links: None,
@@ -626,11 +626,17 @@ mod tests {
                     assert_eq!(m.workspace.as_deref(), Some(":vendor[Cargo.toml]"));
                 }
                 Rule::RustLibrary(l) => {
-                    assert_eq!(l.srcs, Set::from([":vendor[crates/rig-core]".to_owned()]));
+                    assert_eq!(
+                        l.srcs,
+                        Set::from([":vendor[crates/rig-core]".to_owned()]).into()
+                    );
                     assert_eq!(l.crate_root, "vendor/crates/rig-core/src/lib.rs");
                 }
                 Rule::RustBinary(b) => {
-                    assert_eq!(b.srcs, Set::from([":vendor[crates/rig-core]".to_owned()]));
+                    assert_eq!(
+                        b.srcs,
+                        Set::from([":vendor[crates/rig-core]".to_owned()]).into()
+                    );
                     assert_eq!(b.crate_root, "vendor/crates/rig-core/build.rs");
                 }
                 Rule::BuildscriptRun(r) => {
@@ -783,5 +789,116 @@ mod tests {
         let content = gen_buck_content(&rules);
         assert!(!content.contains("platform = "), "{content}");
         assert!(content.contains("\"browser\""), "{content}");
+    }
+
+    fn first_party_package(relative_path: &str, files: &[&str]) -> (tempfile::TempDir, BuckalNode) {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = Utf8PathBuf::from_path_buf(dir.path().join(relative_path)).unwrap();
+        for file in files {
+            let path = pkg.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        let target = |name: &str, kind: TargetKind, file: &str| BuckalTarget {
+            name: name.to_owned(),
+            kind: vec![kind],
+            src_path: pkg.join(file),
+            doctest: true,
+            test: true,
+        };
+        let mut node = mock_node(
+            "conta-wire",
+            vec![
+                target("conta_wire", TargetKind::Lib, "src/lib.rs"),
+                target("wire", TargetKind::Test, "tests/wire.rs"),
+            ],
+        );
+        node.kind = NodeKind::FirstParty {
+            relative_path: relative_path.to_owned(),
+        };
+        node.manifest_path = pkg.join("Cargo.toml");
+        (dir, node)
+    }
+
+    #[test]
+    fn test_first_party_sources_compile_at_their_checkout_paths() {
+        let (_dir, node) = first_party_package(
+            "conta/wire",
+            &[
+                "src/lib.rs",
+                "tests/wire.rs",
+                "testdata/snapshots/a__b.snap",
+            ],
+        );
+        let rules = buckify_root_node(&node, &test_ctx());
+        let content = gen_buck_content(&rules);
+
+        let lib = rules
+            .iter()
+            .find_map(|r| match r {
+                Rule::RustLibrary(l) => Some(l),
+                _ => None,
+            })
+            .expect("rust_library");
+        // file!() becomes `conta/wire/src/lib.rs`: the prelude remaps the sources
+        // directory to the package path, and the sources sit at their own paths.
+        assert_eq!(lib.crate_root, "src/lib.rs");
+        assert!(
+            content.contains("    srcs = glob([\"**/**\"]),\n"),
+            "{content}"
+        );
+        assert!(!content.contains("crate_root = \"vendor/"), "{content}");
+
+        // cargo_manifest still reads the vendor filegroup.
+        assert!(content.contains("    vendor = \":vendor\",\n"), "{content}");
+
+        for test in ["unittest", "wire"] {
+            let t = find_test(&rules, test);
+            assert_eq!(
+                t.run_env.get("CARGO_MANIFEST_DIR").map(String::as_str),
+                Some("conta/wire")
+            );
+            assert_eq!(
+                t.resources.as_ref().map(|g| g.include.clone()),
+                Some(Set::from(["**/*.snap".to_owned()]))
+            );
+        }
+        assert_eq!(find_test(&rules, "wire").crate_root, "tests/wire.rs");
+        assert!(
+            content.contains("    resources = glob([\"**/*.snap\"]),\n"),
+            "{content}"
+        );
+        assert!(
+            content.contains(
+                "    run_env = {\n        \"CARGO_MANIFEST_DIR\": \"conta/wire\",\n    },\n"
+            ),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_resources_only_when_the_package_has_snapshots() {
+        let (_dir, node) = first_party_package(
+            "conta/inspect/render",
+            &[
+                "src/lib.rs",
+                "tests/wire.rs",
+                // In a nested Buck package, which the package glob does not enter.
+                "vocab/BUCK",
+                "vocab/x.snap",
+                // Build output and hidden directories are not sources.
+                "target/debug/y.snap",
+                ".jj/z.snap",
+            ],
+        );
+        let rules = buckify_root_node(&node, &test_ctx());
+        assert_eq!(find_test(&rules, "unittest").resources, None);
+        assert_eq!(
+            find_test(&rules, "unittest")
+                .run_env
+                .get("CARGO_MANIFEST_DIR")
+                .map(String::as_str),
+            Some("conta/inspect/render")
+        );
     }
 }

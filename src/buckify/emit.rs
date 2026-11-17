@@ -12,13 +12,13 @@ use cargo_util_schemas::lockfile::TomlLockfileSourceId;
 use crate::{
     buck::{
         BuildscriptRun, CargoManifest, CargoTargetKind, ExportFile, FileGroup, GitFetch, Glob,
-        HttpArchive, RustBinary, RustLibrary, RustRule, RustTest,
+        HttpArchive, RustBinary, RustLibrary, RustRule, RustTest, Srcs,
     },
     buckify::actions::is_third_party,
     context::BuckalContext,
     platform::{buck_labels, lookup_platforms},
     platform_features::{PlatformAttrs, split_features},
-    resolve::{BuckalDepKind, BuckalNode, BuckalTarget},
+    resolve::{BuckalDepKind, BuckalNode, BuckalTarget, NodeKind},
     utils::{UnwrapOrExit, get_buck2_root, get_cfgs, get_target, get_vendor_path_relative},
 };
 
@@ -36,7 +36,7 @@ pub(super) fn emit_rust_library(
     let (features, platform) = node_features(node);
     let mut rust_library = RustLibrary {
         name: buckal_name.to_owned(),
-        srcs: Set::from([vendor.label.clone()]),
+        srcs: vendor.srcs.clone(),
         crate_name: lib_target.name.to_owned().replace("-", "_"),
         edition: node.edition.to_string(),
         features,
@@ -51,18 +51,14 @@ pub(super) fn emit_rust_library(
     }
 
     // Set the crate root path
-    rust_library.crate_root = format!(
-        "{}/{}",
-        vendor.root,
-        normalize_path_for_buck(
-            lib_target
-                .src_path
-                .to_owned()
-                .strip_prefix(manifest_dir)
-                .expect("Failed to get library source path")
-                .as_str()
-        )
-    );
+    rust_library.crate_root = vendor.crate_path(&normalize_path_for_buck(
+        lib_target
+            .src_path
+            .to_owned()
+            .strip_prefix(manifest_dir)
+            .expect("Failed to get library source path")
+            .as_str(),
+    ));
 
     // look up platform compatibility
     if let Some(platforms) = lookup_platforms(&node.name) {
@@ -88,7 +84,7 @@ pub(super) fn emit_rust_binary(
     let (features, platform) = node_features(node);
     let mut rust_binary = RustBinary {
         name: buckal_name.to_owned(),
-        srcs: Set::from([vendor.label.clone()]),
+        srcs: vendor.srcs.clone(),
         crate_name: bin_target.name.to_owned().replace("-", "_"),
         edition: node.edition.to_string(),
         features,
@@ -99,18 +95,14 @@ pub(super) fn emit_rust_binary(
     };
 
     // Set the crate root path
-    rust_binary.crate_root = format!(
-        "{}/{}",
-        vendor.root,
-        normalize_path_for_buck(
-            bin_target
-                .src_path
-                .to_owned()
-                .strip_prefix(manifest_dir)
-                .expect("Failed to get binary source path")
-                .as_str()
-        )
-    );
+    rust_binary.crate_root = vendor.crate_path(&normalize_path_for_buck(
+        bin_target
+            .src_path
+            .to_owned()
+            .strip_prefix(manifest_dir)
+            .expect("Failed to get binary source path")
+            .as_str(),
+    ));
 
     // Set dependencies
     set_deps(&mut rust_binary, node, CargoTargetKind::Bin, ctx)
@@ -135,7 +127,7 @@ pub(super) fn emit_rust_test(
     let (features, platform) = node_features(node);
     let mut rust_test = RustTest {
         name: buckal_name.to_owned(),
-        srcs: Set::from([vendor.label.clone()]),
+        srcs: vendor.srcs.clone(),
         crate_name: test_target.name.to_owned().replace("-", "_"),
         edition: node.edition.to_string(),
         features,
@@ -146,28 +138,67 @@ pub(super) fn emit_rust_test(
     };
 
     // Set the crate root path
-    rust_test.crate_root = format!(
-        "{}/{}",
-        vendor.root,
-        normalize_path_for_buck(
-            test_target
-                .src_path
-                .to_owned()
-                .strip_prefix(manifest_dir)
-                .expect("Failed to get test source path")
-                .as_str()
-        )
-    );
+    rust_test.crate_root = vendor.crate_path(&normalize_path_for_buck(
+        test_target
+            .src_path
+            .to_owned()
+            .strip_prefix(manifest_dir)
+            .expect("Failed to get test source path")
+            .as_str(),
+    ));
 
     // Set dependencies
     set_deps(&mut rust_test, node, CargoTargetKind::Test, ctx)
         .unwrap_or_exit_ctx(format!("failed to set dependencies for '{}'", buckal_name));
+
+    if let NodeKind::FirstParty { relative_path } = &node.kind {
+        // The crate root that `file!()` paths are relative to, for the test's run time.
+        // Project-relative, as the sources are compiled at their checkout paths.
+        let crate_root = if relative_path.is_empty() {
+            ".".to_owned()
+        } else {
+            normalize_path_for_buck(relative_path)
+        };
+        rust_test
+            .run_env
+            .insert("CARGO_MANIFEST_DIR".to_owned(), crate_root);
+
+        // Snapshot files (insta) are read at run time from their checkout paths.
+        if has_snapshot_files(manifest_dir) {
+            rust_test.resources = Some(Glob {
+                include: Set::from([SNAPSHOT_GLOB.to_owned()]),
+                ..Default::default()
+            });
+        }
+    }
 
     if let Some(platforms) = lookup_platforms(&node.name) {
         rust_test.compatible_with = buck_labels(&platforms);
     }
 
     rust_test
+}
+
+/// Snapshot files a test reads at run time, relative to its package.
+const SNAPSHOT_GLOB: &str = "**/*.snap";
+
+/// Whether the package directory holds snapshot files that `SNAPSHOT_GLOB` would
+/// match: below it, outside `target/` and hidden directories, and not inside a nested
+/// Buck package (a directory with its own BUCK file), which a glob does not enter.
+fn has_snapshot_files(manifest_dir: &Utf8Path) -> bool {
+    walkdir::WalkDir::new(manifest_dir)
+        .into_iter()
+        .filter_entry(|entry| {
+            if entry.depth() == 0 || !entry.file_type().is_dir() {
+                return true;
+            }
+            let name = entry.file_name().to_string_lossy();
+            !(name == "target" || name.starts_with('.') || entry.path().join("BUCK").exists())
+        })
+        .filter_map(Result::ok)
+        .any(|entry| {
+            entry.file_type().is_file() && entry.path().extension().is_some_and(|ext| ext == "snap")
+        })
 }
 
 /// Emit `buildscript_build` rule for the given build target
@@ -182,7 +213,7 @@ pub(super) fn emit_buildscript_build(
     // create the build script rule
     let mut buildscript_build = RustBinary {
         name: build_target.name.to_owned(),
-        srcs: Set::from([vendor.label.clone()]),
+        srcs: vendor.srcs.clone(),
         crate_name: build_target.name.to_owned().replace("-", "_"),
         edition: node.edition.to_string(),
         features,
@@ -192,18 +223,14 @@ pub(super) fn emit_buildscript_build(
     };
 
     // Set the crate root path for the build script
-    buildscript_build.crate_root = format!(
-        "{}/{}",
-        vendor.root,
-        normalize_path_for_buck(
-            build_target
-                .src_path
-                .to_owned()
-                .strip_prefix(manifest_dir)
-                .expect("Failed to get build script source path")
-                .as_str()
-        )
-    );
+    buildscript_build.crate_root = vendor.crate_path(&normalize_path_for_buck(
+        build_target
+            .src_path
+            .to_owned()
+            .strip_prefix(manifest_dir)
+            .expect("Failed to get build script source path")
+            .as_str(),
+    ));
 
     // Set dependencies for the build script
     set_deps(
@@ -431,19 +458,51 @@ pub(super) struct VendorRef {
     /// Label of the package directory: `:vendor`, or `:vendor[<subdir>]` for a crate that lives
     /// in a subdirectory of a fetched git repository.
     pub label: String,
-    /// Path of the package directory inside the rule's sources, used as the `crate_root` prefix.
+    /// The `srcs` of the package's Rust rules.
+    pub srcs: Srcs,
+    /// Path of the package directory inside the rule's sources, used as the `crate_root`
+    /// prefix; empty when the sources are the package's own files at their own paths.
     pub root: String,
     /// Label of the enclosing workspace manifest a git crate inherits keys from, if any.
     pub workspace_manifest: Option<String>,
 }
 
+impl VendorRef {
+    /// `path` (relative to the package directory) as a path inside the rule's sources.
+    pub fn crate_path(&self, path: &str) -> String {
+        if self.root.is_empty() {
+            path.to_owned()
+        } else {
+            format!("{}/{}", self.root, path)
+        }
+    }
+}
+
 /// The vendored location of `node`'s package directory.
 ///
-/// Registry archives and first-party packages are the `vendor` target itself. A git
+/// A first-party package compiles its own files at their own package-relative paths
+/// (`srcs = glob(["**/**"])`, `crate_root = "src/lib.rs"`). The prelude remaps the
+/// sources directory to the package path, so `file!()` is the checkout path
+/// (`<package>/src/...`), as under Cargo. Tools that locate files from `file!()` at run
+/// time, such as insta snapshots, then find them where they are checked in. The
+/// `vendor` filegroup remains the input of `cargo_manifest` and `buildscript_run`.
+///
+/// A registry archive is the `vendor` target itself. A git
 /// dependency may live in a subdirectory of its repository (e.g. `crates/foo` of a
 /// multi-crate workspace); its `vendor` git_fetch then exposes that subdirectory and the
 /// enclosing workspace manifest as sub-targets, and every rule refers to those.
 pub(super) fn vendor_ref(node: &BuckalNode) -> VendorRef {
+    if matches!(node.kind, NodeKind::FirstParty { .. }) {
+        return VendorRef {
+            label: get_vendor_target(),
+            srcs: Srcs::Glob(Glob {
+                include: Set::from(["**/**".to_owned()]),
+                ..Default::default()
+            }),
+            root: String::new(),
+            workspace_manifest: None,
+        };
+    }
     let is_git = node
         .source
         .as_deref()
@@ -465,11 +524,13 @@ fn vendor_ref_for_layout(layout: Option<GitLayout>) -> VendorRef {
     match layout.subdir {
         Some(subdir) => VendorRef {
             label: format!(":{name}[{subdir}]"),
+            srcs: Srcs::Labels(Set::from([format!(":{name}[{subdir}]")])),
             root: format!("{name}/{subdir}"),
             workspace_manifest,
         },
         None => VendorRef {
             label: get_vendor_target(),
+            srcs: Srcs::Labels(Set::from([get_vendor_target()])),
             root: name.to_string(),
             workspace_manifest,
         },
@@ -624,6 +685,7 @@ mod tests {
             vendor,
             VendorRef {
                 label: ":vendor[crates/foo]".to_owned(),
+                srcs: Srcs::Labels(Set::from([":vendor[crates/foo]".to_owned()])),
                 root: "vendor/crates/foo".to_owned(),
                 workspace_manifest: Some(":vendor[Cargo.toml]".to_owned()),
             }
@@ -636,6 +698,7 @@ mod tests {
             vendor_ref_for_layout(None),
             VendorRef {
                 label: ":vendor".to_owned(),
+                srcs: Srcs::Labels(Set::from([":vendor".to_owned()])),
                 root: "vendor".to_owned(),
                 workspace_manifest: None,
             }
