@@ -6,7 +6,7 @@ use cargo_util_schemas::core::{PackageIdSpec, SourceKind};
 use itertools::Itertools;
 
 use crate::{
-    buck::{ExportFile, GENERATED_HEADER, Load, Rule, RustRule},
+    buck::{ExportFile, GENERATED_HEADER, Load, PARTLY_GENERATED_HEADER, Rule, RustRule},
     buckal_error, buckal_note, buckal_warn,
     context::BuckalContext,
     resolve::{BuckalNode, BuckalTarget, NodeKind, is_lib_like},
@@ -1001,7 +1001,7 @@ pub fn vendor_package(node: &BuckalNode) -> Utf8PathBuf {
 
 /// Generate the content of the BUCK file based on the given rules, including conditional load statements for used rule types.
 pub fn gen_buck_content(rules: &[Rule]) -> String {
-    gen_buck_content_preserving(rules, &[], &[])
+    render_buck_content(rules, &[], &[], GENERATED_HEADER)
 }
 
 /// [`gen_buck_content`], keeping hand-written `loads` (after the generated ones) and
@@ -1010,6 +1010,20 @@ pub fn gen_buck_content_preserving(
     rules: &[Rule],
     preserved_loads: &[String],
     preserved_statements: &[String],
+) -> String {
+    render_buck_content(
+        rules,
+        preserved_loads,
+        preserved_statements,
+        PARTLY_GENERATED_HEADER,
+    )
+}
+
+fn render_buck_content(
+    rules: &[Rule],
+    preserved_loads: &[String],
+    preserved_statements: &[String],
+    header: &str,
 ) -> String {
     // Analyze which rule types are present to build conditional load statements
     let mut has_cargo_manifest = false;
@@ -1089,7 +1103,7 @@ pub fn gen_buck_content_preserving(
     }
 
     content.insert_str(0, "\n\n");
-    content.insert_str(0, GENERATED_HEADER);
+    content.insert_str(0, header);
 
     content
 }

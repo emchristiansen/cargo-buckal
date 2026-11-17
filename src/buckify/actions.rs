@@ -3,8 +3,8 @@ use regex::Regex;
 
 use crate::{
     buck::{
-        FixupFlags, GENERATED_HEADER, NamedFileGroup, Rule, TopLevelKind, parse_buck_file,
-        patch_buck_rules, top_level_statements,
+        FixupFlags, GENERATED_HEADER, NamedFileGroup, PARTLY_GENERATED_HEADER, Rule, TopLevelKind,
+        parse_buck_file, patch_buck_rules, top_level_statements,
     },
     buckal_log,
     buckify::emit::emit_export_file,
@@ -156,16 +156,34 @@ impl BuckalChange {
                 .iter()
                 .map(|(function, name, text)| (*function, *name, text.trim_end()))
                 .collect();
-            let buck_content = splice_rules(buck_path.as_str(), &existing, &rules, removed)
-                .unwrap_or_exit_ctx(format!("Failed to parse {}", buck_path));
+            let buck_content = splice_rules(
+                buck_path.as_str(),
+                &partly_generated_header(&existing),
+                &rules,
+                removed,
+            )
+            .unwrap_or_exit_ctx(format!("Failed to parse {}", buck_path));
             if buck_content != existing {
                 std::fs::write(&buck_path, buck_content).expect("Failed to write BUCK file");
             }
         } else if !owned.is_empty() {
             let texts: Vec<&str> = owned.iter().map(|(_, _, text)| text.as_str()).collect();
-            let buck_content = format!("{GENERATED_HEADER}\n\n{}", texts.join("\n"));
+            let buck_content = format!("{PARTLY_GENERATED_HEADER}\n\n{}", texts.join("\n"));
             std::fs::write(&buck_path, buck_content).expect("Failed to write BUCK file");
         }
+    }
+}
+
+/// `content` of the workspace-root BUCK file, whose header claims only
+/// generation's own rules: an earlier `@generated` header (which claims the whole
+/// file) becomes [`PARTLY_GENERATED_HEADER`]. Nothing else changes.
+fn partly_generated_header(content: &str) -> String {
+    match content.split_once('\n') {
+        Some((first, rest)) if first.trim() == GENERATED_HEADER => {
+            format!("{PARTLY_GENERATED_HEADER}\n{rest}")
+        }
+        None if content.trim() == GENERATED_HEADER => PARTLY_GENERATED_HEADER.to_owned(),
+        _ => content.to_owned(),
     }
 }
 
