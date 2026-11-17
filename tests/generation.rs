@@ -4786,3 +4786,27 @@ fn test_a_name_generation_emits_twice_is_refused() {
     );
     assert!(!f.ws.join("module/BUCK").exists());
 }
+
+#[test]
+fn test_a_variant_is_named_only_by_its_variant_key() {
+    // Fable on 4b76a20a: `{ wasm = "module.harness" }` is not another spelling
+    // of `{ wasm = "module", variant = "harness" }`.
+    for (key, value) in [
+        ("wasm", "module.harness"),
+        ("wasm_sha256", "module.harness"),
+    ] {
+        let f = wasm_test_env_fixture(
+            "[package.metadata.buck2.wasm-variants.harness]\nfeatures = [\"admission\"]\n",
+            &format!("H = {{ {key} = \"{value}\" }}\n"),
+        );
+        let output = f.output(&["migrate"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{key}: {stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "`testkit`: `[package.metadata.buck2.test-env] H` names the package `module.harness`; a variant is named by its own key, `{{ {key} = \"module\", variant = \"harness\" }}`"
+            )),
+            "{key}: {stderr}"
+        );
+    }
+}

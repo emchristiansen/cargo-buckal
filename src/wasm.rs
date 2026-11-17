@@ -265,6 +265,15 @@ pub fn test_env_declaration(package: &Package) -> Result<BTreeMap<String, TestEn
                 _ => return Err(refuse()),
             };
             let module = module.as_str().ok_or_else(refuse)?;
+            // A package name has no `.`: `<package>.<variant>` is a module key,
+            // which a declaration spells only with `variant`.
+            if let Some((name, variant)) = module.split_once('.') {
+                bail!(
+                    "`{}`: `[package.metadata.buck2.test-env] {variable}` names the package `{module}`; a variant is named by its own key, `{{ {} = \"{name}\", variant = \"{variant}\" }}`",
+                    package.name,
+                    if sha256 { "wasm_sha256" } else { "wasm" }
+                );
+            }
             let variant = match entry.get("variant") {
                 None => None,
                 Some(v) => Some(v.as_str().filter(|v| valid_variant_name(v)).ok_or_else(refuse)?),
