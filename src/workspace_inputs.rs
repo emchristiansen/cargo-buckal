@@ -255,19 +255,24 @@ fn expand(input: &str, workspace_root: &Utf8Path) -> Result<Vec<String>, String>
                 .unwrap_or_else(|| base.to_string());
             format!("cannot read `{at}`: {error}")
         })?;
-        // A symbolic link to a file counts as the file, as a literal path does;
-        // where it leads is checked with every match.
-        if !entry.path().is_file() {
-            continue;
-        }
         let Some(path) = Utf8Path::from_path(entry.path()) else {
             continue;
         };
-        let Ok(path) = relative(path, workspace_root) else {
+        let Ok(relative_path) = relative(path, workspace_root) else {
             continue;
         };
-        if matcher.is_match(&path) {
-            files.push(path);
+        // A symbolic link to a file counts as the file, as a literal path does;
+        // where it leads is checked with every match. A matching link that
+        // leads nowhere is refused, as its literal path is; one the glob does
+        // not match gives no file whatever it was meant to be.
+        if !path.is_file() {
+            if entry.path_is_symlink() && !path.exists() && matcher.is_match(&relative_path) {
+                return Err(format!("`{relative_path}` is a dangling symbolic link"));
+            }
+            continue;
+        }
+        if matcher.is_match(&relative_path) {
+            files.push(relative_path);
         }
     }
     files.sort();
@@ -312,6 +317,29 @@ mod tests {
             expand("missing/*.toml", &root).unwrap_err(),
             "matches no file"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_glob_refuses_a_dangling_link_it_matches() {
+        // N9 residual (a): a matching dangling link is refused by name, as the
+        // literal path is; one the glob does not match gives no file either way.
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
+        std::fs::create_dir_all(root.join("conf")).unwrap();
+        std::fs::write(root.join("conf/a.toml"), "").unwrap();
+        std::os::unix::fs::symlink("gone.toml", root.join("conf/dangling.toml")).unwrap();
+        std::os::unix::fs::symlink("gone", root.join("conf/stale")).unwrap();
+        assert_eq!(
+            expand("conf/dangling.toml", &root).unwrap_err(),
+            "matches no file"
+        );
+        let error = expand("conf/*.toml", &root).unwrap_err();
+        assert!(
+            error.contains("`conf/dangling.toml` is a dangling symbolic link"),
+            "{error}"
+        );
+        assert_eq!(expand("conf/a*", &root).unwrap(), ["conf/a.toml"]);
     }
 
     #[test]
