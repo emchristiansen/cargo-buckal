@@ -9,16 +9,17 @@ use crate::{
     buck::{Load, Rule, RustRule},
     buckal_error, buckal_note, buckal_warn,
     context::BuckalContext,
-    resolve::{BuckalNode, is_lib_like},
+    resolve::{BuckalNode, BuckalTarget, is_lib_like},
     utils::{UnwrapOrExit, get_vendor_dir},
 };
 
 use super::includes::{IncludeGap, UnprovidedInclude, unprovided_includes};
 
+use super::deps::host_variant_name;
 use super::emit::{
     emit_buildscript_build, emit_buildscript_run, emit_cargo_manifest, emit_filegroup,
     emit_git_fetch, emit_http_archive, emit_rust_binary, emit_rust_library, emit_rust_test,
-    patch_with_buildscript,
+    host_variant_build_target, patch_with_buildscript,
 };
 
 /// Buckifies a third-party dependency into a list of BUCK rules.
@@ -95,6 +96,14 @@ pub fn buckify_dep_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         let buildscript_run = emit_buildscript_run(node, build_target, ctx);
         buck_rules.push(Rule::BuildscriptRun(buildscript_run));
     }
+
+    buck_rules.extend(host_variant_rules(
+        node,
+        lib_target,
+        &node.name,
+        &manifest_dir,
+        ctx,
+    ));
 
     apply_fixups(&mut buck_rules, node, ctx);
 
@@ -234,9 +243,71 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         buck_rules.push(Rule::BuildscriptRun(buildscript_run));
     }
 
+    if let (Some(lib_target), Some(lib_name)) = (lib_targets.first(), &lib_buck_name) {
+        buck_rules.extend(host_variant_rules(
+            node,
+            lib_target,
+            lib_name,
+            &manifest_dir,
+            ctx,
+        ));
+    }
+
     apply_fixups(&mut buck_rules, node, ctx);
 
     buck_rules
+}
+
+/// The rules of `node`'s host variant, if it has one: its library `<lib_name>-host`
+/// and, with a build script, `build-script-host-build`/`build-script-host-run`,
+/// compiled with Cargo's host-context resolution. Host-context rules of other
+/// packages (build scripts, proc-macros and what they use) depend on it instead of
+/// the target-context library.
+fn host_variant_rules(
+    node: &BuckalNode,
+    lib_target: &BuckalTarget,
+    lib_name: &str,
+    manifest_dir: &Utf8PathBuf,
+    ctx: &BuckalContext,
+) -> Vec<Rule> {
+    let Some(resolution) = node.platform_features.host_variant_resolution() else {
+        return Vec::new();
+    };
+    let host_node = BuckalNode {
+        platform_features: resolution,
+        ..node.clone()
+    };
+    let mut rules = vec![Rule::RustLibrary(emit_rust_library(
+        &host_node,
+        lib_target,
+        manifest_dir,
+        &host_variant_name(lib_name),
+        ctx,
+    ))];
+    let custom_build_target = node
+        .targets
+        .iter()
+        .find(|t| t.kind.contains(&TargetKind::CustomBuild));
+    if let Some(build_target) = custom_build_target {
+        let host_build = host_variant_build_target(build_target);
+        for rule in &mut rules {
+            if let Some(rust_rule) = rule.as_rust_rule_mut() {
+                patch_with_buildscript(rust_rule, &host_build);
+            }
+        }
+        rules.push(Rule::RustBinary(emit_buildscript_build(
+            &host_build,
+            &host_node,
+            manifest_dir,
+            ctx,
+        )));
+        rules.push(Rule::BuildscriptRun(emit_buildscript_run(
+            &host_node,
+            &host_build,
+            ctx,
+        )));
+    }
+    rules
 }
 
 /// Add the repository's `[fixups.<package>]` configuration to the package's rules.
@@ -778,7 +849,7 @@ mod tests {
                 ),
             ]
             .into(),
-            deps: Default::default(),
+            ..Default::default()
         };
 
         let rules = buckify_root_node(&node, &test_ctx());
@@ -975,5 +1046,84 @@ mod tests {
             content.contains("    mapped_srcs = {\n        \"//text/glyph_vocab/vocab:compiler_input/bpe-52.toml\": \"vocab/bpe-52.toml\",\n    },\n"),
             "{content}"
         );
+    }
+
+    #[test]
+    fn test_host_variant_emits_host_rules() {
+        let lib = mock_target("json", TargetKind::Lib);
+        let build = mock_target("build-script-build", TargetKind::CustomBuild);
+        let mut node = mock_node("json", vec![lib, build]);
+        let linux = |features: &[&str]| {
+            std::collections::BTreeMap::from([(
+                "linux-x86_64".to_owned(),
+                features.iter().map(|f| f.to_string()).collect::<Set<_>>(),
+            )])
+        };
+        node.platform_features = crate::platform_features::PlatformResolution {
+            features: linux(&["std"]),
+            deps: linux(&[]),
+            host_variant: Some(crate::platform_features::HostVariant {
+                features: linux(&["preserve_order", "std"]),
+                deps: linux(&[]),
+            }),
+            ..Default::default()
+        };
+
+        let rules = buckify_root_node(&node, &test_ctx());
+        let library = |name: &str| {
+            rules
+                .iter()
+                .find_map(|r| match r {
+                    Rule::RustLibrary(l) if l.name == name => Some(l),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("rust_library {name}"))
+        };
+        assert_eq!(library("json").features, Set::from(["std".to_owned()]));
+        assert_eq!(
+            library("json").env["OUT_DIR"],
+            "$(location :build-script-run[out_dir])"
+        );
+        let host = library("json-host");
+        assert_eq!(
+            host.features,
+            Set::from(["preserve_order".to_owned(), "std".to_owned()])
+        );
+        assert_eq!(
+            host.env["OUT_DIR"],
+            "$(location :build-script-host-run[out_dir])"
+        );
+        assert!(
+            host.rustc_flags
+                .contains("@$(location :build-script-host-run[rustc_flags])")
+        );
+        assert!(
+            !host
+                .rustc_flags
+                .contains("@$(location :build-script-run[rustc_flags])")
+        );
+
+        let run = rules
+            .iter()
+            .find_map(|r| match r {
+                Rule::BuildscriptRun(b) if b.name == "build-script-host-run" => Some(b),
+                _ => None,
+            })
+            .expect("host build script run");
+        assert_eq!(run.buildscript_rule, ":build-script-host-build");
+        assert_eq!(
+            run.features,
+            Set::from(["preserve_order".to_owned(), "std".to_owned()])
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|r| matches!(r, Rule::RustBinary(b) if b.name == "build-script-host-build"))
+        );
+
+        // Without a host variant nothing extra is emitted.
+        node.platform_features.host_variant = None;
+        let rules = buckify_root_node(&node, &test_ctx());
+        assert!(!gen_buck_content(&rules).contains("-host"));
     }
 }

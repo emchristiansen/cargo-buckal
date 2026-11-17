@@ -22,7 +22,7 @@ use crate::{
     utils::{UnwrapOrExit, get_buck2_root, get_cfgs, get_target, get_vendor_path_relative},
 };
 
-use super::deps::{dep_kind_matches, set_deps};
+use super::deps::{dep_kind_matches, host_variant_name, set_deps, uses_host_variant};
 
 /// Emit `rust_library` rule for the given lib target
 pub(super) fn emit_rust_library(
@@ -287,7 +287,10 @@ pub(super) fn emit_buildscript_run(
                 .iter()
                 .find(|t| t.kind.contains(&TargetKind::CustomBuild));
             if let Some(build_target_dep) = custom_build_target_dep {
-                let build_name_dep = get_build_name(&build_target_dep.name);
+                let mut build_name_dep = get_build_name(&build_target_dep.name).into_owned();
+                if node.platform_features.host_context && uses_host_variant(node, dep_node) {
+                    build_name_dep = host_variant_name(&build_name_dep);
+                }
                 buildscript_run.env_srcs.insert(format!(
                     "//{}:{build_name_dep}-run[metadata]",
                     get_vendor_path_relative(&dep_node.package_id).unwrap_or_exit()
@@ -411,6 +414,19 @@ pub(super) fn emit_export_file() -> ExportFile {
         src: "Cargo.toml".to_string(),
         mode: Some("reference".to_owned()),
         visibility: Set::from(["PUBLIC".to_owned()]),
+    }
+}
+
+/// The build script target of a package's host variant: `build-script-build` becomes
+/// `build-script-host-build`, so its rules are `build-script-host-build` and
+/// `build-script-host-run`.
+pub(super) fn host_variant_build_target(build_target: &BuckalTarget) -> BuckalTarget {
+    BuckalTarget {
+        name: format!(
+            "{}-build",
+            host_variant_name(&get_build_name(&build_target.name))
+        ),
+        ..build_target.clone()
     }
 }
 

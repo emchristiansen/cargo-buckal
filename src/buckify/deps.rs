@@ -208,6 +208,24 @@ fn insert_dep(
     Ok(())
 }
 
+/// Whether `kind` of `node` is compiled for the host: a build script, or any rule of
+/// a package that Cargo builds for the host only (or of its host variant).
+pub(super) fn is_host_context(node: &BuckalNode, kind: CargoTargetKind) -> bool {
+    kind == CargoTargetKind::CustomBuild || node.platform_features.host_context
+}
+
+/// Whether a host-context rule of `node` must use `dep_node`'s host variant.
+pub(super) fn uses_host_variant(node: &BuckalNode, dep_node: &BuckalNode) -> bool {
+    node.platform_features
+        .host_variant_deps
+        .contains(&dep_node.package_id.repr)
+}
+
+/// The name (or label) of the host variant of the rule `name`.
+pub(super) fn host_variant_name(name: &str) -> String {
+    format!("{name}-host")
+}
+
 pub(super) fn set_deps(
     rust_rule: &mut dyn RustRule,
     node: &BuckalNode,
@@ -263,12 +281,16 @@ pub(super) fn set_deps(
             continue;
         }
 
-        let (target_label, alias) = resolve_dep_label(dep, dep_node, ctx).with_context(|| {
-            format!(
-                "failed to resolve dependency label for '{}' (package '{}')",
-                dep.name, dep_node.name
-            )
-        })?;
+        let (mut target_label, alias) =
+            resolve_dep_label(dep, dep_node, ctx).with_context(|| {
+                format!(
+                    "failed to resolve dependency label for '{}' (package '{}')",
+                    dep.name, dep_node.name
+                )
+            })?;
+        if is_host_context(node, kind) && uses_host_variant(node, dep_node) {
+            target_label = host_variant_name(&target_label);
+        }
 
         if let Some(on) = edge_platforms
             && on.len() < node.platform_features.deps.len()
@@ -550,5 +572,80 @@ mod tests {
             .chain(rule.platform.values().flat_map(|a| a.values().flatten()))
             .collect();
         assert!(!all.iter().any(|label| label.contains("nowhere")));
+    }
+
+    #[test]
+    fn test_host_context_rules_use_host_variants() {
+        let id = |name: &str| PackageId {
+            repr: format!("registry+https://github.com/rust-lang/crates.io-index#{name}@1.0.0"),
+        };
+        let node = |name: &str| BuckalNode {
+            package_id: id(name),
+            name: name.to_string(),
+            version: "1.0.0".to_string(),
+            features: vec![],
+            platform_features: Default::default(),
+            kind: NodeKind::ThirdParty,
+            edition: Edition::E2021,
+            manifest_path: Utf8PathBuf::from(format!("/registry/{name}/Cargo.toml")),
+            targets: vec![mock_target(name, TargetKind::Lib)],
+            source: Some("registry+https://github.com/rust-lang/crates.io-index".to_string()),
+            links: None,
+            checksum: None,
+        };
+        // `app` uses `json` as a normal and as a build dependency; `json` has a host variant.
+        let mut app = node("app");
+        app.platform_features.host_variant_deps = Set::from([id("json").repr]);
+        let mut json = node("json");
+        json.platform_features.host_variant = Some(Default::default());
+
+        let mut dag = Dag::new();
+        let app_idx = dag.add_node(app.clone());
+        let json_idx = dag.add_node(json.clone());
+        dag.add_edge(
+            app_idx,
+            json_idx,
+            BuckalDep {
+                name: "json".to_string(),
+                dep_kinds: vec![
+                    BuckalDepKind {
+                        kind: DependencyKind::Normal,
+                        target: None,
+                    },
+                    BuckalDepKind {
+                        kind: DependencyKind::Build,
+                        target: None,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        let ctx = BuckalContext {
+            root: None,
+            resolve: BuckalResolve {
+                dag,
+                index_map: HashMap::from([(id("app"), app_idx), (id("json"), json_idx)]),
+            },
+            workspace_root: Utf8PathBuf::from("/registry"),
+            workspace_inherit: false,
+            no_merge: false,
+            repo_config: RepoConfig::default(),
+        };
+        let label = "//third-party/rust/crates/json/1.0.0:json";
+
+        let mut lib = RustLibrary::default();
+        set_deps(&mut lib, &app, CargoTargetKind::Lib, &ctx).unwrap();
+        assert_eq!(lib.deps, Set::from([label.to_owned()]));
+
+        let mut build = RustLibrary::default();
+        set_deps(&mut build, &app, CargoTargetKind::CustomBuild, &ctx).unwrap();
+        assert_eq!(build.deps, Set::from([format!("{label}-host")]));
+
+        // A host-only package (e.g. a proc-macro) uses the variant from its library too.
+        let mut host_only = app.clone();
+        host_only.platform_features.host_context = true;
+        let mut pm = RustLibrary::default();
+        set_deps(&mut pm, &host_only, CargoTargetKind::Lib, &ctx).unwrap();
+        assert_eq!(pm.deps, Set::from([format!("{label}-host")]));
     }
 }
