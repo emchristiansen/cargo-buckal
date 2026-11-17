@@ -225,8 +225,8 @@ pub struct RustTest {
     pub crate_name: String,
     pub crate_root: String,
     pub edition: String,
-    #[serde(skip_serializing_if = "Set::is_empty")]
-    pub target_compatible_with: Set<String>,
+    #[serde(skip_serializing_if = "TestCompatibility::is_empty")]
+    pub target_compatible_with: TestCompatibility,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub compatible_with: Set<String>,
     #[serde(skip_serializing_if = "Set::is_empty")]
@@ -235,9 +235,9 @@ pub struct RustTest {
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub labels: Set<String>,
     /// Arguments after the test binary, which a test runner passes on (`[fixups.<pkg>]
-    /// test_args` and per-test `args`), in order.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub args: Vec<String>,
+    /// test_args` and per-test `args`), in order, then those lifted by constraints.
+    #[serde(skip_serializing_if = "TestArgs::is_empty")]
+    pub args: TestArgs,
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub env: Map<String, String>,
     /// Environment for running the test only (not for compiling it).
@@ -324,6 +324,189 @@ pub struct BuildscriptRun {
     pub rustc_link_search: bool,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub visibility: Set<String>,
+}
+
+/// The `target_compatible_with` of a `rust_test`: every constraint of `all`, and
+/// one of each group of `any_of` (`[fixups] test_compatible_with` and per-test
+/// `compatible_with`). A group is rendered as nested `select()`s, which are
+/// unambiguous when several of its constraints are present:
+/// `select({A: [], "DEFAULT": select({B: [], "DEFAULT": ["prelude//:none"]})})`.
+#[derive(Default, Debug, PartialEq, Eq, Clone)]
+pub struct TestCompatibility {
+    pub all: Set<String>,
+    pub any_of: Vec<Vec<String>>,
+}
+
+impl TestCompatibility {
+    pub fn is_empty(&self) -> bool {
+        self.all.is_empty() && self.any_of.is_empty()
+    }
+}
+
+impl From<Set<String>> for TestCompatibility {
+    fn from(all: Set<String>) -> Self {
+        Self {
+            all,
+            any_of: Vec::new(),
+        }
+    }
+}
+
+impl std::ops::Deref for TestCompatibility {
+    type Target = Set<String>;
+    fn deref(&self) -> &Set<String> {
+        &self.all
+    }
+}
+
+impl std::ops::DerefMut for TestCompatibility {
+    fn deref_mut(&mut self) -> &mut Set<String> {
+        &mut self.all
+    }
+}
+
+impl Serialize for TestCompatibility {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let groups: Vec<SelectValue> = self
+            .any_of
+            .iter()
+            .map(|group| {
+                SelectValue::unless_any(group, vec![], vec![INCOMPATIBLE_CONSTRAINT.to_owned()])
+            })
+            .collect();
+        concatenation(serializer, &self.all, &groups)
+    }
+}
+
+/// The constraint no platform satisfies.
+pub const INCOMPATIBLE_CONSTRAINT: &str = "prelude//:none";
+
+/// The `args` of a `rust_test`: `plain`, in order, then each group of `lifted`
+/// arguments, which apply unless one of its `lifted_by` constraints is present.
+#[derive(Default, Debug, PartialEq, Eq, Clone)]
+pub struct TestArgs {
+    pub plain: Vec<String>,
+    pub lifted: Vec<crate::config::LiftedArgs>,
+}
+
+impl TestArgs {
+    pub fn is_empty(&self) -> bool {
+        self.plain.is_empty() && self.lifted.is_empty()
+    }
+}
+
+impl From<Vec<String>> for TestArgs {
+    fn from(plain: Vec<String>) -> Self {
+        Self {
+            plain,
+            lifted: Vec::new(),
+        }
+    }
+}
+
+impl std::ops::Deref for TestArgs {
+    type Target = Vec<String>;
+    fn deref(&self) -> &Vec<String> {
+        &self.plain
+    }
+}
+
+impl std::ops::DerefMut for TestArgs {
+    fn deref_mut(&mut self) -> &mut Vec<String> {
+        &mut self.plain
+    }
+}
+
+impl Serialize for TestArgs {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let groups: Vec<SelectValue> = self
+            .lifted
+            .iter()
+            .map(|lifted| SelectValue::unless_any(&lifted.lifted_by, vec![], lifted.args.clone()))
+            .collect();
+        concatenation(serializer, &self.plain, &groups)
+    }
+}
+
+/// `list + select(...) + ...`: `list` alone without selects, the selects alone
+/// with an empty list.
+fn concatenation<S: Serializer, L: Serialize + ?Sized>(
+    serializer: S,
+    list: &L,
+    selects: &[SelectValue],
+) -> Result<S::Ok, S::Error>
+where
+    for<'a> &'a L: IntoIterator,
+{
+    let list_empty = list.into_iter().next().is_none();
+    if selects.is_empty() {
+        return list.serialize(serializer);
+    }
+    let len = selects.len() + usize::from(!list_empty);
+    if len == 1 {
+        return selects[0].serialize(serializer);
+    }
+    let mut plus = serializer.serialize_tuple_struct("+", len)?;
+    if !list_empty {
+        plus.serialize_field(list)?;
+    }
+    for select in selects {
+        plus.serialize_field(select)?;
+    }
+    plus.end()
+}
+
+/// A value that is a string list or a `select()` on one key with a fallback.
+#[derive(Debug, PartialEq, Clone)]
+enum SelectValue {
+    List(Vec<String>),
+    Select {
+        key: String,
+        matched: Vec<String>,
+        otherwise: Box<SelectValue>,
+    },
+}
+
+impl SelectValue {
+    /// `matched` when any of `keys` is present, else `otherwise`, as nested selects
+    /// (one key each, in order).
+    fn unless_any(keys: &[String], matched: Vec<String>, otherwise: Vec<String>) -> Self {
+        keys.iter()
+            .rev()
+            .fold(SelectValue::List(otherwise), |rest, key| {
+                SelectValue::Select {
+                    key: key.clone(),
+                    matched: matched.clone(),
+                    otherwise: Box::new(rest),
+                }
+            })
+    }
+}
+
+impl Serialize for SelectValue {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            SelectValue::List(list) => list.serialize(serializer),
+            SelectValue::Select {
+                key,
+                matched,
+                otherwise,
+            } => {
+                struct Arms<'a>(&'a str, &'a Vec<String>, &'a SelectValue);
+                impl Serialize for Arms<'_> {
+                    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                        use serde::ser::SerializeMap;
+                        let mut map = serializer.serialize_map(Some(2))?;
+                        map.serialize_entry(self.0, self.1)?;
+                        map.serialize_entry("DEFAULT", self.2)?;
+                        map.end()
+                    }
+                }
+                serde_starlark::FunctionCall::new("select", (Arms(key, matched, otherwise),))
+                    .serialize(serializer)
+            }
+        }
+    }
 }
 
 #[derive(Default, Debug, PartialEq, Clone)]
@@ -1014,11 +1197,11 @@ impl RustTest {
         let crate_name = kwargs.get_str("crate")?;
         let crate_root = kwargs.get_str("crate_root")?;
         let edition = kwargs.get_str("edition")?;
-        let target_compatible_with = kwargs.get_list("target_compatible_with");
+        let target_compatible_with = kwargs.get_list("target_compatible_with").into();
         let compatible_with = kwargs.get_list("compatible_with");
         let exec_compatible_with = kwargs.get_list("exec_compatible_with");
         let labels = kwargs.get_list("labels");
-        let args = kwargs.get_ordered_list("args");
+        let args = kwargs.get_ordered_list("args").into();
         let env = kwargs.get_dict("env");
         let features = kwargs.get_list("features");
         let rustc_flags = kwargs.get_ordered_list("rustc_flags");
@@ -2358,11 +2541,12 @@ mod tests {
             crate_name: "example_test".to_string(),
             crate_root: "src/lib.rs".to_string(),
             edition: "2024".to_string(),
-            target_compatible_with: Set::from(["prelude//os/constraints:windows".to_string()]),
+            target_compatible_with: Set::from(["prelude//os/constraints:windows".to_string()])
+                .into(),
             compatible_with: Set::from(["prelude//os/constraints:linux".to_string()]),
             exec_compatible_with: Set::from(["prelude//os/constraints:macos".to_string()]),
             labels: Set::new(),
-            args: Vec::new(),
+            args: Vec::new().into(),
             env: Map::from([("RUST_LOG".to_string(), "debug".to_string())]),
             run_env: Map::new(),
             remote_execution: None,

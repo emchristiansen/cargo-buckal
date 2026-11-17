@@ -3689,3 +3689,63 @@ fn test_with_the_execution_platform_a_plain_rule_differing_only_elsewhere_is_not
         "{stderr}"
     );
 }
+
+#[test]
+fn test_any_of_compatibility_and_lifted_args_through_generation() {
+    // Fable L3: main's generator let either of two switches admit a gate-excluded
+    // test of a live-effect package, and let a switch lift a narrowed test's
+    // selection. `compatible_with` (any-of) and `lifted_args` express both.
+    let f = fixture();
+    let gate = "root//buck2/platforms:test_gate_excluded";
+    let live = "root//buck2/platforms:test_live_effects";
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!(
+            "{BUCKAL_TOML}\n[fixups.app.tests.unittest]\n\
+             compatible_with = [\"{gate}\", \"{live}\"]\n\
+             args = [\"--exact\"]\n\
+             lifted_args = [\n  {{ args = [\"--declared-skip-substring\", \"fleet::\"], lifted_by = [\"{gate}\"] }},\n  {{ args = [\"--declared-skip-substring\", \"live::\"], lifted_by = [\"{gate}\", \"{live}\"] }},\n]\n"
+        ),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let app = f.buck("app");
+    let unittest = rule(&app, "unittest");
+    // Either switch admits the test; with neither it is incompatible. The
+    // cross-compilation selector still follows.
+    let compat = format!(
+        "    target_compatible_with = select({{\n        \"{gate}\": [],\n        \"DEFAULT\": select({{\n            \"{live}\": [],\n            \"DEFAULT\": [\"prelude//:none\"],\n        }}),\n    }}) + select("
+    );
+    assert!(unittest.contains(&compat), "{unittest}");
+    // The plain arguments always apply; each lifted group gives none when one of
+    // its constraints is present.
+    let args = format!(
+        "    args = [\"--exact\"] + select({{\n        \"{gate}\": [],\n        \"DEFAULT\": [\n            \"--declared-skip-substring\",\n            \"fleet::\",\n        ],\n    }}) + select({{\n        \"{gate}\": [],\n        \"DEFAULT\": select({{\n            \"{live}\": [],\n            \"DEFAULT\": [\n                \"--declared-skip-substring\",\n                \"live::\",\n            ],\n        }}),\n    }}),\n"
+    );
+    assert!(unittest.contains(&args), "{unittest}");
+    f.migrate(&["--no-cache"]);
+    assert_eq!(f.buck("app"), app);
+
+    // An entry that would apply always or never is refused.
+    for (entry, why) in [
+        (
+            format!("lifted_args = [{{ args = [], lifted_by = [\"{gate}\"] }}]"),
+            "`[fixups.app.tests.unittest] lifted_args`: an entry has no `args`",
+        ),
+        (
+            "lifted_args = [{ args = [\"--exact\"], lifted_by = [] }]".to_owned(),
+            "`[fixups.app.tests.unittest] lifted_args`: an entry has no `lifted_by`",
+        ),
+    ] {
+        write(
+            &f.ws.join("buckal.toml"),
+            &format!("{BUCKAL_TOML}\n[fixups.app.tests.unittest]\n{entry}\n"),
+        );
+        let output = f.output(&["migrate"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{entry}:\n{stderr}");
+        assert!(stderr.contains(why), "{entry}:\n{stderr}");
+        assert_eq!(f.buck("app"), app, "{entry}");
+    }
+}

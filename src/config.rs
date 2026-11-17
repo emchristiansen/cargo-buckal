@@ -320,6 +320,17 @@ pub struct PackageFixup {
     /// the package, e.g. one that makes a test incompatible unless a setting is on.
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub test_target_compatible_with: Set<String>,
+    /// Constraints (or config settings) of which every test of the package needs
+    /// at least one, e.g. either of two switches: any-of, where
+    /// `test_target_compatible_with` is all-of. Emitted inside the tests'
+    /// `target_compatible_with` as nested `select()`s, since a rule cannot have both
+    /// `compatible_with` and `target_compatible_with`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub test_compatible_with: Vec<String>,
+    /// Arguments of every test of the package that apply unless one of the named
+    /// constraints (or config settings) is present (see [`LiftedArgs`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub test_lifted_args: Vec<LiftedArgs>,
     /// Arguments after the binary of every test of the package, which the test
     /// runner passes on, e.g. the per-test process runner's `--declared-skip NAME`,
     /// `--declared-only-substring WORD` and `--declared-skip-substring WORD`, or
@@ -435,6 +446,24 @@ pub struct TestFixup {
     /// Arguments after the package's `test_args`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
+    /// Any-of constraints of this test, after the package's
+    /// `test_compatible_with` (a separate group: the test needs one of each).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub compatible_with: Vec<String>,
+    /// Arguments of this test lifted by named constraints, after the package's.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub lifted_args: Vec<LiftedArgs>,
+}
+
+/// Test arguments (e.g. a narrowing selection such as `--declared-skip-substring
+/// WORD`) that apply unless one of `lifted_by`, constraint values or config
+/// settings, is present in the test's configuration: emitted as nested
+/// `select()`s giving no arguments when one is present and `args` otherwise.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LiftedArgs {
+    pub args: Vec<String>,
+    pub lifted_by: Vec<String>,
 }
 
 /// An entry of `[fixups.<package>] export_files`.

@@ -822,6 +822,10 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
         );
         std::process::exit(1);
     }
+    if let Err(error) = check_lifted_args(&node.name, fixup) {
+        buckal_error!("{:#}", error);
+        std::process::exit(1);
+    }
     if let Err(error) = check_buildscript_fixup(&node.name, &fixup.buildscript) {
         buckal_error!("{:#}", error);
         std::process::exit(1);
@@ -865,9 +869,21 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
                 r.labels.extend(fixup.test_labels.iter().cloned());
                 r.target_compatible_with.extend(sets.target_compatible_with);
                 r.args.extend(fixup.test_args.iter().cloned());
+                if !fixup.test_compatible_with.is_empty() {
+                    r.target_compatible_with
+                        .any_of
+                        .push(fixup.test_compatible_with.clone());
+                }
+                r.args.lifted.extend(fixup.test_lifted_args.iter().cloned());
                 if let Some(test) = fixup.tests.get(&r.name) {
                     r.labels.extend(test.labels.iter().cloned());
                     r.args.extend(test.args.iter().cloned());
+                    if !test.compatible_with.is_empty() {
+                        r.target_compatible_with
+                            .any_of
+                            .push(test.compatible_with.clone());
+                    }
+                    r.args.lifted.extend(test.lifted_args.iter().cloned());
                 }
                 (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs)
             }
@@ -947,6 +963,34 @@ pub(crate) fn fixup_set_contributions(
         _ => {}
     }
     sets
+}
+
+/// Refuse a lifted-arguments entry without arguments or without a lifting
+/// constraint, which would apply always or never.
+fn check_lifted_args(package: &str, fixup: &crate::config::PackageFixup) -> anyhow::Result<()> {
+    let entries = fixup
+        .test_lifted_args
+        .iter()
+        .map(|lifted| (format!("`[fixups.{package}] test_lifted_args`"), lifted))
+        .chain(fixup.tests.iter().flat_map(|(test, t)| {
+            t.lifted_args.iter().map(move |lifted| {
+                (
+                    format!("`[fixups.{package}.tests.{test}] lifted_args`"),
+                    lifted,
+                )
+            })
+        }));
+    for (key, lifted) in entries {
+        if lifted.args.is_empty() {
+            anyhow::bail!("{key}: an entry has no `args`");
+        }
+        if lifted.lifted_by.is_empty() {
+            anyhow::bail!(
+                "{key}: an entry has no `lifted_by` (use `args` for arguments that always apply)"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Refuse what generation cannot honour in `[fixups.<package>.buildscript]`: not
@@ -1650,6 +1694,8 @@ mod tests {
                 export_files: Default::default(),
                 test_labels: Default::default(),
                 test_target_compatible_with: Default::default(),
+                test_compatible_with: Default::default(),
+                test_lifted_args: Default::default(),
                 test_args: Default::default(),
                 tests: Default::default(),
                 target_compatible_with: Default::default(),
