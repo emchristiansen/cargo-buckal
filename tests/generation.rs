@@ -2228,3 +2228,62 @@ fn test_a_host_only_library_the_tests_build_for_the_target_has_a_test_variant() 
         "{app}"
     );
 }
+
+#[test]
+fn test_host_compilations_differing_by_platform_are_reported() {
+    // F4 (Fable review): Cargo plans the host proc-macro `pm` with feature `f` for
+    // linux and `w` for wasm32. Buck configures it in the execution platform, so it
+    // cannot build the wasm32 resolution; generation reports it.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"pm\"]\n",
+    );
+    write(
+        &f.ws.join("app/Cargo.toml"),
+        &manifest(
+            "app",
+            "[target.'cfg(not(target_arch = \"wasm32\"))'.dependencies]\npm = { path = \"../pm\", features = [\"f\"] }\n\
+             [target.'cfg(target_arch = \"wasm32\")'.dependencies]\npm = { path = \"../pm\", features = [\"w\"] }\n",
+        ),
+    );
+    write(&f.ws.join("app/src/lib.rs"), "");
+    write(
+        &f.ws.join("pm/Cargo.toml"),
+        &manifest(
+            "pm",
+            "[lib]\nproc-macro = true\n[features]\nf = []\nw = []\n",
+        ),
+    );
+    write(&f.ws.join("pm/src/lib.rs"), "");
+    write(
+        &f.ws.join("buckal.toml"),
+        BUCKAL_TOML.split("[fixups.extra]").next().unwrap(),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("resolve differently per configured platform: pm v0.1.0 (host-only)"),
+        "{stderr}"
+    );
+    // The data stays keyed by the platform Cargo planned for.
+    let pm = f.buck("pm");
+    assert!(
+        pm.contains("\"linux-x86_64\": {\n            \"features\": [\"f\"]"),
+        "{pm}"
+    );
+
+    // A host compilation that resolves alike on every platform is not reported.
+    write(
+        &f.ws.join("app/Cargo.toml"),
+        &manifest(
+            "app",
+            "[dependencies]\npm = { path = \"../pm\", features = [\"f\"] }\n",
+        ),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(!stderr.contains("resolve differently"), "{stderr}");
+}

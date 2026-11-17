@@ -5,8 +5,9 @@ use cargo_metadata::{MetadataCommand, PackageId, camino::Utf8PathBuf};
 use cargo_util_schemas::{lockfile::TomlLockfile, manifest::TomlManifest};
 
 use crate::{
+    buckal_warn,
     config::RepoConfig,
-    platform_features::resolve_platform_features,
+    platform_features::{host_resolutions_differing_by_platform, resolve_platform_features},
     resolve::{BuckalNode, BuckalResolve, NodeKind},
     utils::{UnwrapOrExit, get_buck2_root},
 };
@@ -96,6 +97,31 @@ impl BuckalContext {
                 &repo_config.test_features,
             )
             .unwrap_or_exit_ctx("failed to resolve per-platform features");
+            let differing = host_resolutions_differing_by_platform(&per_platform);
+            if !differing.is_empty() {
+                let names: Vec<String> = differing
+                    .iter()
+                    .map(|(id, suffix)| {
+                        let name = packages_map
+                            .get(id)
+                            .map(|p| format!("{} v{}", p.name, p.version))
+                            .unwrap_or_else(|| id.repr.clone());
+                        format!(
+                            "{name} ({}{suffix})",
+                            if suffix.is_empty() {
+                                "host-only"
+                            } else {
+                                "variant "
+                            }
+                        )
+                    })
+                    .collect();
+                buckal_warn!(format!(
+                    "{} host compilation(s) resolve differently per configured platform: {}. Buck configures host compilations in the execution platform, so their `platform` attribute selects the execution platform's resolution for every target; the other platforms' host features and dependencies are not built as Cargo plans them",
+                    names.len(),
+                    names.join(", ")
+                ));
+            }
             for (pkg_id, features) in per_platform {
                 if let Some(&idx) = resolve.index_map.get(&pkg_id) {
                     resolve.dag[idx].platform_features = features;

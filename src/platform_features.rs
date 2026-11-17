@@ -349,6 +349,55 @@ impl PlatformResolution {
 /// Per-platform resolution per package.
 pub type PlatformFeatures = HashMap<PackageId, PlatformResolution>;
 
+/// Host compilations whose resolution differs between the configured platforms
+/// they are built for: `(package, rule suffix)`, the suffix naming the host
+/// compilation (`""` for a host-only package's own rules, `-host`, `-test-host`).
+///
+/// Cargo plans a separate host compilation per target (each target's unit graph
+/// unifies the host's features apart), and BUCKAL keys them by platform. Buck
+/// configures a host compilation in the execution platform, though, so its
+/// `platform` attribute selects the execution platform's entry, whatever the
+/// target: the other platforms' host resolutions are not what Buck builds.
+pub fn host_resolutions_differing_by_platform(
+    resolutions: &PlatformFeatures,
+) -> Vec<(PackageId, &'static str)> {
+    let differs = |features: &FeaturesByPlatform, deps: &Edges| {
+        let mut platforms = features.keys();
+        let Some(first) = platforms.next() else {
+            return false;
+        };
+        let deps_on = |platform: &String| {
+            [EdgeRole::Normal, EdgeRole::Build]
+                .map(|role| deps.role(role).get(platform).cloned().unwrap_or_default())
+        };
+        platforms.any(|platform| {
+            features.get(platform) != features.get(first) || deps_on(platform) != deps_on(first)
+        })
+    };
+    let mut found: Vec<(PackageId, &'static str)> = resolutions
+        .iter()
+        .flat_map(|(id, r)| {
+            let mut hosts = Vec::new();
+            if r.host_context && differs(&r.features, &r.deps) {
+                hosts.push((id.clone(), ""));
+            }
+            if let Some(host) = &r.host_variant
+                && differs(&host.features, &host.deps)
+            {
+                hosts.push((id.clone(), "-host"));
+            }
+            if let Some(host) = &r.test_host_variant
+                && differs(&host.features, &host.deps)
+            {
+                hosts.push((id.clone(), "-test-host"));
+            }
+            hosts
+        })
+        .collect();
+    found.sort_by(|a, b| (&a.0.repr, a.1).cmp(&(&b.0.repr, b.1)));
+    found
+}
+
 /// One context's resolution of a package, per platform.
 #[derive(Debug, Default, Clone, PartialEq)]
 struct ContextResolution {
