@@ -27,6 +27,28 @@ pub struct ModuleDeclaration {
     pub profile: String,
 }
 
+/// The features the modules in `modules` (package names) declare, as
+/// `<package>/<feature>`: what `cargo metadata` needs for the workspace's resolve to
+/// contain every edge and package of the modules' own graphs. A module that is no
+/// package of `packages` is left to [`resolve_modules`] to refuse.
+pub fn declared_module_features(modules: &[String], packages: &[Package]) -> Result<Vec<String>> {
+    let mut features = Vec::new();
+    for module in modules {
+        let Some(package) = packages.iter().find(|p| p.name.as_str() == module) else {
+            continue;
+        };
+        if let Some(declaration) = module_declaration(package)? {
+            features.extend(
+                declaration
+                    .features
+                    .iter()
+                    .map(|feature| format!("{module}/{feature}")),
+            );
+        }
+    }
+    Ok(features)
+}
+
 /// `[package.metadata.buck2.wasm]` of `package`, if declared.
 pub fn module_declaration(package: &Package) -> Result<Option<ModuleDeclaration>> {
     let Some(wasm) = package.metadata.get("buck2").and_then(|b| b.get("wasm")) else {

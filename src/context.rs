@@ -13,7 +13,9 @@ use crate::{
     },
     resolve::{BuckalNode, BuckalResolve, NodeKind},
     utils::{UnwrapOrExit, get_buck2_root},
-    wasm::{WASM_TRIPLE, package_dir, resolve_modules, test_env_declaration},
+    wasm::{
+        WASM_TRIPLE, declared_module_features, package_dir, resolve_modules, test_env_declaration,
+    },
     workspace_inputs::{WorkspaceInputs, resolve_workspace_inputs},
 };
 
@@ -54,19 +56,36 @@ pub struct BuckalContext {
 impl BuckalContext {
     pub fn new(manifest_path: Option<String>) -> Self {
         let mut repo_config = RepoConfig::load();
-        let mut metadata_command = MetadataCommand::new();
-        if let Some(manifest) = manifest_path.as_deref() {
-            metadata_command.manifest_path(manifest);
-        }
+        let metadata = |features: &[String]| {
+            let mut metadata_command = MetadataCommand::new();
+            if let Some(manifest) = manifest_path.as_deref() {
+                metadata_command.manifest_path(manifest);
+            }
+            if !features.is_empty() {
+                metadata_command
+                    .features(cargo_metadata::CargoOpt::SomeFeatures(features.to_vec()));
+            }
+            metadata_command.exec().unwrap_or_exit_ctx(
+                "`cargo metadata` failed (with the configured `test_features` and the wasm modules' features, if any)",
+            )
+        };
         // Packages that only the tests' features enable are part of the resolve.
-        if !repo_config.test_features.is_empty() {
-            metadata_command.features(cargo_metadata::CargoOpt::SomeFeatures(
-                repo_config.test_features.clone(),
-            ));
+        let mut cargo_metadata = metadata(&repo_config.test_features);
+        // So are the edges and packages only a wasm module's declared features
+        // enable: its own graph has them, and its variants depend on them.
+        if !repo_config.wasm.is_empty() {
+            let module_features =
+                declared_module_features(&repo_config.wasm.packages, &cargo_metadata.packages)
+                    .unwrap_or_else(|error| {
+                        buckal_error!(format!("{error:#}"));
+                        std::process::exit(1);
+                    });
+            if !module_features.is_empty() {
+                let mut features = repo_config.test_features.clone();
+                features.extend(module_features);
+                cargo_metadata = metadata(&features);
+            }
         }
-        let cargo_metadata = metadata_command.exec().unwrap_or_exit_ctx(
-            "`cargo metadata` failed (with the configured `test_features`, if any)",
-        );
         let root = cargo_metadata.root_package().map(|p| p.id.clone());
         let packages_map = cargo_metadata
             .packages
@@ -287,9 +306,14 @@ impl BuckalContext {
                 std::process::exit(1);
             });
             for (id, by_module) in variants {
-                if let Some(&idx) = resolve.index_map.get(&id) {
-                    resolve.dag[idx].platform_features.wasm_variants = by_module;
-                }
+                let Some(&idx) = resolve.index_map.get(&id) else {
+                    let modules = by_module.keys().cloned().collect::<Vec<_>>().join("`, `");
+                    buckal_error!(format!(
+                        "`[wasm] packages`: `{modules}`'s own graph compiles `{id}`, which the workspace's resolve does not contain"
+                    ));
+                    std::process::exit(1);
+                };
+                resolve.dag[idx].platform_features.wasm_variants = by_module;
             }
             for module in &wasm.packages {
                 let manifest = &packages_map[&first_party[module]].manifest_path;

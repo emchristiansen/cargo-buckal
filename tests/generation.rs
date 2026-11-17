@@ -4000,6 +4000,78 @@ fn test_wasm_modules_from_their_own_graph_through_generation() {
 }
 
 #[test]
+fn test_wasm_module_features_select_its_own_graph() {
+    // Wasm stage 2 (`ccc_web_dx` with `web`): the module's declared features
+    // shape its graph. `web` turns on the optional `opt` and `d`'s `w`; the
+    // workspace never enables them, so only the module's variants have them, and
+    // the workspace's resolve must still contain the `opt` edge.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"webmod\", \"d\"]\nexclude = [\"opt\"]\n",
+    );
+    write(
+        &f.ws.join("webmod/Cargo.toml"),
+        &manifest(
+            "webmod",
+            "[lib]\ncrate-type = [\"cdylib\", \"rlib\"]\n[features]\nweb = [\"dep:opt\", \"d/w\"]\n\
+             [dependencies]\nd = { path = \"../d\" }\nopt = { path = \"../opt\", optional = true }\n\
+             [package.metadata.buck2.wasm]\nfeatures = [\"web\"]\nprofile = \"release\"\n",
+        ),
+    );
+    write(
+        &f.ws.join("d/Cargo.toml"),
+        &manifest("d", "[features]\nw = []\n"),
+    );
+    write(
+        &f.ws.join("opt/Cargo.toml"),
+        &manifest("opt", "[workspace]\n"),
+    );
+    for name in ["webmod", "d", "opt"] {
+        write(&f.ws.join(name).join("src/lib.rs"), "");
+    }
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!(
+            "{}\n[wasm]\npackages = [\"webmod\"]\nplatform = \"root//buck2/platforms/wasm:wasm32_unknown_unknown\"\n",
+            BUCKAL_TOML.split("[fixups.extra]").next().unwrap()
+        ),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+
+    let webmod = f.buck("webmod");
+    let variant = rule(&webmod, "webmod-wasm-webmod");
+    assert!(variant.contains("    features = [\"web\"],\n"), "{variant}");
+    assert_eq!(
+        top_deps(variant),
+        ["//d:d-wasm-webmod", "//opt:opt-wasm-webmod"],
+        "{variant}"
+    );
+    let plain = rule(&webmod, "webmod");
+    assert!(!plain.contains("\"web\""), "{plain}");
+    assert!(!plain.contains("//opt"), "{plain}");
+    let d = f.buck("d");
+    assert!(
+        rule(&d, "d-wasm-webmod").contains("    features = [\"w\"],\n"),
+        "{d}"
+    );
+    assert!(!rule(&d, "d").contains("\"w\""), "{d}");
+    // `opt` (outside the workspace) is in the module's graph only: its plain
+    // rule builds nowhere.
+    let opt = f.buck("opt");
+    assert!(
+        opt.contains("rust_library(\n    name = \"opt-wasm-webmod\","),
+        "{opt}"
+    );
+    assert!(
+        rule(&opt, "opt").contains("    target_compatible_with = [\"prelude//:none\"],\n"),
+        "{opt}"
+    );
+}
+
+#[test]
 fn test_per_test_unset_run_env_through_generation() {
     // N14: a single test can drop a key of the package's `test_run_env` (an empty
     // string stays a value).
