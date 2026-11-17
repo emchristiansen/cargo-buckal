@@ -238,6 +238,11 @@ pub struct RustTest {
     /// test_args` and per-test `args`), in order, then those lifted by constraints.
     #[serde(skip_serializing_if = "TestArgs::is_empty")]
     pub args: TestArgs,
+    /// Whether Buck may reuse a cached result of the test's execution
+    /// (`[fixups.<pkg>] test_supports_execution_caching`, per-test
+    /// `supports_test_execution_caching`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_test_execution_caching: Option<bool>,
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub env: Map<String, String>,
     /// Environment for running the test only (not for compiling it).
@@ -1202,6 +1207,8 @@ impl RustTest {
         let exec_compatible_with = kwargs.get_list("exec_compatible_with");
         let labels = kwargs.get_list("labels");
         let args = kwargs.get_ordered_list("args").into();
+        let supports_test_execution_caching =
+            kwargs.get_bool_opt("supports_test_execution_caching");
         let env = kwargs.get_dict("env");
         let features = kwargs.get_list("features");
         let rustc_flags = kwargs.get_ordered_list("rustc_flags");
@@ -1228,6 +1235,7 @@ impl RustTest {
             exec_compatible_with,
             labels,
             args,
+            supports_test_execution_caching,
             env,
             run_env,
             remote_execution,
@@ -2547,6 +2555,7 @@ mod tests {
             exec_compatible_with: Set::from(["prelude//os/constraints:macos".to_string()]),
             labels: Set::new(),
             args: Vec::new().into(),
+            supports_test_execution_caching: None,
             env: Map::from([("RUST_LOG".to_string(), "debug".to_string())]),
             run_env: Map::new(),
             remote_execution: None,

@@ -3749,3 +3749,47 @@ fn test_any_of_compatibility_and_lifted_args_through_generation() {
         assert_eq!(f.buck("app"), app, "{entry}");
     }
 }
+
+#[test]
+fn test_supports_test_execution_caching_through_generation() {
+    // Main set `supports_test_execution_caching = True` on tests; the package key
+    // sets it on every test, a per-test key overrides it.
+    let f = fixture();
+    f.migrate(&[]);
+    let before = f.buck("app");
+    assert!(
+        !before.contains("supports_test_execution_caching"),
+        "{before}"
+    );
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!(
+            "{BUCKAL_TOML}\n[fixups.app]\ntest_supports_execution_caching = true\n\n[fixups.sdk]\ntest_supports_execution_caching = true\n\n[fixups.sdk.tests.unittest]\nsupports_test_execution_caching = false\n"
+        ),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let app = f.buck("app");
+    assert!(
+        rule(&app, "unittest").contains("    supports_test_execution_caching = True,\n"),
+        "{app}"
+    );
+    let sdk = f.buck("sdk");
+    assert!(
+        rule(&sdk, "unittest").contains("    supports_test_execution_caching = False,\n"),
+        "{sdk}"
+    );
+    // Only tests get it.
+    assert!(
+        !rule(&app, "app").contains("supports_test_execution_caching"),
+        "{app}"
+    );
+    f.migrate(&["--no-cache"]);
+    assert_eq!(f.buck("app"), app);
+
+    // Removing the keys restores the rules.
+    write(&f.ws.join("buckal.toml"), BUCKAL_TOML);
+    f.migrate(&[]);
+    assert_eq!(f.buck("app"), before);
+}

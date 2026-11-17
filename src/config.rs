@@ -331,6 +331,10 @@ pub struct PackageFixup {
     /// constraints (or config settings) is present (see [`LiftedArgs`]).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub test_lifted_args: Vec<LiftedArgs>,
+    /// `supports_test_execution_caching` of every test of the package: whether Buck
+    /// may reuse a cached result of the test's execution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_supports_execution_caching: Option<bool>,
     /// Arguments after the binary of every test of the package, which the test
     /// runner passes on, e.g. the per-test process runner's `--declared-skip NAME`,
     /// `--declared-only-substring WORD` and `--declared-skip-substring WORD`, or
@@ -453,6 +457,10 @@ pub struct TestFixup {
     /// Arguments of this test lifted by named constraints, after the package's.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub lifted_args: Vec<LiftedArgs>,
+    /// `supports_test_execution_caching` of this test, over the package's
+    /// `test_supports_execution_caching`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supports_test_execution_caching: Option<bool>,
 }
 
 /// Test arguments (e.g. a narrowing selection such as `--declared-skip-substring

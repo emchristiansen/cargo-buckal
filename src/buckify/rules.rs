@@ -875,7 +875,13 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
                         .push(fixup.test_compatible_with.clone());
                 }
                 r.args.lifted.extend(fixup.test_lifted_args.iter().cloned());
+                if let Some(caching) = fixup.test_supports_execution_caching {
+                    r.supports_test_execution_caching = Some(caching);
+                }
                 if let Some(test) = fixup.tests.get(&r.name) {
+                    if let Some(caching) = test.supports_test_execution_caching {
+                        r.supports_test_execution_caching = Some(caching);
+                    }
                     r.labels.extend(test.labels.iter().cloned());
                     r.args.extend(test.args.iter().cloned());
                     if !test.compatible_with.is_empty() {
@@ -1696,6 +1702,7 @@ mod tests {
                 test_target_compatible_with: Default::default(),
                 test_compatible_with: Default::default(),
                 test_lifted_args: Default::default(),
+                test_supports_execution_caching: None,
                 test_args: Default::default(),
                 tests: Default::default(),
                 target_compatible_with: Default::default(),
