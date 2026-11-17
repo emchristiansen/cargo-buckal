@@ -246,7 +246,15 @@ fn test_context_variant(
     let resolution = &node.platform_features;
     let dep = &dep_node.package_id.repr;
     let host_rule = is_host_context(node, kind);
-    if host_rule || dep_node.platform_features.host_context {
+    // A target compilation loads only a proc-macro dependency on the host; any
+    // other dependency (even one the ordinary build only uses on the host) it
+    // compiles for the target, through the dependency's test variant.
+    let host_dep = dep_node.platform_features.host_context
+        && dep_node
+            .targets
+            .iter()
+            .any(|t| t.kind.contains(&TargetKind::ProcMacro));
+    if host_rule || host_dep {
         if resolution.test_host_variant_deps.contains(dep) {
             Some(test_host_variant_name)
         } else if host_rule && resolution.host_variant_deps.contains(dep) {

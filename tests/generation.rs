@@ -2145,3 +2145,86 @@ fn test_tests_consume_their_build_script_output() {
         }
     }
 }
+
+#[test]
+fn test_unit_tests_of_a_build_dependency_library_are_target_compilations() {
+    // Control for F2 (Fable review): `hostlib` is a member that the ordinary build
+    // compiles only for the host (as `app`'s build dependency). Cargo compiles its
+    // unit tests for the target with the test features, here `hostlib/x`.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"hostlib\"]\n",
+    );
+    write(
+        &f.ws.join("app/Cargo.toml"),
+        &manifest(
+            "app",
+            "[build-dependencies]\nhostlib = { path = \"../hostlib\" }\n",
+        ),
+    );
+    write(&f.ws.join("app/build.rs"), "fn main() {}\n");
+    write(&f.ws.join("app/src/lib.rs"), "");
+    write(
+        &f.ws.join("hostlib/Cargo.toml"),
+        &manifest("hostlib", "[features]\nx = []\n"),
+    );
+    write(&f.ws.join("hostlib/src/lib.rs"), "");
+    let config = BUCKAL_TOML.split("[fixups.extra]").next().unwrap();
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!("test_features = [\"hostlib/x\"]\n{config}"),
+    );
+    f.migrate(&[]);
+    let hostlib = f.buck("hostlib");
+    assert!(rule(&hostlib, "unittest").contains("\"x\""), "{hostlib}");
+    assert!(!rule(&hostlib, "hostlib").contains("\"x\""), "{hostlib}");
+}
+
+#[test]
+fn test_a_host_only_library_the_tests_build_for_the_target_has_a_test_variant() {
+    // F2 (Fable review): `shared` (not a member, so `cargo build --workspace`
+    // builds it only where something uses it) is only a build dependency of `app` in
+    // the ordinary build (a host compilation without features), and a
+    // dev-dependency with feature `t`. Cargo compiles `app`'s tests against a target
+    // `shared` with `t`; the tests must not use the production (host) `shared`.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\nexclude = [\"shared\"]\n",
+    );
+    write(
+        &f.ws.join("app/Cargo.toml"),
+        &manifest(
+            "app",
+            "[build-dependencies]\nshared = { path = \"../shared\" }\n[dev-dependencies]\nshared = { path = \"../shared\", features = [\"t\"] }\n",
+        ),
+    );
+    write(&f.ws.join("app/build.rs"), "fn main() {}\n");
+    write(&f.ws.join("app/src/lib.rs"), "");
+    write(
+        &f.ws.join("shared/Cargo.toml"),
+        &manifest("shared", "[features]\nt = []\n"),
+    );
+    write(&f.ws.join("shared/src/lib.rs"), "");
+    write(
+        &f.ws.join("buckal.toml"),
+        BUCKAL_TOML.split("[fixups.extra]").next().unwrap(),
+    );
+    f.migrate(&[]);
+    let shared = f.buck("shared");
+    let app = f.buck("app");
+    assert!(!rule(&shared, "shared").contains("\"t\""), "{shared}");
+    let unittest = rule(&app, "unittest");
+    let label = top_deps(unittest)
+        .into_iter()
+        .find(|d| d.starts_with("//shared:"))
+        .unwrap_or_else(|| panic!("{unittest}"));
+    let name = label.strip_prefix("//shared:").unwrap();
+    assert!(rule(&shared, name).contains("\"t\""), "{label}:\n{shared}");
+    // The build script keeps the production host `shared`.
+    assert!(
+        rule(&app, "build-script-build").contains("\"//shared:shared\""),
+        "{app}"
+    );
+}

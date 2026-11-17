@@ -498,10 +498,11 @@ fn with_test_resolution(
     let differs = |m: &PlatformResolution, t: &PlatformResolution| {
         m.features != t.features || lib_edges(m) != lib_edges(t)
     };
-    let in_both_on_target = |id: &PackageId| {
-        main.get(id).is_some_and(|m| !m.host_context)
-            && tests.get(id).is_some_and(|t| !t.host_context)
-    };
+    // Packages the tests compile for the target that the ordinary build also has:
+    // for the target, or (a library the ordinary build only uses on the host) for
+    // the host only, whose production rule then has the host's resolution.
+    let in_both_on_target =
+        |id: &PackageId| main.contains_key(id) && tests.get(id).is_some_and(|t| !t.host_context);
     let mut variants: BTreeSet<String> = tests
         .iter()
         .filter(|(id, t)| {
