@@ -64,7 +64,7 @@ pub(super) fn emit_rust_library(
     ));
 
     // look up platform compatibility
-    if let Some(platforms) = lookup_platforms(&node.name) {
+    if let Some(platforms) = static_platforms(node, ctx) {
         rust_library.compatible_with = buck_labels(&platforms);
     }
     let host = node.platform_features.host_context;
@@ -119,7 +119,7 @@ pub(super) fn emit_rust_binary(
     set_deps(&mut rust_binary, node, CargoTargetKind::Bin, ctx)
         .unwrap_or_exit_ctx(format!("failed to set dependencies for '{}'", buckal_name));
 
-    if let Some(platforms) = lookup_platforms(&node.name) {
+    if let Some(platforms) = static_platforms(node, ctx) {
         rust_binary.compatible_with = buck_labels(&platforms);
     }
     let host = node.platform_features.host_context;
@@ -186,7 +186,7 @@ pub(super) fn emit_rust_test(
         });
     }
 
-    if let Some(platforms) = lookup_platforms(&node.name) {
+    if let Some(platforms) = static_platforms(node, ctx) {
         rust_test.compatible_with = buck_labels(&platforms);
     }
     let host = node.platform_features.host_context;
@@ -199,6 +199,21 @@ pub(super) fn emit_rust_test(
     );
 
     rust_test
+}
+
+/// The operating systems the static package table restricts `node` to, when it
+/// is consulted: only without configured platforms. With them, the per-platform
+/// resolution decides where a package builds (`target_compatible_with`), and
+/// Buck2 refuses a target that has both that and `compatible_with`.
+fn static_platforms(
+    node: &BuckalNode,
+    ctx: &BuckalContext,
+) -> Option<std::collections::BTreeSet<crate::platform::Os>> {
+    if ctx.repo_config.feature_platforms.is_empty() {
+        lookup_platforms(&node.name)
+    } else {
+        None
+    }
 }
 
 /// The prelude's constraint that no platform satisfies.
