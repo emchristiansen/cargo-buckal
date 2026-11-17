@@ -2959,3 +2959,56 @@ fn test_proc_macro_unit_tests_have_the_proc_macro_crate() {
     let app = f.buck("app");
     assert!(!app.contains("--extern"), "{app}");
 }
+
+#[test]
+fn test_a_host_only_library_the_tests_build_for_the_target_uses_target_flavours() {
+    // Fable N1 (f13): production uses `x` only in `app`'s build script, so its
+    // rule is a host compilation, against `f-host`. The tests use `x` for the
+    // target, where Cargo compiles it against the target `f` (feature `t`): the
+    // tests need an `x-test` variant on target flavours, even though `x`'s own
+    // features and dependency names are the same in both.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\nexclude = [\"x\", \"f\"]\n",
+    );
+    write(
+        &f.ws.join("app/Cargo.toml"),
+        &manifest(
+            "app",
+            "[dependencies]\nf = { path = \"../f\", features = [\"t\"] }\n\
+             [build-dependencies]\nx = { path = \"../x\" }\nf = { path = \"../f\", features = [\"h\"] }\n\
+             [dev-dependencies]\nx = { path = \"../x\" }\n",
+        ),
+    );
+    write(&f.ws.join("app/src/lib.rs"), "");
+    write(&f.ws.join("app/build.rs"), "fn main() {}\n");
+    write(&f.ws.join("app/tests/it.rs"), "");
+    write(
+        &f.ws.join("x/Cargo.toml"),
+        &manifest("x", "[dependencies]\nf = { path = \"../f\" }\n"),
+    );
+    write(&f.ws.join("x/src/lib.rs"), "");
+    write(
+        &f.ws.join("f/Cargo.toml"),
+        &manifest("f", "[features]\nt = []\nh = []\n"),
+    );
+    write(&f.ws.join("f/src/lib.rs"), "");
+    write(
+        &f.ws.join("buckal.toml"),
+        BUCKAL_TOML.split("[fixups.extra]").next().unwrap(),
+    );
+    f.migrate(&[]);
+    let fb = f.buck("f");
+    assert!(rule(&fb, "f").contains("\"t\""), "{fb}");
+    assert!(rule(&fb, "f-host").contains("\"h\""), "{fb}");
+    let x = f.buck("x");
+    assert_eq!(top_deps(rule(&x, "x")), ["//f:f-host"], "{x}");
+    assert_eq!(top_deps(rule(&x, "x-test")), ["//f:f"], "{x}");
+    let app = f.buck("app");
+    assert!(top_deps(rule(&app, "it")).contains(&"//x:x-test"), "{app}");
+    assert!(
+        top_deps(rule(&app, "build-script-build")).contains(&"//x:x"),
+        "{app}"
+    );
+}

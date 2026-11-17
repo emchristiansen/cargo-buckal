@@ -607,6 +607,17 @@ fn with_test_resolution(
         .filter(|(id, t)| {
             in_both_on_target(id)
                 && (differs(&main[*id], t)
+                    // The ordinary build compiles it for the host only, so its rule
+                    // is a host compilation, against its dependencies' host
+                    // variants: the tests' target compilation needs their target
+                    // flavours.
+                    || main[*id].host_context
+                        && t.deps
+                            .normal
+                            .values()
+                            .chain(t.deps.build.values())
+                            .flatten()
+                            .any(|dep| host_variant_in_main.contains(dep))
                     // Its build script or a proc-macro it uses is compiled otherwise
                     // for the tests. (A normal dependency is a host compilation of
                     // this target rule only when it is host-only: a proc-macro.)
