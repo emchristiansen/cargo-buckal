@@ -831,6 +831,14 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
         _ => Default::default(),
     };
     let build_scripts = build_script_names(rules);
+    let workspace_inputs = ctx.buildscript_inputs.get(&node.name);
+    if workspace_inputs.is_some() && build_scripts.is_empty() {
+        buckal_error!(
+            "`[fixups.{}.buildscript.run] inputs`: the package has no build script",
+            node.name
+        );
+        std::process::exit(1);
+    }
     for rule in rules {
         let sets = fixup_set_contributions(fixup, rule, &build_scripts);
         let (env, rustc_flags, mapped_srcs) = match rule {
@@ -868,6 +876,10 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
                 r.target_compatible_with.extend(sets.target_compatible_with);
                 r.rustc_link_lib |= run.rustc_link_lib;
                 r.rustc_link_search |= run.rustc_link_search;
+                if let Some(inputs) = workspace_inputs {
+                    r.package_path = Some(inputs.package_path.clone());
+                    r.workspace_inputs = inputs.inputs.clone();
+                }
                 continue;
             }
             _ => continue,
@@ -1347,6 +1359,7 @@ mod tests {
             workspace_members: None,
             host_platform_differences: None,
             host_platform_difference_digests: None,
+            buildscript_inputs: Default::default(),
             root: None,
             resolve: empty_resolve(),
             repo_config: RepoConfig {
@@ -1384,6 +1397,7 @@ mod tests {
             workspace_members: None,
             host_platform_differences: None,
             host_platform_difference_digests: None,
+            buildscript_inputs: Default::default(),
             root: None,
             resolve: empty_resolve(),
             repo_config: RepoConfig {
@@ -1419,6 +1433,7 @@ mod tests {
             workspace_members: None,
             host_platform_differences: None,
             host_platform_difference_digests: None,
+            buildscript_inputs: Default::default(),
             root: None,
             resolve: empty_resolve(),
             repo_config: RepoConfig {

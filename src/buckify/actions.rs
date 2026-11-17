@@ -675,6 +675,7 @@ mod tests {
             workspace_members: None,
             host_platform_differences: None,
             host_platform_difference_digests: None,
+            buildscript_inputs: Default::default(),
             root: Some(package_id),
             resolve,
             workspace_root: tmp_path.clone(),

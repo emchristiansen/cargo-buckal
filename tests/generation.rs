@@ -3386,3 +3386,97 @@ fn test_a_generated_export_file_is_removed_without_a_cache_record() {
         "{stderr}"
     );
 }
+
+#[test]
+fn test_buildscript_run_inputs_through_generation() {
+    // G3: `shared`'s build script reads files outside its package relative to
+    // `CARGO_MANIFEST_DIR`, as Cargo runs it from the checkout: `../shared.toml` at
+    // the workspace root (owned by no generated package) and `../sdk/conf/*.toml`
+    // (in the `sdk` package). Its runs (target and host variant) must place them at
+    // their workspace-relative positions around the package.
+    let f = fixture();
+    write(
+        &f.ws.join("shared/build.rs"),
+        "fn main() {\n    let dir = std::env::var(\"CARGO_MANIFEST_DIR\").unwrap();\n    std::fs::read_to_string(format!(\"{dir}/../shared.toml\")).unwrap();\n    std::fs::read_to_string(format!(\"{dir}/../sdk/conf/a.toml\")).unwrap();\n}\n",
+    );
+    write(&f.ws.join("shared.toml"), "");
+    write(&f.ws.join("sdk/conf/a.toml"), "");
+    write(&f.ws.join("sdk/conf/b.toml"), "");
+    write(&f.ws.join("sdk/conf/notes.txt"), "");
+    f.migrate(&[]);
+    let shared_before = f.buck("shared");
+    let sdk_before = f.buck("sdk");
+    // Without the key the runs place nothing outside the package: the build script
+    // would not find `../shared.toml`.
+    let runs = shared_before.matches("buildscript_run(").count();
+    assert!(runs >= 2, "{shared_before}");
+    assert!(
+        !shared_before.contains("workspace_inputs"),
+        "{shared_before}"
+    );
+    assert!(!shared_before.contains("package_path"), "{shared_before}");
+
+    let with = |inputs: &str| {
+        format!("{BUCKAL_TOML}\n[fixups.shared.buildscript.run]\ninputs = [{inputs}]\n")
+    };
+    write(
+        &f.ws.join("buckal.toml"),
+        &with("\"shared.toml\", \"sdk/conf/*.toml\""),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let shared = f.buck("shared");
+    let expected = "    package_path = \"shared\",\n    workspace_inputs = {\n        \"sdk/conf/a.toml\": \"//sdk:conf/a.toml\",\n        \"sdk/conf/b.toml\": \"//sdk:conf/b.toml\",\n        \"shared.toml\": \"//:shared.toml\",\n    },\n";
+    assert_eq!(shared.matches(expected).count(), runs, "{shared}");
+    // The owning generated package exports its files to the reader only; a file no
+    // generated package owns is named, for its BUCK file to provide.
+    let sdk = f.buck("sdk");
+    for name in ["conf/a.toml", "conf/b.toml"] {
+        assert!(
+            sdk.contains(&format!("export_file(\n    name = \"{name}\",")),
+            "{sdk}"
+        );
+        let export = rule(&sdk, name);
+        assert!(export.contains("\"//shared:\""), "{export}");
+        assert!(export.contains("\"buckal-export-files\""), "{export}");
+    }
+    assert!(!sdk.contains("notes.txt"), "{sdk}");
+    assert!(
+        stderr.contains("`[fixups.shared.buildscript.run] inputs`: `shared.toml` belongs to no generated package; its BUCK file must provide `//:shared.toml`"),
+        "{stderr}"
+    );
+    f.migrate(&["--no-cache"]);
+    assert_eq!(f.buck("shared"), shared);
+    assert_eq!(f.buck("sdk"), sdk);
+
+    // Paths that are absolute, leave the workspace, lie in the package itself or
+    // match nothing are refused, and no BUCK file changes.
+    for (input, why) in [
+        ("/etc/hostname", "is not a relative path"),
+        ("../outside.toml", "leaves the workspace"),
+        ("sdk/../../outside.toml", "leaves the workspace"),
+        ("shared/src/lib.rs", "is inside the package `shared`"),
+        ("missing.toml", "matches no file"),
+        ("sdk/conf/*.json", "matches no file"),
+    ] {
+        write(&f.ws.join("buckal.toml"), &with(&format!("{input:?}")));
+        let output = f.output(&["migrate"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{input} was accepted:\n{stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "`[fixups.shared.buildscript.run] inputs`: `{input}`"
+            )) && stderr.contains(why),
+            "{input}:\n{stderr}"
+        );
+        assert_eq!(f.buck("shared"), shared, "{input}");
+        assert_eq!(f.buck("sdk"), sdk, "{input}");
+    }
+
+    // Removing the key restores both packages.
+    write(&f.ws.join("buckal.toml"), BUCKAL_TOML);
+    f.migrate(&[]);
+    assert_eq!(f.buck("shared"), shared_before);
+    assert_eq!(f.buck("sdk"), sdk_before);
+}

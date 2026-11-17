@@ -385,6 +385,19 @@ pub struct BuildscriptRunFixup {
     /// Search the build script's `cargo:rustc-link-search` directories.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub rustc_link_search: bool,
+    /// Files outside the package that the build script reads when it runs, as
+    /// paths or globs (`*` within a directory, `**` across directories) relative to
+    /// the workspace root, e.g. `"../../release-build-env.toml"` read from
+    /// `CARGO_MANIFEST_DIR` is listed as `"release-build-env.toml"`. Each run of the
+    /// package's build script (its variants' too) gets them at their
+    /// workspace-relative positions around the package (`workspace_inputs`, with
+    /// `package_path`), so relative paths resolve as under Cargo. A file of a
+    /// generated first-party package is exported by that package to this one; any
+    /// other file's BUCK file must export it under its name relative to that BUCK
+    /// file. A path that is absolute, leaves the workspace, lies in the package
+    /// itself or matches no file is refused.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<String>,
 }
 
 /// Additions to one test (`rust_test` rule) of a package, after the package-wide

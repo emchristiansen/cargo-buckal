@@ -13,6 +13,7 @@ use crate::{
     },
     resolve::{BuckalNode, BuckalResolve, NodeKind},
     utils::{UnwrapOrExit, get_buck2_root},
+    workspace_inputs::{WorkspaceInputs, resolve_workspace_inputs},
 };
 
 pub struct BuckalContext {
@@ -39,11 +40,14 @@ pub struct BuckalContext {
     /// (features and normal and build dependencies, by name and version, per
     /// platform), so that a change in how an entry differs is caught too.
     pub host_platform_difference_digests: Option<std::collections::BTreeMap<String, String>>,
+    /// The files outside each first-party package that its build-script runs get
+    /// (`[fixups.<pkg>.buildscript.run] inputs`, expanded), by package name.
+    pub buildscript_inputs: std::collections::BTreeMap<String, WorkspaceInputs>,
 }
 
 impl BuckalContext {
     pub fn new(manifest_path: Option<String>) -> Self {
-        let repo_config = RepoConfig::load();
+        let mut repo_config = RepoConfig::load();
         let mut metadata_command = MetadataCommand::new();
         if let Some(manifest) = manifest_path.as_deref() {
             metadata_command.manifest_path(manifest);
@@ -195,12 +199,28 @@ impl BuckalContext {
 
         let workspace_members = Some(cargo_metadata.workspace_members.iter().cloned().collect());
 
+        let inputs = resolve_workspace_inputs(
+            &mut repo_config,
+            &resolve,
+            &cargo_metadata.workspace_root,
+            &buck2_root,
+            workspace_inherit,
+        )
+        .unwrap_or_else(|error| {
+            buckal_error!(format!("{error:#}"));
+            std::process::exit(1);
+        });
+        for note in &inputs.notes {
+            buckal_warn!(note.clone());
+        }
+
         Self {
             root,
             resolve,
             workspace_members,
             host_platform_differences,
             host_platform_difference_digests,
+            buildscript_inputs: inputs.by_package,
             workspace_root: cargo_metadata.workspace_root.clone(),
             workspace_inherit,
             no_merge: false,
@@ -358,6 +378,7 @@ mod tests {
             workspace_members: None,
             host_platform_differences: None,
             host_platform_difference_digests: None,
+            buildscript_inputs: Default::default(),
             root: None,
             resolve,
             workspace_root: Utf8PathBuf::from("/tmp"),

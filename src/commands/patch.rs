@@ -318,6 +318,7 @@ mod tests {
             workspace_members: None,
             host_platform_differences: None,
             host_platform_difference_digests: None,
+            buildscript_inputs: Default::default(),
             root: None,
             resolve: BuckalResolve {
                 dag,

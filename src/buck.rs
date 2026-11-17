@@ -307,6 +307,15 @@ pub struct BuildscriptRun {
     pub buildscript_compatible_with: Set<String>,
     pub version: String,
     pub manifest_dir: String,
+    /// The package's directory relative to the workspace root, where the run
+    /// places the package when it has `workspace_inputs`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub package_path: Option<String>,
+    /// Files outside the package that the build script reads, as
+    /// `{workspace-relative path: source label}`, placed at those paths around the
+    /// package (`[fixups.<pkg>.buildscript.run] inputs`).
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub workspace_inputs: Map<String, String>,
     /// Pass the build script's `cargo:rustc-link-lib` (`rustc_link_search`:
     /// `cargo:rustc-link-search`) output on to the crate's linking.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -1065,6 +1074,8 @@ impl BuildscriptRun {
         let features = kwargs.get_list("features");
         let version = kwargs.get_str("version")?;
         let manifest_dir = kwargs.get_str("manifest_dir")?;
+        let package_path = kwargs.get_str_opt("package_path");
+        let workspace_inputs = kwargs.get_dict("workspace_inputs");
         let rustc_link_lib = kwargs.get_bool_opt("rustc_link_lib").unwrap_or_default();
         let rustc_link_search = kwargs.get_bool_opt("rustc_link_search").unwrap_or_default();
         let visibility = kwargs.get_list("visibility");
@@ -1082,6 +1093,8 @@ impl BuildscriptRun {
             buildscript_compatible_with,
             version,
             manifest_dir,
+            package_path,
+            workspace_inputs,
             rustc_link_lib,
             rustc_link_search,
             visibility,
@@ -2399,6 +2412,8 @@ mod tests {
             buildscript_compatible_with: Set::new(),
             version: "1.2.3".to_string(),
             manifest_dir: ":vendor".to_string(),
+            package_path: None,
+            workspace_inputs: Map::new(),
             rustc_link_lib: false,
             rustc_link_search: false,
             visibility: Set::from(["PUBLIC".to_string()]),
