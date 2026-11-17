@@ -4810,3 +4810,32 @@ fn test_a_variant_is_named_only_by_its_variant_key() {
         );
     }
 }
+
+#[test]
+fn test_a_hand_written_wasm_sha256_is_removed_with_a_warning() {
+    // Fable on 4b76a20a: `wasm_sha256` is a generated rule kind, like `rust_test`
+    // (`test_..._removed_it`): generation owns every call of it in a first-party
+    // BUCK file, whose `@buckal//` loads it also owns. A call it does not emit is
+    // removed when the file is regenerated, and the removal is reported by name.
+    let f = wasm_test_env_fixture(
+        "[package.metadata.buck2.wasm-variants.harness]\nfeatures = [\"admission\"]\n",
+        "D = { wasm_sha256 = \"module\", variant = \"harness\" }\n",
+    );
+    f.migrate(&[]);
+    let path = f.ws.join("module/BUCK");
+    let generated = std::fs::read_to_string(&path).unwrap();
+    write(
+        &path,
+        &format!("{generated}\nwasm_sha256(\n    name = \"mine\",\n    src = \"data.wasm\",\n)\n"),
+    );
+    let output = f.output(&["migrate", "--no-cache"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "module/BUCK: removing `wasm_sha256(name = \"mine\")`: generation owns every `wasm_sha256` rule of a first-party BUCK file and no longer emits this one"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), generated);
+}

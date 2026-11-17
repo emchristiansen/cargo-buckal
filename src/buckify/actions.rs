@@ -320,7 +320,7 @@ fn workspace_manifests(ctx: &BuckalContext) -> NamedFileGroup {
 
 /// Rule kinds that generation owns in a package BUCK file it writes: their calls
 /// are replaced by the generated rules.
-const GENERATED_RULE_KINDS: [&str; 9] = [
+const GENERATED_RULE_KINDS: [&str; 10] = [
     "buildscript_run",
     "cargo_manifest",
     "export_file",
@@ -330,6 +330,9 @@ const GENERATED_RULE_KINDS: [&str; 9] = [
     "rust_binary",
     "rust_library",
     "rust_test",
+    // The buckal cell's rule, loaded from `@buckal//`, whose loads generation
+    // also owns: a hand-written call could not keep its load.
+    "wasm_sha256",
 ];
 
 /// The hand-written content of the BUCK file at `buck_path`, which generation
@@ -378,8 +381,9 @@ impl OwnedNames {
     }
 
     /// Whether generation owns the call of `function` named `name`: every call of a
-    /// Rust, build-script or vendoring rule kind, and the `filegroup` and
-    /// `export_file` calls it writes.
+    /// Rust, build-script, vendoring or `wasm_sha256` rule kind, the `filegroup`
+    /// and `export_file` calls it writes, and the modules' `configured_alias`es.
+    /// An owned call generation does not emit is removed, with a warning.
     fn owns(&self, function: &str, name: Option<&str>) -> bool {
         match (function, name) {
             ("filegroup", Some(name)) => self.filegroups.contains(name),
@@ -388,7 +392,6 @@ impl OwnedNames {
                 name == crate::wasm::MODULE_ALIAS
                     || name.starts_with(&format!("{}.", crate::wasm::MODULE_ALIAS))
             }
-            ("wasm_sha256", _) => true,
             _ => GENERATED_RULE_KINDS.contains(&function),
         }
     }
