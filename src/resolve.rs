@@ -261,7 +261,10 @@ impl BuckalResolve {
                                 // In lenient mode, skip the cyclic dev edge so we still
                                 // have all nodes. The parent's tests lose this dev-dependency.
                                 crate::buckal_warn!(
-                                    "Skipping dev-dependency `{parent_name}` -> `{child_name}`, which forms a cycle; tests of `{parent_name}` will not see it."
+                                    "Skipping dev-dependency `{}` -> `{}`, which forms a cycle; tests of `{}` will not see it.",
+                                    parent_name,
+                                    child_name,
+                                    parent_name
                                 );
                                 continue;
                             }
