@@ -4090,3 +4090,73 @@ fn test_with_the_execution_platform_a_library_only_elsewhere_compares_its_hoiste
     assert!(rule(&w, "w").contains("    features = [\"f\"],\n"), "{w}");
     assert!(!stderr.contains("resolve differently"), "{stderr}");
 }
+
+#[test]
+fn test_a_plain_rule_entry_changes_when_its_host_needs_change() {
+    // Fable N11: `w` is `f` on wasm32 and wasi, plain on linux (the execution
+    // platform); the proc-macro `pm` needs `w` with `f` on wasm32. When wasi gains
+    // `pm` too, the plain rule is unchanged but the host needs grow: the recorded
+    // entry's digest must change, stopping generation until accepted.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\"]\nexclude = [\"pm\", \"w\"]\n",
+    );
+    let app = |wasi_pm: &str| {
+        manifest(
+            "app",
+            &format!(
+                "[dependencies]\nw = {{ path = \"../w\" }}\n\
+                 [target.'cfg(all(target_arch = \"wasm32\", target_os = \"unknown\"))'.dependencies]\nw = {{ path = \"../w\", features = [\"f\"] }}\npm = {{ path = \"../pm\" }}\n\
+                 [target.'cfg(target_os = \"wasi\")'.dependencies]\nw = {{ path = \"../w\", features = [\"f\"] }}\n{wasi_pm}"
+            ),
+        )
+    };
+    write(&f.ws.join("app/Cargo.toml"), &app(""));
+    write(&f.ws.join("app/src/lib.rs"), "");
+    write(
+        &f.ws.join("pm/Cargo.toml"),
+        &manifest(
+            "pm",
+            "[workspace]\n[lib]\nproc-macro = true\n[dependencies]\nw = { path = \"../w\", features = [\"f\"] }\n",
+        ),
+    );
+    write(&f.ws.join("pm/src/lib.rs"), "");
+    write(
+        &f.ws.join("w/Cargo.toml"),
+        &manifest("w", "[workspace]\n[features]\nf = []\n"),
+    );
+    write(&f.ws.join("w/src/lib.rs"), "");
+    write(
+        &f.ws.join("buckal.toml"),
+        "ignore_tests = false\n\n[feature_platforms]\nlinux-x86_64 = \"x86_64-unknown-linux-gnu\"\nwasm32 = \"wasm32-unknown-unknown\"\nwasi = \"wasm32-wasip1\"\n\n[platforms]\nexecution = \"linux-x86_64\"\n",
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("w v0.1.0 (plain rule used by host compilations)"),
+        "{stderr}"
+    );
+    let w = f.buck("w");
+    let snap = std::fs::read_to_string(f.ws.join("buckal.snap")).unwrap();
+
+    write(
+        &f.ws.join("app/Cargo.toml"),
+        &app("pm = { path = \"../pm\" }\n"),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr
+            .contains("~ w v0.1.0 (plain rule used by host compilations) (its resolution changed)"),
+        "{stderr}"
+    );
+    // The plain rule itself is unchanged, and the refusal wrote nothing.
+    assert_eq!(f.buck("w"), w);
+    assert_eq!(
+        std::fs::read_to_string(f.ws.join("buckal.snap")).unwrap(),
+        snap
+    );
+}

@@ -192,8 +192,38 @@ impl BuckalContext {
                             )
                         })
                         .collect();
-                    let digest =
-                        blake3::hash(&serde_json::to_vec(&shape).expect("a resolution serializes"));
+                    let mut hashed = serde_json::to_vec(&shape).expect("a resolution serializes");
+                    // A plain-rule entry is compared with what its host compilations
+                    // need, per platform: those are part of what it records (N11).
+                    // Other kinds hash their resolution alone, as before.
+                    if *suffix == PLAIN_HOST_USE {
+                        let needs: Vec<std::collections::BTreeMap<&String, _>> = resolution
+                            .plain_host_needs
+                            .iter()
+                            .map(|need| {
+                                need.features
+                                    .iter()
+                                    .map(|(platform, on)| {
+                                        let edges =
+                                            |role: EdgeRole| -> std::collections::BTreeSet<String> {
+                                                need.deps
+                                                    .role(role)
+                                                    .get(platform)
+                                                    .map(|d| d.iter().map(named).collect())
+                                                    .unwrap_or_default()
+                                            };
+                                        (
+                                            platform,
+                                            (on, edges(EdgeRole::Normal), edges(EdgeRole::Build)),
+                                        )
+                                    })
+                                    .collect()
+                            })
+                            .collect();
+                        hashed.extend(b"plain_host_needs");
+                        hashed.extend(serde_json::to_vec(&needs).expect("host needs serialize"));
+                    }
+                    let digest = blake3::hash(&hashed);
                     (entry, digest.to_hex().to_string())
                 })
                 .collect();
