@@ -106,7 +106,7 @@ impl BuckalResolve {
     /// first normal/build deps, then dev deps. Returns an error if any edge would form
     /// a cycle — Buck2 requires a strictly acyclic dependency graph.
     ///
-    /// When `lenient` is `true`, dev-dependency cycles are silently skipped instead of
+    /// When `lenient` is `true`, dev-dependency cycles are skipped (with a warning) instead of
     /// causing a hard error. This is used by the cache fallback path where having all
     /// nodes (for removal detection) matters more than strict edge accuracy.
     pub fn from_metadata(
@@ -258,8 +258,11 @@ impl BuckalResolve {
                             let parent_name = &dag[parent_idx].name;
                             let child_name = &dag[child_idx].name;
                             if lenient {
-                                // In lenient mode (cache fallback), skip the cyclic
-                                // dev edge so we still have all nodes for diffing.
+                                // In lenient mode, skip the cyclic dev edge so we still
+                                // have all nodes. The parent's tests lose this dev-dependency.
+                                crate::buckal_warn!(
+                                    "Skipping dev-dependency `{parent_name}` -> `{child_name}`, which forms a cycle; tests of `{parent_name}` will not see it."
+                                );
                                 continue;
                             }
                             bail!(

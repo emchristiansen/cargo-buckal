@@ -178,6 +178,11 @@ pub struct RepoConfig {
     /// over all platforms that `cargo metadata` reports.
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub feature_platforms: Map<String, String>,
+    /// Drop dev-dependency edges that would close a cycle (Cargo allows such cycles;
+    /// a strictly acyclic graph is required here) instead of refusing the workspace.
+    /// Each dropped edge is reported; the dependent's tests lose that dev-dependency.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub skip_dev_dependency_cycles: bool,
 }
 
 impl Default for RepoConfig {
@@ -189,6 +194,7 @@ impl Default for RepoConfig {
             patch: RepoPatchConfig::default(),
             fixups: Map::new(),
             feature_platforms: Map::new(),
+            skip_dev_dependency_cycles: false,
         }
     }
 }
@@ -339,6 +345,14 @@ mod tests {
                 .map(String::as_str),
             Some("vocab/bpe-52.toml")
         );
+    }
+
+    #[test]
+    fn test_repo_config_skip_dev_dependency_cycles() {
+        assert!(!RepoConfig::default().skip_dev_dependency_cycles);
+        let config: RepoConfig =
+            toml::from_str("skip_dev_dependency_cycles = true").expect("deserialize");
+        assert!(config.skip_dev_dependency_cycles);
     }
 
     #[test]

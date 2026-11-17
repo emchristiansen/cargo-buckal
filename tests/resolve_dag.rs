@@ -794,6 +794,45 @@ fn test_dev_dependency_cycle() {
     );
 }
 
+/// With `lenient`, the cycle-closing dev edge is dropped and every package stays.
+#[test]
+fn test_dev_dependency_cycle_lenient_keeps_all_packages() {
+    let fixture_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dev-dep-cycle");
+    let metadata = MetadataCommand::new()
+        .manifest_path(fixture_dir.join("Cargo.toml"))
+        .exec()
+        .expect("cargo metadata failed");
+    let packages_map: HashMap<PackageId, cargo_metadata::Package> = metadata
+        .packages
+        .iter()
+        .cloned()
+        .map(|p| (p.id.clone(), p))
+        .collect();
+    let nodes_map: HashMap<PackageId, cargo_metadata::Node> = metadata
+        .resolve
+        .clone()
+        .expect("no resolve in metadata")
+        .nodes
+        .into_iter()
+        .map(|n| (n.id.clone(), n))
+        .collect();
+    let root_path = std::path::Path::new(metadata.workspace_root.as_str());
+
+    let resolve =
+        BuckalResolve::from_metadata(&nodes_map, &packages_map, &HashMap::new(), root_path, true)
+            .expect("lenient resolution succeeds");
+
+    assert_eq!(resolve.nodes().count(), packages_map.len());
+    // Exactly one direction of the cycle survives.
+    let edge_count: usize = resolve
+        .nodes()
+        .map(|n| resolve.deps_of(&n.package_id).len())
+        .sum();
+    let declared: usize = nodes_map.values().map(|n| n.deps.len()).sum();
+    assert_eq!(edge_count + 1, declared);
+}
+
 /// Verify that `cargo test` succeeds for a mutual dev-dependency cycle.
 ///
 /// Despite the flattened `cargo metadata` graph containing a cycle
