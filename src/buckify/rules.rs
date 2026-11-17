@@ -836,12 +836,26 @@ fn wasm_variant_rules(
         if wasm.root
             && let Some(platform) = &ctx.repo_config.wasm.platform
         {
+            let alias = crate::wasm::module_alias(module);
             variant.push(Rule::ConfiguredAlias(crate::buck::ConfiguredAlias {
-                name: crate::wasm::MODULE_ALIAS.to_owned(),
+                name: alias.clone(),
                 actual: format!(":{name}"),
                 platform: platform.clone(),
                 visibility: Set::from(["PUBLIC".to_owned()]),
             }));
+            // The module's SHA-256 witness, where a test-env declaration names it.
+            let witnessed = ctx
+                .declared_test_env
+                .values()
+                .flat_map(|declared| declared.values())
+                .any(|value| value.sha256 && &value.module == module);
+            if witnessed {
+                variant.push(Rule::WasmSha256(crate::buck::WasmSha256 {
+                    name: format!("{alias}{}", crate::wasm::SHA256_SUFFIX),
+                    src: format!(":{alias}[cdylib]"),
+                    visibility: Set::from(["PUBLIC".to_owned()]),
+                }));
+            }
         }
         rules.extend(variant);
     }
@@ -850,10 +864,12 @@ fn wasm_variant_rules(
 
 /// Give every test of `node` the `[package.metadata.buck2.test-env]` variables its
 /// dependency closure declares (the package itself, its dependencies and
-/// dev-dependencies, and their dependencies): `VAR = { wasm = "<module>" }` becomes
-/// `run_env` `VAR = "$(location //<module dir>:lib-wasm-wasm32[cdylib])"`. A module
-/// that `[wasm] packages` does not build, two declarations of one variable with
-/// different modules, and a variable the test's `run_env` already sets are refused.
+/// dev-dependencies, and their dependencies): `VAR = { wasm = "<package>" }` becomes
+/// `run_env` `VAR = "$(location //<module dir>:lib-wasm-wasm32[cdylib])"`, a
+/// variant's (`variant = "<name>"`) `lib-wasm-wasm32.<name>`, and `wasm_sha256`
+/// instead of `wasm` the module's witness `<alias>-sha256`. A module that `[wasm]
+/// packages` does not build, two declarations of one variable with different
+/// values, and a variable the test's `run_env` already sets are refused.
 fn apply_declared_test_env(
     rules: &mut [Rule],
     node: &BuckalNode,
@@ -908,12 +924,22 @@ fn apply_declared_test_env(
             .nodes()
             .find(|n| &n.package_id == id)
             .map_or(id.repr.clone(), |n| n.name.clone());
-        for (variable, module) in declared {
+        for (variable, declared_value) in declared {
             let where_ = format!("`{tested}`: `{variable}`, declared by `{reader}`");
+            let module = &declared_value.module;
             let Some(dir) = ctx.wasm_modules.get(module) else {
-                anyhow::bail!("{where_}, names `{module}`, which `[wasm] packages` does not build");
+                let named = match module.split_once('.') {
+                    None => format!("`{module}`"),
+                    Some((package, variant)) => format!("`{package}` variant `{variant}`"),
+                };
+                anyhow::bail!("{where_}, names {named}, which `[wasm] packages` does not build");
             };
-            let value = format!("$(location //{dir}:{}[cdylib])", crate::wasm::MODULE_ALIAS);
+            let alias = crate::wasm::module_alias(module);
+            let value = if declared_value.sha256 {
+                format!("$(location //{dir}:{alias}{})", crate::wasm::SHA256_SUFFIX)
+            } else {
+                format!("$(location //{dir}:{alias}[cdylib])")
+            };
             match values.get(variable) {
                 Some((other, by)) if *other != value => {
                     anyhow::bail!("{where_} and by `{by}` with different modules")
@@ -1494,9 +1520,11 @@ fn render_buck_content(
     let mut has_rust_binary = false;
     let mut has_rust_test = false;
     let mut has_buildscript_run = false;
+    let mut has_wasm_sha256 = false;
 
     for rule in rules {
         match rule {
+            Rule::WasmSha256(_) => has_wasm_sha256 = true,
             Rule::CargoManifest(_) => has_cargo_manifest = true,
             Rule::RustLibrary(_) => has_rust_library = true,
             Rule::RustBinary(_) => has_rust_binary = true,
@@ -1536,6 +1564,13 @@ fn render_buck_content(
         loads.push(Rule::Load(Load {
             bzl: "@buckal//:wrapper.bzl".to_owned(),
             items: wrapper_items,
+        }));
+    }
+
+    if has_wasm_sha256 {
+        loads.push(Rule::Load(Load {
+            bzl: "@buckal//:wasm_digest.bzl".to_owned(),
+            items: Set::from(["wasm_sha256".to_owned()]),
         }));
     }
 

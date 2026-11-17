@@ -20,11 +20,97 @@ pub const WASM_TRIPLE: &str = "wasm32-unknown-unknown";
 /// The name of a module's `configured_alias`, whose `[cdylib]` is the module.
 pub const MODULE_ALIAS: &str = "lib-wasm-wasm32";
 
-/// A module's `[package.metadata.buck2.wasm]`.
+/// The suffix of the rule holding a module's SHA-256 witness, after its alias.
+pub const SHA256_SUFFIX: &str = "-sha256";
+
+/// A module's `[package.metadata.buck2.wasm]`, with its feature variants
+/// (`[package.metadata.buck2.wasm-variants.<name>]`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleDeclaration {
     pub features: Vec<String>,
     pub profile: String,
+    /// Each variant's own features (exactly these, in a graph of its own) and
+    /// profile (the module's when not given).
+    pub variants: BTreeMap<String, (Vec<String>, String)>,
+}
+
+impl ModuleDeclaration {
+    /// Every module `package` builds, by module key: the featureless module
+    /// (`<package>`) and each variant (`<package>.<variant>`), with its features
+    /// and profile.
+    pub fn modules(&self, package: &str) -> Vec<(String, &[String], &str)> {
+        std::iter::once((package.to_owned(), &self.features[..], &self.profile[..]))
+            .chain(self.variants.iter().map(|(variant, (features, profile))| {
+                (
+                    module_key(package, Some(variant)),
+                    &features[..],
+                    &profile[..],
+                )
+            }))
+            .collect()
+    }
+}
+
+/// The key of a module: `<package>`, or `<package>.<variant>` for a variant (a
+/// package name holds no `.`).
+pub fn module_key(package: &str, variant: Option<&str>) -> String {
+    match variant {
+        None => package.to_owned(),
+        Some(variant) => format!("{package}.{variant}"),
+    }
+}
+
+/// The name of the `configured_alias` of the module `key`, whose `[cdylib]` is the
+/// module: `lib-wasm-wasm32`, or `lib-wasm-wasm32.<variant>`.
+pub fn module_alias(key: &str) -> String {
+    match key.split_once('.') {
+        None => MODULE_ALIAS.to_owned(),
+        Some((_, variant)) => format!("{MODULE_ALIAS}.{variant}"),
+    }
+}
+
+/// What a `[package.metadata.buck2.test-env]` variable gets: the module `module`
+/// (a module key), or the file holding its lowercase SHA-256 (`sha256`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TestEnvValue {
+    pub module: String,
+    pub sha256: bool,
+}
+
+impl serde::Serialize for TestEnvValue {
+    /// The featureless module's path as its key alone, as before variants and
+    /// witnesses existed (so recorded fingerprints keep their values).
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.sha256 {
+            use serde::ser::SerializeMap;
+            let mut map = serializer.serialize_map(Some(1))?;
+            map.serialize_entry("wasm_sha256", &self.module)?;
+            map.end()
+        } else {
+            serializer.serialize_str(&self.module)
+        }
+    }
+}
+
+/// A list of strings at `value`, or why not (`what` names it).
+fn string_list(value: &serde_json::Value, what: &str) -> Result<Vec<String>> {
+    value
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .map(|f| f.as_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()
+        })
+        .with_context(|| format!("{what} is not a list of strings"))
+}
+
+/// Whether `name` can name a variant: letters, digits, `_` and `-`.
+fn valid_variant_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// The features the modules in `modules` (package names) declare, as
@@ -47,12 +133,13 @@ pub fn declared_module_features(
             continue;
         };
         if let Some(declaration) = module_declaration(package)? {
-            features.extend(
-                declaration
-                    .features
-                    .iter()
-                    .map(|feature| format!("{module}/{feature}")),
-            );
+            for (_, module_features, _) in declaration.modules(module) {
+                features.extend(
+                    module_features
+                        .iter()
+                        .map(|feature| format!("{module}/{feature}")),
+                );
+            }
         }
     }
     Ok(features)
@@ -92,11 +179,62 @@ pub fn module_declaration(package: &Package) -> Result<Option<ModuleDeclaration>
             })?
             .to_owned(),
     };
-    Ok(Some(ModuleDeclaration { features, profile }))
+    let mut variants = BTreeMap::new();
+    if let Some(table) = package
+        .metadata
+        .get("buck2")
+        .and_then(|b| b.get("wasm-variants"))
+    {
+        let where_ = format!(
+            "`{}`: `[package.metadata.buck2.wasm-variants]`",
+            package.name
+        );
+        let table = table
+            .as_object()
+            .with_context(|| format!("{where_} is not a table"))?;
+        for (name, variant) in table {
+            let where_ = format!(
+                "`{}`: `[package.metadata.buck2.wasm-variants.{name}]`",
+                package.name
+            );
+            if !valid_variant_name(name) {
+                bail!("{where_}: a variant name holds only letters, digits, `_` and `-`");
+            }
+            let variant = variant
+                .as_object()
+                .with_context(|| format!("{where_} is not a table"))?;
+            if let Some(key) = variant
+                .keys()
+                .find(|k| !["features", "profile"].contains(&k.as_str()))
+            {
+                bail!("{where_}: unknown key `{key}` (a variant has `features` and `profile`)");
+            }
+            let variant_features = match variant.get("features") {
+                None => bail!("{where_}: `features` is required (a variant's exact features)"),
+                Some(list) => string_list(list, &format!("{where_} `features`"))?,
+            };
+            let variant_profile = match variant.get("profile") {
+                None => profile.clone(),
+                Some(p) => p
+                    .as_str()
+                    .with_context(|| format!("{where_} `profile` is not a string"))?
+                    .to_owned(),
+            };
+            variants.insert(name.clone(), (variant_features, variant_profile));
+        }
+    }
+    Ok(Some(ModuleDeclaration {
+        features,
+        profile,
+        variants,
+    }))
 }
 
-/// `[package.metadata.buck2.test-env]` of `package`: `{variable: wasm package}`.
-pub fn test_env_declaration(package: &Package) -> Result<BTreeMap<String, String>> {
+/// `[package.metadata.buck2.test-env]` of `package`: each variable's module path
+/// (`{ wasm = "<package>" }`) or SHA-256 witness file (`{ wasm_sha256 = "<package>"
+/// }`), of the package's featureless module or, with `variant = "<name>"`, of that
+/// variant.
+pub fn test_env_declaration(package: &Package) -> Result<BTreeMap<String, TestEnvValue>> {
     let Some(table) = package
         .metadata
         .get("buck2")
@@ -108,18 +246,45 @@ pub fn test_env_declaration(package: &Package) -> Result<BTreeMap<String, String
     table
         .iter()
         .map(|(variable, value)| {
-            let module = value
-                .as_object()
-                .filter(|v| v.len() == 1)
-                .and_then(|v| v.get("wasm"))
-                .and_then(|m| m.as_str())
-                .with_context(|| {
-                    format!(
-                        "`{}`: `[package.metadata.buck2.test-env] {variable}` is not `{{ wasm = \"<package>\" }}`",
-                        package.name
-                    )
-                })?;
-            Ok((variable.clone(), module.to_owned()))
+            let refuse = || {
+                anyhow::anyhow!(
+                    "`{}`: `[package.metadata.buck2.test-env] {variable}` is not `{{ wasm = \"<package>\" }}` or `{{ wasm_sha256 = \"<package>\" }}`, with an optional `variant = \"<name>\"`",
+                    package.name
+                )
+            };
+            let entry = value.as_object().ok_or_else(refuse)?;
+            if entry
+                .keys()
+                .any(|k| !["wasm", "wasm_sha256", "variant"].contains(&k.as_str()))
+            {
+                return Err(refuse());
+            }
+            let (module, sha256) = match (entry.get("wasm"), entry.get("wasm_sha256")) {
+                (Some(module), None) => (module, false),
+                (None, Some(module)) => (module, true),
+                _ => return Err(refuse()),
+            };
+            let module = module.as_str().ok_or_else(refuse)?;
+            // A package name has no `.`: `<package>.<variant>` is a module key,
+            // which a declaration spells only with `variant`.
+            if let Some((name, variant)) = module.split_once('.') {
+                bail!(
+                    "`{}`: `[package.metadata.buck2.test-env] {variable}` names the package `{module}`; a variant is named by its own key, `{{ {} = \"{name}\", variant = \"{variant}\" }}`",
+                    package.name,
+                    if sha256 { "wasm_sha256" } else { "wasm" }
+                );
+            }
+            let variant = match entry.get("variant") {
+                None => None,
+                Some(v) => Some(v.as_str().filter(|v| valid_variant_name(v)).ok_or_else(refuse)?),
+            };
+            Ok((
+                variable.clone(),
+                TestEnvValue {
+                    module: module_key(module, variant),
+                    sha256,
+                },
+            ))
         })
         .collect()
 }
@@ -209,38 +374,40 @@ pub fn resolve_modules(
         let Some(declaration) = module_declaration(&packages[id])? else {
             bail!("`[wasm] packages`: `{module}` declares no `[package.metadata.buck2.wasm]`");
         };
-        let graph = resolve_package_graph(
-            manifest_path,
-            packages,
-            module,
-            &declaration.features,
-            &declaration.profile,
-            WASM_TRIPLE,
-        )?;
-        if !graph.contains_key(id) {
-            bail!(
-                "`[wasm] packages`: `{module}`'s own graph does not compile its library for {WASM_TRIPLE}"
-            );
-        }
-        for (pkg, lib) in graph {
-            let root = &pkg == id;
-            let (mut rustc_flags, root_flags) = profile_flags(&lib.profile)
-                .with_context(|| format!("`[wasm] packages`: `{module}`: `{pkg}`"))?;
-            if root {
-                rustc_flags.extend(root_flags);
+        for (key, features, profile) in declaration.modules(module) {
+            let graph = resolve_package_graph(
+                manifest_path,
+                packages,
+                module,
+                features,
+                profile,
+                WASM_TRIPLE,
+            )?;
+            if !graph.contains_key(id) {
+                bail!(
+                    "`[wasm] packages`: `{key}`'s own graph does not compile its library for {WASM_TRIPLE}"
+                );
             }
-            let variant = WasmVariant {
-                platform: platform.to_owned(),
-                features: lib.features,
-                normal: lib.normal,
-                build: lib.build,
-                rustc_flags,
-                root,
-            };
-            variants
-                .entry(pkg)
-                .or_default()
-                .insert(module.clone(), variant);
+            for (pkg, lib) in graph {
+                let root = &pkg == id;
+                let (mut rustc_flags, root_flags) = profile_flags(&lib.profile)
+                    .with_context(|| format!("`[wasm] packages`: `{key}`: `{pkg}`"))?;
+                if root {
+                    rustc_flags.extend(root_flags);
+                }
+                let variant = WasmVariant {
+                    platform: platform.to_owned(),
+                    features: lib.features,
+                    normal: lib.normal,
+                    build: lib.build,
+                    rustc_flags,
+                    root,
+                };
+                variants
+                    .entry(pkg)
+                    .or_default()
+                    .insert(key.clone(), variant);
+            }
         }
     }
     Ok(variants)

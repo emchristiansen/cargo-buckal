@@ -50,7 +50,8 @@ pub struct BuckalContext {
     pub wasm_modules: std::collections::BTreeMap<String, String>,
     /// With `[wasm]`: each first-party package's `[package.metadata.buck2.test-env]`
     /// (`{variable: wasm package}`), where it declares one.
-    pub declared_test_env: HashMap<PackageId, std::collections::BTreeMap<String, String>>,
+    pub declared_test_env:
+        HashMap<PackageId, std::collections::BTreeMap<String, crate::wasm::TestEnvValue>>,
 }
 
 impl BuckalContext {
@@ -323,11 +324,16 @@ impl BuckalContext {
                 resolve.dag[idx].platform_features.wasm_variants = by_module;
             }
             for module in &wasm.packages {
-                let manifest = &packages_map[&members[module]].manifest_path;
-                wasm_modules.insert(
-                    module.clone(),
-                    package_dir(manifest, &buck2_root).unwrap_or_default(),
-                );
+                let package = &packages_map[&members[module]];
+                let dir = package_dir(&package.manifest_path, &buck2_root).unwrap_or_default();
+                // resolve_modules has read every declaration.
+                let declaration = crate::wasm::module_declaration(package)
+                    .ok()
+                    .flatten()
+                    .expect("a module's declaration was read");
+                for (key, _, _) in declaration.modules(module) {
+                    wasm_modules.insert(key, dir.clone());
+                }
             }
             for id in &first_party {
                 let declared = test_env_declaration(&packages_map[id]).unwrap_or_else(|error| {
@@ -394,16 +400,19 @@ impl BuckalContext {
         if self.declared_test_env.is_empty() {
             return Vec::new();
         }
-        let by_name: std::collections::BTreeMap<&str, &std::collections::BTreeMap<String, String>> =
-            self.declared_test_env
-                .iter()
-                .map(|(id, declared)| {
-                    (
-                        self.resolve.dag[self.resolve.index_map[id]].name.as_str(),
-                        declared,
-                    )
-                })
-                .collect();
+        let by_name: std::collections::BTreeMap<
+            &str,
+            &std::collections::BTreeMap<String, crate::wasm::TestEnvValue>,
+        > = self
+            .declared_test_env
+            .iter()
+            .map(|(id, declared)| {
+                (
+                    self.resolve.dag[self.resolve.index_map[id]].name.as_str(),
+                    declared,
+                )
+            })
+            .collect();
         serde_json::to_vec(&by_name).expect("declared test environments serialize")
     }
 

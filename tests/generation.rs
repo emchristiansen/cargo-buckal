@@ -4390,6 +4390,141 @@ fn test_wasm_module_features_come_from_the_workspace_member() {
 }
 
 #[test]
+fn test_wasm_feature_variant_and_sha256_witness_through_test_env() {
+    // t_ba207f13 (Callosum test harness): a package builds a second wasm32 module,
+    // a feature variant with exactly its own features in its own graph, beside
+    // its featureless module; a test-env key names the variant, and another the
+    // file holding the variant's lowercase SHA-256, which a separate action
+    // computes from the same artifact.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"module\", \"d\", \"testkit\", \"reader\"]\n",
+    );
+    write(
+        &f.ws.join("module/Cargo.toml"),
+        &manifest(
+            "module",
+            "[lib]\ncrate-type = [\"cdylib\", \"rlib\"]\n[features]\nadmission = [\"d/strict\"]\n\
+             [dependencies]\nd = { path = \"../d\" }\n\
+             [package.metadata.buck2.wasm]\nfeatures = []\nprofile = \"release\"\n\
+             [package.metadata.buck2.wasm-variants.harness]\nfeatures = [\"admission\"]\n",
+        ),
+    );
+    write(
+        &f.ws.join("d/Cargo.toml"),
+        &manifest("d", "[features]\nstrict = []\n"),
+    );
+    write(
+        &f.ws.join("testkit/Cargo.toml"),
+        &manifest(
+            "testkit",
+            "[package.metadata.buck2.test-env]\nMODULE_WASM = { wasm = \"module\" }\n\
+             HARNESS_WASM = { wasm = \"module\", variant = \"harness\" }\n\
+             HARNESS_WASM_DIGEST_FILE = { wasm_sha256 = \"module\", variant = \"harness\" }\n",
+        ),
+    );
+    write(
+        &f.ws.join("reader/Cargo.toml"),
+        &manifest(
+            "reader",
+            "[dev-dependencies]\ntestkit = { path = \"../testkit\" }\n",
+        ),
+    );
+    write(&f.ws.join("reader/tests/it.rs"), "");
+    for name in ["module", "d", "testkit", "reader"] {
+        write(&f.ws.join(name).join("src/lib.rs"), "");
+    }
+    let platform = "root//buck2/platforms/wasm:wasm32_unknown_unknown";
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!(
+            "{}\n[wasm]\npackages = [\"module\"]\nplatform = \"{platform}\"\n",
+            BUCKAL_TOML.split("[fixups.extra]").next().unwrap()
+        ),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+
+    // Both modules, each from its own graph: the variant with exactly its
+    // features, the featureless module without them.
+    let module = f.buck("module");
+    let base = rule(&module, "module-wasm-module");
+    assert!(!base.contains("admission"), "{base}");
+    assert_eq!(top_deps(base), ["//d:d-wasm-module"], "{base}");
+    let harness = rule(&module, "module-wasm-module.harness");
+    assert!(
+        harness.contains("    features = [\"admission\"],\n"),
+        "{harness}"
+    );
+    assert_eq!(
+        top_deps(harness),
+        ["//d:d-wasm-module.harness"],
+        "{harness}"
+    );
+    let d = f.buck("d");
+    assert!(
+        rule(&d, "d-wasm-module.harness").contains("    features = [\"strict\"],\n"),
+        "{d}"
+    );
+    assert!(!rule(&d, "d-wasm-module").contains("strict"), "{d}");
+    assert!(
+        module.contains(&format!(
+            "configured_alias(\n    name = \"lib-wasm-wasm32\",\n    actual = \":module-wasm-module\",\n    platform = \"{platform}\",\n"
+        )),
+        "{module}"
+    );
+    assert!(
+        module.contains(&format!(
+            "configured_alias(\n    name = \"lib-wasm-wasm32.harness\",\n    actual = \":module-wasm-module.harness\",\n    platform = \"{platform}\",\n"
+        )),
+        "{module}"
+    );
+    // The witness: only for the declared one.
+    assert!(
+        module.contains("load(\"@buckal//:wasm_digest.bzl\", \"wasm_sha256\")"),
+        "{module}"
+    );
+    assert!(
+        module.contains(
+            "wasm_sha256(\n    name = \"lib-wasm-wasm32.harness-sha256\",\n    src = \":lib-wasm-wasm32.harness[cdylib]\",\n"
+        ),
+        "{module}"
+    );
+    assert!(!module.contains("\"lib-wasm-wasm32-sha256\""), "{module}");
+
+    let reader = f.buck("reader");
+    let it = rule(&reader, "it");
+    for value in [
+        "\"MODULE_WASM\": \"$(location //module:lib-wasm-wasm32[cdylib])\"",
+        "\"HARNESS_WASM\": \"$(location //module:lib-wasm-wasm32.harness[cdylib])\"",
+        "\"HARNESS_WASM_DIGEST_FILE\": \"$(location //module:lib-wasm-wasm32.harness-sha256)\"",
+    ] {
+        assert!(it.contains(value), "{value}: {it}");
+    }
+    f.migrate(&["--no-cache"]);
+    assert_eq!(f.buck("module"), module);
+    assert_eq!(f.buck("reader"), reader);
+
+    // A variant the package does not declare is refused.
+    write(
+        &f.ws.join("testkit/Cargo.toml"),
+        &manifest(
+            "testkit",
+            "[package.metadata.buck2.test-env]\nX = { wasm = \"module\", variant = \"nope\" }\n",
+        ),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("`X`, declared by `testkit`, names `module` variant `nope`, which `[wasm] packages` does not build"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn test_per_test_unset_run_env_through_generation() {
     // N14: a single test can drop a key of the package's `test_run_env` (an empty
     // string stays a value).
@@ -4590,4 +4725,117 @@ fn test_a_sibling_directory_sharing_the_root_prefix_is_not_the_workspace() {
         snap.contains("path+file://($WORKSPACE)/app#0.1.0"),
         "{snap}"
     );
+}
+
+/// A workspace with the wasm module `module` (declaring `module_metadata` after
+/// its featureless module) and `testkit`, whose test-env is `test_env`.
+fn wasm_test_env_fixture(module_metadata: &str, test_env: &str) -> Fixture {
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"module\", \"testkit\"]\n",
+    );
+    write(
+        &f.ws.join("module/Cargo.toml"),
+        &manifest(
+            "module",
+            &format!(
+                "[lib]\ncrate-type = [\"cdylib\", \"rlib\"]\n[features]\nadmission = []\n\
+                 [package.metadata.buck2.wasm]\nfeatures = []\nprofile = \"release\"\n{module_metadata}"
+            ),
+        ),
+    );
+    write(
+        &f.ws.join("testkit/Cargo.toml"),
+        &manifest(
+            "testkit",
+            &format!("[package.metadata.buck2.test-env]\n{test_env}"),
+        ),
+    );
+    for name in ["module", "testkit"] {
+        write(&f.ws.join(name).join("src/lib.rs"), "");
+    }
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!(
+            "{}\n[wasm]\npackages = [\"module\"]\nplatform = \"root//buck2/platforms/wasm:wasm32_unknown_unknown\"\n",
+            BUCKAL_TOML.split("[fixups.extra]").next().unwrap()
+        ),
+    );
+    f
+}
+
+#[test]
+fn test_a_name_generation_emits_twice_is_refused() {
+    // Fable N21 (fixture f61): variant `x`'s witness `lib-wasm-wasm32.x-sha256` is
+    // also the alias of the variant `x-sha256`. Buck2 refuses a BUCK file that
+    // declares a name twice, so generation refuses it and writes nothing.
+    let f = wasm_test_env_fixture(
+        "[package.metadata.buck2.wasm-variants.x]\nfeatures = [\"admission\"]\n\
+         [package.metadata.buck2.wasm-variants.x-sha256]\nfeatures = []\n",
+        "D = { wasm_sha256 = \"module\", variant = \"x\" }\n",
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "generation emits two rules named `lib-wasm-wasm32.x-sha256` (`wasm_sha256` and `configured_alias`)"
+        ),
+        "{stderr}"
+    );
+    assert!(!f.ws.join("module/BUCK").exists());
+}
+
+#[test]
+fn test_a_variant_is_named_only_by_its_variant_key() {
+    // Fable on 4b76a20a: `{ wasm = "module.harness" }` is not another spelling
+    // of `{ wasm = "module", variant = "harness" }`.
+    for (key, value) in [
+        ("wasm", "module.harness"),
+        ("wasm_sha256", "module.harness"),
+    ] {
+        let f = wasm_test_env_fixture(
+            "[package.metadata.buck2.wasm-variants.harness]\nfeatures = [\"admission\"]\n",
+            &format!("H = {{ {key} = \"{value}\" }}\n"),
+        );
+        let output = f.output(&["migrate"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{key}: {stderr}");
+        assert!(
+            stderr.contains(&format!(
+                "`testkit`: `[package.metadata.buck2.test-env] H` names the package `module.harness`; a variant is named by its own key, `{{ {key} = \"module\", variant = \"harness\" }}`"
+            )),
+            "{key}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn test_a_hand_written_wasm_sha256_is_removed_with_a_warning() {
+    // Fable on 4b76a20a: `wasm_sha256` is a generated rule kind, like `rust_test`
+    // (`test_..._removed_it`): generation owns every call of it in a first-party
+    // BUCK file, whose `@buckal//` loads it also owns. A call it does not emit is
+    // removed when the file is regenerated, and the removal is reported by name.
+    let f = wasm_test_env_fixture(
+        "[package.metadata.buck2.wasm-variants.harness]\nfeatures = [\"admission\"]\n",
+        "D = { wasm_sha256 = \"module\", variant = \"harness\" }\n",
+    );
+    f.migrate(&[]);
+    let path = f.ws.join("module/BUCK");
+    let generated = std::fs::read_to_string(&path).unwrap();
+    write(
+        &path,
+        &format!("{generated}\nwasm_sha256(\n    name = \"mine\",\n    src = \"data.wasm\",\n)\n"),
+    );
+    let output = f.output(&["migrate", "--no-cache"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "module/BUCK: removing `wasm_sha256(name = \"mine\")`: generation owns every `wasm_sha256` rule of a first-party BUCK file and no longer emits this one"
+        ),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), generated);
 }

@@ -26,6 +26,7 @@ pub enum Rule {
     RustTest(RustTest),
     BuildscriptRun(BuildscriptRun),
     ConfiguredAlias(ConfiguredAlias),
+    WasmSha256(WasmSha256),
 }
 
 /// Buck2's native `configured_alias`: `actual` configured for `platform`.
@@ -39,7 +40,36 @@ pub struct ConfiguredAlias {
     pub visibility: Set<String>,
 }
 
+/// The buckal cell's `wasm_sha256` (`@buckal//:wasm_digest.bzl`): a file holding
+/// the lowercase hex SHA-256 of `src` (a module's `[cdylib]`), with no newline.
+#[derive(Serialize, Debug, PartialEq, Clone)]
+#[serde(rename = "wasm_sha256")]
+pub struct WasmSha256 {
+    pub name: String,
+    pub src: String,
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub visibility: Set<String>,
+}
+
 impl Rule {
+    /// The function a BUCK file calls for the rule (`load` for a load).
+    pub fn function(&self) -> &'static str {
+        match self {
+            Rule::Load(_) => "load",
+            Rule::HttpArchive(_) => "http_archive",
+            Rule::FileGroup(_) => "filegroup",
+            Rule::GitFetch(_) => "git_fetch",
+            Rule::CargoManifest(_) => "cargo_manifest",
+            Rule::ExportFile(_) => "export_file",
+            Rule::RustLibrary(_) => "rust_library",
+            Rule::RustBinary(_) => "rust_binary",
+            Rule::RustTest(_) => "rust_test",
+            Rule::BuildscriptRun(_) => "buildscript_run",
+            Rule::ConfiguredAlias(_) => "configured_alias",
+            Rule::WasmSha256(_) => "wasm_sha256",
+        }
+    }
+
     /// The rule's `name`, or `None` for a `load`.
     pub fn name(&self) -> Option<&str> {
         match self {
@@ -54,6 +84,7 @@ impl Rule {
             Rule::RustTest(r) => Some(&r.name),
             Rule::BuildscriptRun(r) => Some(&r.name),
             Rule::ConfiguredAlias(r) => Some(&r.name),
+            Rule::WasmSha256(r) => Some(&r.name),
         }
     }
 
@@ -1445,16 +1476,7 @@ fn parse_rule_from_call(
 fn rule_map_key(rule: &Rule) -> String {
     match rule {
         Rule::Load(load) => format!("load[{}]", load.bzl),
-        Rule::HttpArchive(r) => format!("http_archive[{}]", r.name),
-        Rule::FileGroup(r) => format!("filegroup[{}]", r.name),
-        Rule::GitFetch(r) => format!("git_fetch[{}]", r.name),
-        Rule::CargoManifest(r) => format!("cargo_manifest[{}]", r.name),
-        Rule::ExportFile(r) => format!("export_file[{}]", r.name),
-        Rule::RustLibrary(r) => format!("rust_library[{}]", r.name),
-        Rule::RustBinary(r) => format!("rust_binary[{}]", r.name),
-        Rule::RustTest(r) => format!("rust_test[{}]", r.name),
-        Rule::BuildscriptRun(r) => format!("buildscript_run[{}]", r.name),
-        Rule::ConfiguredAlias(r) => format!("configured_alias[{}]", r.name),
+        rule => format!("{}[{}]", rule.function(), rule.name().unwrap_or_default()),
     }
 }
 
