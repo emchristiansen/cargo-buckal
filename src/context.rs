@@ -5,7 +5,8 @@ use cargo_metadata::{MetadataCommand, PackageId, camino::Utf8PathBuf};
 use cargo_util_schemas::{lockfile::TomlLockfile, manifest::TomlManifest};
 
 use crate::{
-    buckal_warn,
+    buckal_error, buckal_warn,
+    cache::BuckalCache,
     config::RepoConfig,
     platform_features::{host_resolutions_differing_by_platform, resolve_platform_features},
     resolve::{BuckalNode, BuckalResolve, NodeKind},
@@ -27,6 +28,11 @@ pub struct BuckalContext {
     /// and `cargo test --workspace` build; `None` takes every first-party package
     /// for one.
     pub workspace_members: Option<std::collections::BTreeSet<PackageId>>,
+    /// Host compilations that resolve differently per configured platform, as
+    /// `<name> v<version> (<host-only | variant -host | variant -test-host>)`,
+    /// sorted; `None` without `feature_platforms`. The emission record keeps it,
+    /// and a change stops the next generation unless it is accepted.
+    pub host_platform_differences: Option<Vec<String>>,
 }
 
 impl BuckalContext {
@@ -93,6 +99,7 @@ impl BuckalContext {
         )
         .unwrap_or_exit_ctx("failed to resolve dependency graph");
 
+        let mut host_platform_differences = None;
         if !repo_config.feature_platforms.is_empty() {
             let per_platform = resolve_platform_features(
                 manifest_path.as_deref(),
@@ -102,30 +109,33 @@ impl BuckalContext {
             )
             .unwrap_or_exit_ctx("failed to resolve per-platform features");
             let differing = host_resolutions_differing_by_platform(&per_platform);
-            if !differing.is_empty() {
-                let names: Vec<String> = differing
-                    .iter()
-                    .map(|(id, suffix)| {
-                        let name = packages_map
-                            .get(id)
-                            .map(|p| format!("{} v{}", p.name, p.version))
-                            .unwrap_or_else(|| id.repr.clone());
-                        format!(
-                            "{name} ({}{suffix})",
-                            if suffix.is_empty() {
-                                "host-only"
-                            } else {
-                                "variant "
-                            }
-                        )
-                    })
-                    .collect();
+            let names: Vec<String> = differing
+                .iter()
+                .map(|(id, suffix)| {
+                    let name = packages_map
+                        .get(id)
+                        .map(|p| format!("{} v{}", p.name, p.version))
+                        .unwrap_or_else(|| id.repr.clone());
+                    format!(
+                        "{name} ({}{suffix})",
+                        if suffix.is_empty() {
+                            "host-only"
+                        } else {
+                            "variant "
+                        }
+                    )
+                })
+                .collect();
+            let mut names = names;
+            names.sort();
+            if !names.is_empty() {
                 buckal_warn!(format!(
                     "{} host compilation(s) resolve differently per configured platform: {}. Buck configures host compilations in the execution platform, so their `platform` attribute selects the execution platform's resolution for every target; the other platforms' host features and dependencies are not built as Cargo plans them",
                     names.len(),
                     names.join(", ")
                 ));
             }
+            host_platform_differences = Some(names);
             for (pkg_id, features) in per_platform {
                 if let Some(&idx) = resolve.index_map.get(&pkg_id) {
                     resolve.dag[idx].platform_features = features;
@@ -139,11 +149,58 @@ impl BuckalContext {
             root,
             resolve,
             workspace_members,
+            host_platform_differences,
             workspace_root: cargo_metadata.workspace_root.clone(),
             workspace_inherit,
             no_merge: false,
             repo_config,
         }
+    }
+
+    /// The cache recording this generation: the packages' fingerprints, the
+    /// fixups it applies and the host compilations that differ per platform.
+    pub fn new_cache(&self) -> BuckalCache {
+        BuckalCache::from_resolve_with_config(
+            &self.resolve,
+            &self.workspace_root,
+            &self.repo_config,
+        )
+        .with_host_platform_differences(self.host_platform_differences.clone())
+    }
+
+    /// Stop, writing nothing, when the host compilations that resolve differently
+    /// per platform are not those the last generation recorded (R17 is deferred:
+    /// Buck builds each of them in the execution platform's resolution only), unless
+    /// `accept`. A record without the list, or no record, accepts any.
+    pub fn check_host_platform_differences(&self, accept: bool) {
+        let Some(current) = &self.host_platform_differences else {
+            return;
+        };
+        let Ok(recorded) = BuckalCache::load() else {
+            return;
+        };
+        let Some(previous) = recorded.host_platform_differences() else {
+            return;
+        };
+        if previous == current.as_slice() || accept {
+            return;
+        }
+        let mut lines: Vec<String> = previous
+            .iter()
+            .filter(|name| !current.contains(name))
+            .map(|name| format!("  - {name}"))
+            .collect();
+        lines.extend(
+            current
+                .iter()
+                .filter(|name| !previous.contains(name))
+                .map(|name| format!("  + {name}")),
+        );
+        buckal_error!(format!(
+            "the host compilations that resolve differently per configured platform changed since the recorded generation (Buck builds each in the execution platform's resolution only):\n{}\nReview them, then run `cargo buckal migrate --accept-host-differences` to accept and record the new list.",
+            lines.join("\n")
+        ));
+        std::process::exit(1);
     }
 
     /// Whether `id` is a member of the workspace (with no member list, any package).
@@ -228,6 +285,7 @@ mod tests {
     fn make_context(resolve: BuckalResolve, patch: RepoPatchConfig) -> BuckalContext {
         BuckalContext {
             workspace_members: None,
+            host_platform_differences: None,
             root: None,
             resolve,
             workspace_root: Utf8PathBuf::from("/tmp"),

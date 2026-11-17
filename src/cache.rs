@@ -161,6 +161,11 @@ pub struct BuckalCache {
     /// `None` in a cache written before this was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     fixups: Option<BTreeMap<String, PackageFixup>>,
+    /// The host compilations that resolved differently per configured platform in
+    /// this generation (see `BuckalContext::host_platform_differences`). `None`
+    /// without `feature_platforms`, and in a cache written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_platform_differences: Option<Vec<String>>,
 }
 
 impl BuckalCache {
@@ -250,6 +255,7 @@ impl BuckalCache {
             rules_outdated: false,
             fixup_rustc_flags,
             fixups: Some(fixups.clone()),
+            host_platform_differences: None,
         }
     }
 
@@ -262,7 +268,22 @@ impl BuckalCache {
             rules_outdated: false,
             fixup_rustc_flags: BTreeMap::new(),
             fixups: None,
+            host_platform_differences: None,
         }
+    }
+
+    /// Record the host compilations that resolve differently per platform.
+    pub fn with_host_platform_differences(mut self, differences: Option<Vec<String>>) -> Self {
+        self.host_platform_differences = differences;
+        self
+    }
+
+    /// The recorded host compilations that resolve differently per platform, if
+    /// this is a record of a generation that kept them.
+    pub fn host_platform_differences(&self) -> Option<&[String]> {
+        self.recorded
+            .then_some(self.host_platform_differences.as_deref())
+            .flatten()
     }
 
     /// Mark this cache as an inventory rebuilt from metadata, not a record of

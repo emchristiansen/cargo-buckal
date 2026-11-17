@@ -9,7 +9,7 @@ use toml_edit::{DocumentMut, InlineTable, Item, Table, Value};
 
 use crate::{
     buckal_log,
-    cache::{BuckalCache, BuckalChange, ChangeType},
+    cache::{BuckalChange, ChangeType},
     config::{RepoConfig, VersionPatch},
     context::BuckalContext,
     resolve::{BuckalNode, NodeKind},
@@ -37,6 +37,8 @@ pub fn execute(args: &PatchArgs) {
     ensure_prerequisites().unwrap_or_exit();
 
     let mut ctx = BuckalContext::new(args.manifest_path.clone());
+
+    ctx.check_host_platform_differences(false);
     let selected = select_patch_for_spec(&ctx, &args.package)
         .unwrap_or_exit_ctx("failed to determine dependency patch");
 
@@ -49,10 +51,7 @@ pub fn execute(args: &PatchArgs) {
     // the full diff against the last cache finds (all of them without a compatible
     // record of generated rules), such as one whose fixup changed since.
     let last_cache = get_last_cache(args.manifest_path.as_deref());
-    changes.merge(
-        BuckalCache::from_resolve_with_config(&ctx.resolve, &ctx.workspace_root, &ctx.repo_config)
-            .diff(&last_cache, &ctx.workspace_root),
-    );
+    changes.merge(ctx.new_cache().diff(&last_cache, &ctx.workspace_root));
 
     upsert_version_patch(
         &RepoConfig::repo_config_path(),
@@ -77,8 +76,7 @@ pub fn execute(args: &PatchArgs) {
     );
 
     changes.apply(&ctx);
-    BuckalCache::from_resolve_with_config(&ctx.resolve, &ctx.workspace_root, &ctx.repo_config)
-        .save();
+    ctx.new_cache().save();
 }
 
 fn select_patch_for_spec(ctx: &BuckalContext, spec: &str) -> Result<SelectedPatch> {
@@ -318,6 +316,7 @@ mod tests {
 
         BuckalContext {
             workspace_members: None,
+            host_platform_differences: None,
             root: None,
             resolve: BuckalResolve {
                 dag,

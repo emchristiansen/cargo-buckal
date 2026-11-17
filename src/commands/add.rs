@@ -9,7 +9,6 @@ use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value, value};
 
 use crate::buckal_log;
 use crate::{
-    cache::BuckalCache,
     context::BuckalContext,
     utils::{UnwrapOrExit, check_buck2_package, ensure_prerequisites, get_last_cache, section},
 };
@@ -69,8 +68,9 @@ pub fn execute(args: &AddArgs) {
 
     let ctx = BuckalContext::new(args.manifest_path.clone());
 
-    let new_cache =
-        BuckalCache::from_resolve_with_config(&ctx.resolve, &ctx.workspace_root, &ctx.repo_config);
+    ctx.check_host_platform_differences(false);
+
+    let new_cache = ctx.new_cache();
     let changes = new_cache.diff(&last_cache, &ctx.workspace_root);
 
     changes.apply(&ctx);

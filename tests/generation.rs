@@ -2277,7 +2277,8 @@ fn test_host_compilations_differing_by_platform_are_reported() {
         "{pm}"
     );
 
-    // A host compilation that resolves alike on every platform is not reported.
+    // A host compilation that resolves alike on every platform is not reported
+    // (the list changes, which the record makes an explicit acceptance).
     write(
         &f.ws.join("app/Cargo.toml"),
         &manifest(
@@ -2285,7 +2286,7 @@ fn test_host_compilations_differing_by_platform_are_reported() {
             "[dependencies]\npm = { path = \"../pm\", features = [\"f\"] }\n",
         ),
     );
-    let output = f.output(&["migrate"]);
+    let output = f.output(&["migrate", "--accept-host-differences"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert!(!stderr.contains("resolve differently"), "{stderr}");
@@ -3040,4 +3041,73 @@ fn test_unknown_buckal_toml_keys_are_refused() {
         assert!(stderr.contains("buckal.toml"), "{key}: {stderr}");
         assert!(!f.ws.join("app/BUCK").exists(), "{key}: {stderr}");
     }
+}
+
+#[test]
+fn test_host_compilations_differing_by_platform_are_recorded_and_gated() {
+    // F4/R17 (deferral accepted): the emission record keeps the list of host
+    // compilations that resolve differently per platform. A migration whose list
+    // differs from the recorded one stops, naming what changed and writing
+    // nothing, unless `--accept-host-differences` accepts the new list.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"pm\"]\n",
+    );
+    let differing = manifest(
+        "app",
+        "[target.'cfg(not(target_arch = \"wasm32\"))'.dependencies]\npm = { path = \"../pm\", features = [\"f\"] }\n\
+         [target.'cfg(target_arch = \"wasm32\")'.dependencies]\npm = { path = \"../pm\", features = [\"w\"] }\n",
+    );
+    let alike = manifest(
+        "app",
+        "[dependencies]\npm = { path = \"../pm\", features = [\"f\"] }\n",
+    );
+    write(&f.ws.join("app/Cargo.toml"), &alike);
+    write(&f.ws.join("app/src/lib.rs"), "");
+    write(
+        &f.ws.join("pm/Cargo.toml"),
+        &manifest(
+            "pm",
+            "[lib]\nproc-macro = true\n[features]\nf = []\nw = []\n",
+        ),
+    );
+    write(&f.ws.join("pm/src/lib.rs"), "");
+    write(
+        &f.ws.join("buckal.toml"),
+        BUCKAL_TOML.split("[fixups.extra]").next().unwrap(),
+    );
+    let snap = f.ws.join("buckal.snap");
+    // First generation: an empty list is recorded.
+    f.migrate(&[]);
+    let cache = std::fs::read_to_string(&snap).unwrap();
+    assert!(cache.contains("host_platform_differences = []"), "{cache}");
+
+    // The list changes: refused, nothing written.
+    write(&f.ws.join("app/Cargo.toml"), &differing);
+    let pm_before = f.buck("pm");
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("+ pm v0.1.0 (host-only)"), "{stderr}");
+    assert!(stderr.contains("--accept-host-differences"), "{stderr}");
+    assert_eq!(f.buck("pm"), pm_before);
+    assert_eq!(std::fs::read_to_string(&snap).unwrap(), cache);
+
+    // Accepted: generated and recorded; the same list again needs no flag.
+    f.migrate(&["--accept-host-differences"]);
+    let cache = std::fs::read_to_string(&snap).unwrap();
+    assert!(
+        cache.contains("host_platform_differences = [\"pm v0.1.0 (host-only)\"]"),
+        "{cache}"
+    );
+    assert!(f.buck("pm").contains("\"w\""), "{}", f.buck("pm"));
+    f.migrate(&[]);
+
+    // An entry going away is a change too.
+    write(&f.ws.join("app/Cargo.toml"), &alike);
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("- pm v0.1.0 (host-only)"), "{stderr}");
 }

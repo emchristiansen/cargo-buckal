@@ -34,6 +34,11 @@ pub struct MigrateArgs {
     /// Path to Cargo.toml
     #[arg(long, conflicts_with = "init")]
     pub manifest_path: Option<String>,
+
+    /// Accept and record a changed list of host compilations that resolve
+    /// differently per configured platform (otherwise a change stops generation)
+    #[clap(long)]
+    pub accept_host_differences: bool,
 }
 
 pub fn execute(args: &MigrateArgs) {
@@ -112,6 +117,7 @@ pub fn execute(args: &MigrateArgs) {
     // get cargo metadata and generate context
     let mut ctx = BuckalContext::new(args.manifest_path.clone());
     ctx.no_merge = !args.merge;
+    ctx.check_host_platform_differences(args.accept_host_differences);
 
     // Process dep nodes
     // For migrate, a missing/stale cache means "first run" — use empty so everything
@@ -124,8 +130,7 @@ pub fn execute(args: &MigrateArgs) {
         .as_ref()
         .filter(|_| !args.no_cache)
         .unwrap_or(&empty);
-    let new_cache =
-        BuckalCache::from_resolve_with_config(&ctx.resolve, &ctx.workspace_root, &ctx.repo_config);
+    let new_cache = ctx.new_cache();
     let mut changes = new_cache.diff(last_cache, &ctx.workspace_root);
     // Which packages to regenerate is one question; what the previous generation
     // emitted is another. A compatible cache records the fixup flags that generation

@@ -533,6 +533,7 @@ mod tests {
 
         let ctx = BuckalContext {
             workspace_members: None,
+            host_platform_differences: None,
             root: Some(root_id.clone()),
             resolve: BuckalResolve {
                 dag,
@@ -638,6 +639,7 @@ mod tests {
         }
         let ctx = BuckalContext {
             workspace_members: None,
+            host_platform_differences: None,
             root: None,
             resolve: BuckalResolve {
                 dag,
@@ -724,6 +726,7 @@ mod tests {
         .unwrap();
         let ctx = BuckalContext {
             workspace_members: None,
+            host_platform_differences: None,
             root: None,
             resolve: BuckalResolve {
                 dag,

@@ -1324,6 +1324,7 @@ mod tests {
 
         let ctx = BuckalContext {
             workspace_members: None,
+            host_platform_differences: None,
             root: None,
             resolve: empty_resolve(),
             repo_config: RepoConfig {
@@ -1359,6 +1360,7 @@ mod tests {
 
         let ctx = BuckalContext {
             workspace_members: None,
+            host_platform_differences: None,
             root: None,
             resolve: empty_resolve(),
             repo_config: RepoConfig {
@@ -1392,6 +1394,7 @@ mod tests {
     fn test_ctx() -> BuckalContext {
         BuckalContext {
             workspace_members: None,
+            host_platform_differences: None,
             root: None,
             resolve: empty_resolve(),
             repo_config: RepoConfig {
