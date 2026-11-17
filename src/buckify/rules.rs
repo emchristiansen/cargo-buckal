@@ -335,6 +335,9 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
                 if let Some(remote_execution) = &fixup.test_remote_execution {
                     r.remote_execution = Some(remote_execution.clone());
                 }
+                if let Some(runtime_tools) = &fixup.test_runtime_tools {
+                    r.runtime_tools = Some(runtime_tools.clone());
+                }
                 (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs)
             }
             Rule::BuildscriptRun(r) => {
@@ -808,6 +811,7 @@ mod tests {
                 test_resources: Default::default(),
                 test_remote_execution: None,
                 test_run_env: Default::default(),
+                test_runtime_tools: None,
             },
         );
 

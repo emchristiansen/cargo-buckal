@@ -240,6 +240,11 @@ pub struct PackageFixup {
     /// fixture root.
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub test_run_env: Map<String, String>,
+    /// A label providing the prelude's `RuntimeToolsInfo` (a pinned tools directory)
+    /// for the package's tests that run tools at run time. Emitted as the
+    /// `runtime_tools` of every test target of the package.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_runtime_tools: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -373,6 +378,7 @@ mod tests {
                 [fixups.fixture_user]
                 test_remote_execution = "fixture_fs_profile"
                 test_run_env = { FIXTURE_ROOT = "/srv/fixtures" }
+                test_runtime_tools = "//tools:runtime_tools"
             "#,
         )
         .expect("failed to deserialize repo config");
@@ -386,6 +392,10 @@ mod tests {
             fixup.test_run_env.get("FIXTURE_ROOT").map(String::as_str),
             Some("/srv/fixtures")
         );
+        assert_eq!(
+            fixup.test_runtime_tools.as_deref(),
+            Some("//tools:runtime_tools")
+        );
         // Run-time environment is not compile-time environment.
         assert!(fixup.env.is_empty());
 
@@ -396,6 +406,7 @@ mod tests {
         let other = other.fixups.get("other").unwrap();
         assert_eq!(other.test_remote_execution, None);
         assert!(other.test_run_env.is_empty());
+        assert_eq!(other.test_runtime_tools, None);
         assert_eq!(
             serde_json::to_string(other).unwrap(),
             r#"{"env":{"A":"1"}}"#

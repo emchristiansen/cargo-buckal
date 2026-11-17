@@ -213,6 +213,9 @@ pub struct RustTest {
     /// execution profile name, or `"disabled"`. Absent: the toolchain's default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_execution: Option<String>,
+    /// A dependency providing `RuntimeToolsInfo` (`[fixups.<pkg>] test_runtime_tools`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_tools: Option<String>,
     /// Files the test reads at run time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resources: Option<Glob>,
@@ -917,6 +920,7 @@ impl RustTest {
         let deps = kwargs.get_list("deps");
         let run_env = kwargs.get_dict("run_env");
         let remote_execution = kwargs.get_str_opt("remote_execution");
+        let runtime_tools = kwargs.get_str_opt("runtime_tools");
         let resources = kwargs.get_glob_opt("resources");
         let cargo_bin_exes = kwargs.get_dict("cargo_bin_exes");
         let extra_resources = kwargs.get_list("extra_resources");
@@ -933,6 +937,7 @@ impl RustTest {
             env,
             run_env,
             remote_execution,
+            runtime_tools,
             resources,
             cargo_bin_exes,
             extra_resources,
@@ -2093,6 +2098,7 @@ mod tests {
             env: Map::from([("RUST_LOG".to_string(), "debug".to_string())]),
             run_env: Map::new(),
             remote_execution: None,
+            runtime_tools: None,
             resources: None,
             cargo_bin_exes: Map::new(),
             extra_resources: Set::new(),

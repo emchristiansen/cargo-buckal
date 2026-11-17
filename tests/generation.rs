@@ -568,3 +568,45 @@ fn test_fixup_test_execution_through_generation() {
     f.migrate(&[]);
     assert_eq!(f.buck("app"), app_before);
 }
+
+#[test]
+fn test_fixup_test_runtime_tools_through_generation() {
+    let f = fixture();
+    f.migrate(&[]);
+    let app_before = f.buck("app");
+    let shared_before = f.buck("shared");
+    assert!(!app_before.contains("runtime_tools"), "{app_before}");
+
+    // Adding the fixup: an ordinary (cached) migrate gives every test of `app` the
+    // runtime tools dependency, and nothing else changes.
+    let with =
+        |label: &str| format!("{BUCKAL_TOML}\n[fixups.app]\ntest_runtime_tools = \"{label}\"\n");
+    write(&f.ws.join("buckal.toml"), &with("//tools:runtime_tools"));
+    f.migrate(&[]);
+    let app = f.buck("app");
+    let test = rule(&app, "unittest");
+    assert!(
+        test.contains("    runtime_tools = \"//tools:runtime_tools\",\n"),
+        "{test}"
+    );
+    assert_eq!(app.matches("runtime_tools =").count(), 1, "{app}");
+    assert_eq!(rule(&app, "app"), rule(&app_before, "app"));
+    assert_eq!(
+        app.replace("    runtime_tools = \"//tools:runtime_tools\",\n", ""),
+        app_before
+    );
+    assert_eq!(f.buck("shared"), shared_before);
+
+    // Changing only the label regenerates; removing the fixup restores the rules.
+    write(&f.ws.join("buckal.toml"), &with("//tools:other_tools"));
+    f.migrate(&[]);
+    let app = f.buck("app");
+    assert!(
+        app.contains("runtime_tools = \"//tools:other_tools\""),
+        "{app}"
+    );
+    assert!(!app.contains("//tools:runtime_tools"), "{app}");
+    write(&f.ws.join("buckal.toml"), BUCKAL_TOML);
+    f.migrate(&[]);
+    assert_eq!(f.buck("app"), app_before);
+}
