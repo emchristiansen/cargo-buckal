@@ -2839,3 +2839,59 @@ fn test_packages_built_on_no_or_some_configured_platforms_are_incompatible_elsew
     );
     assert!(!app.contains("prelude//:none"), "{app}");
 }
+
+#[test]
+fn test_no_test_variant_for_a_library_the_tests_do_not_build() {
+    // b807 r36 F1, Fable N3: Cargo runs a cdylib-only library's unit tests but
+    // never builds the library itself for `cargo test` (no doc-tests, nothing can
+    // link it), so the tests' resolution has no library to emit as a `-test`
+    // variant, and its integration test does not depend on it; the unit tests
+    // keep their dependencies.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"wasmlib\", \"shared\"]\n",
+    );
+    write(
+        &f.ws.join("wasmlib/Cargo.toml"),
+        &manifest(
+            "wasmlib",
+            "[lib]\ncrate-type = [\"cdylib\"]\n\
+             [features]\ntest_lib = [\"shared/extra\"]\n\
+             [dependencies]\nshared = { path = \"../shared\" }\n",
+        ),
+    );
+    write(
+        &f.ws.join("wasmlib/src/lib.rs"),
+        "pub fn f() {\n    shared::one();\n}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn inline() {}\n}\n",
+    );
+    write(&f.ws.join("wasmlib/tests/it.rs"), "");
+    write(
+        &f.ws.join("shared/Cargo.toml"),
+        &manifest("shared", "[features]\nextra = []\n"),
+    );
+    write(&f.ws.join("shared/src/lib.rs"), "pub fn one() {}\n");
+    let config = BUCKAL_TOML.split("[fixups.extra]").next().unwrap();
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!("test_features = [\"wasmlib/test_lib\"]\n{config}"),
+    );
+    f.migrate(&[]);
+    let wasmlib = f.buck("wasmlib");
+    assert!(!wasmlib.contains("name = \"wasmlib-test\""), "{wasmlib}");
+    assert_eq!(
+        top_deps(rule(&wasmlib, "wasmlib")),
+        ["//shared:shared"],
+        "{wasmlib}"
+    );
+    assert_eq!(
+        top_deps(rule(&wasmlib, "unittest")),
+        ["//shared:shared-test"],
+        "{wasmlib}"
+    );
+    assert_eq!(
+        top_deps(rule(&wasmlib, "it")),
+        ["//shared:shared-test"],
+        "{wasmlib}"
+    );
+}

@@ -219,6 +219,20 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         }
     };
     let lib_buck_name: Option<String> = lib_targets.first().map(|t| lib_rule_name(t));
+    // The library as the package's binaries and tests link it: only a Rust library
+    // (not a cdylib or staticlib alone) can be linked, and Cargo gives them no edge
+    // to any other.
+    let linked_lib_name: Option<String> = lib_targets
+        .first()
+        .filter(|t| {
+            t.kind.iter().any(|k| {
+                matches!(
+                    k,
+                    TargetKind::Lib | TargetKind::RLib | TargetKind::DyLib | TargetKind::ProcMacro
+                )
+            })
+        })
+        .and(lib_buck_name.clone());
     // The package's own library as its test-context rules (tests, test-only
     // binaries) use it: the test host variant of a host-only library (a
     // proc-macro, which the tests' compilations load on the host), else the test
@@ -270,7 +284,7 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         // Cargo allows `main.rs` to use items from `lib.rs` via the crate's own name by default.
         // The binary must always depend on the sibling library, even when names differ
         // (e.g., binary "my-crate" vs library "my_crate").
-        if let Some(lib_name) = &lib_buck_name {
+        if let Some(lib_name) = &linked_lib_name {
             let lib = if for_tests {
                 test_context_lib(lib_name)
             } else {
@@ -329,7 +343,7 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
 
             // Integration tests may use the package's library under its crate name
             // (as the tests need it).
-            if let Some(lib_name) = &lib_buck_name {
+            if let Some(lib_name) = &linked_lib_name {
                 let lib = test_context_lib(lib_name);
                 rust_test.deps_mut().insert(format!(":{lib}"));
             }
@@ -369,7 +383,7 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
             rust_test
                 .env
                 .insert("CARGO_BIN_NAME".to_owned(), bin_target.name.clone());
-            if let Some(lib_name) = &lib_buck_name {
+            if let Some(lib_name) = &linked_lib_name {
                 let lib = test_context_lib(lib_name);
                 rust_test.deps_mut().insert(format!(":{lib}"));
             }

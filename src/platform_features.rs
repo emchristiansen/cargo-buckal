@@ -429,13 +429,13 @@ pub fn resolve_platform_features(
     test_features: &[String],
 ) -> Result<PlatformFeatures> {
     let (main, _) = resolve_shape(manifest_path, platforms, packages, GraphShape::Build)?;
-    let (tests, tests_host_built) = resolve_shape(
+    let (tests, tests_built) = resolve_shape(
         manifest_path,
         platforms,
         packages,
         GraphShape::Test(test_features),
     )?;
-    Ok(with_test_resolution(main, tests, &tests_host_built))
+    Ok(with_test_resolution(main, tests, &tests_built))
 }
 
 /// Which compilation Cargo plans in a unit graph.
@@ -447,12 +447,21 @@ enum GraphShape<'a> {
     Test(&'a [String]),
 }
 
+/// What a unit graph compiles besides each package's resolution.
+#[derive(Debug, Default)]
+struct Built {
+    /// Packages compiled in the host context.
+    host: BTreeSet<PackageId>,
+    /// Packages whose library is compiled for the target.
+    target_libs: BTreeSet<PackageId>,
+}
+
 fn resolve_shape(
     manifest_path: Option<&str>,
     platforms: &BTreeMap<String, String>,
     packages: &HashMap<PackageId, Package>,
     shape: GraphShape,
-) -> Result<(PlatformFeatures, BTreeSet<PackageId>)> {
+) -> Result<(PlatformFeatures, Built)> {
     let mut target: HashMap<PackageId, ContextResolution> = HashMap::new();
     let mut host: HashMap<PackageId, ContextResolution> = HashMap::new();
     for (platform, triple) in platforms {
@@ -479,8 +488,15 @@ fn resolve_shape(
             }
         }
     }
-    let host_built = host.keys().cloned().collect();
-    Ok((combine_contexts(target, host), host_built))
+    let built = Built {
+        host: host.keys().cloned().collect(),
+        target_libs: target
+            .iter()
+            .filter(|(_, t)| t.has_lib)
+            .map(|(id, _)| id.clone())
+            .collect(),
+    };
+    Ok((combine_contexts(target, host), built))
 }
 
 /// Combine the ordinary build's resolution (`main`) with the tests' (`tests`).
@@ -493,8 +509,9 @@ fn resolve_shape(
 fn with_test_resolution(
     mut main: PlatformFeatures,
     mut tests: PlatformFeatures,
-    tests_host_built: &BTreeSet<PackageId>,
+    tests_built: &Built,
 ) -> PlatformFeatures {
+    let tests_host_built = &tests_built.host;
     // The host compilation of a package: its main resolution when it is host-only,
     // else its host variant, else (built for the target alike) the target one.
     let host_side = |r: &PlatformResolution| -> HostVariant {
@@ -573,8 +590,13 @@ fn with_test_resolution(
     // Packages the tests compile for the target that the ordinary build also has:
     // for the target, or (a library the ordinary build only uses on the host) for
     // the host only, whose production rule then has the host's resolution.
-    let in_both_on_target =
-        |id: &PackageId| main.contains_key(id) && tests.get(id).is_some_and(|t| !t.host_context);
+    // Only a library the tests compile for the target can have a test variant: a
+    // cdylib-only library's unit tests are no build of the library itself.
+    let in_both_on_target = |id: &PackageId| {
+        main.contains_key(id)
+            && tests_built.target_libs.contains(id)
+            && tests.get(id).is_some_and(|t| !t.host_context)
+    };
     let host_only_in_tests: BTreeSet<String> = tests
         .iter()
         .filter(|(_, t)| t.host_context)
