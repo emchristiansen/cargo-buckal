@@ -41,7 +41,7 @@ pub(super) fn emit_rust_library(
         edition: node.edition.to_string(),
         features,
         platform,
-        rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_owned()]),
+        rustc_flags: vec!["@$(location :manifest[env_flags])".to_owned()],
         visibility: Set::from(["PUBLIC".to_owned()]),
         ..Default::default()
     };
@@ -89,7 +89,7 @@ pub(super) fn emit_rust_binary(
         edition: node.edition.to_string(),
         features,
         platform,
-        rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_owned()]),
+        rustc_flags: vec!["@$(location :manifest[env_flags])".to_owned()],
         visibility: Set::from(["PUBLIC".to_owned()]),
         ..Default::default()
     };
@@ -132,7 +132,7 @@ pub(super) fn emit_rust_test(
         edition: node.edition.to_string(),
         features,
         platform,
-        rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_owned()]),
+        rustc_flags: vec!["@$(location :manifest[env_flags])".to_owned()],
         visibility: Set::from(["PUBLIC".to_owned()]),
         ..Default::default()
     };
@@ -210,7 +210,7 @@ pub(super) fn emit_buildscript_build(
         edition: node.edition.to_string(),
         features,
         platform,
-        rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_owned()]),
+        rustc_flags: vec!["@$(location :manifest[env_flags])".to_owned()],
         ..Default::default()
     };
 
@@ -314,9 +314,12 @@ pub(super) fn patch_with_buildscript(rust_rule: &mut dyn RustRule, build_target:
         "OUT_DIR".to_owned(),
         format!("$(location :{build_name}-run[out_dir])").to_owned(),
     );
-    rust_rule
-        .rustc_flags_mut()
-        .insert(format!("@$(location :{build_name}-run[rustc_flags])",).to_owned());
+    // The build script's flags go first, as they always have been emitted.
+    let flag = format!("@$(location :{build_name}-run[rustc_flags])");
+    let flags = rust_rule.rustc_flags_mut();
+    if !flags.contains(&flag) {
+        flags.insert(0, flag);
+    }
 }
 
 /// Emit `http_archive` rule for the given package

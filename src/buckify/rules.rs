@@ -786,7 +786,7 @@ mod tests {
                 ]
                 .into(),
                 env: Default::default(),
-                rustc_flags: Set::from(["-Lnative=/opt/openssl/lib".to_owned()]),
+                rustc_flags: vec!["-Lnative=/opt/openssl/lib".to_owned()],
                 mapped_srcs: Default::default(),
             },
         );
@@ -816,11 +816,14 @@ mod tests {
                 _ => None,
             })
             .expect("rust_library");
-        assert!(lib.rustc_flags.contains("-Lnative=/opt/openssl/lib"));
+        assert!(
+            lib.rustc_flags
+                .contains(&"-Lnative=/opt/openssl/lib".to_owned())
+        );
         // The generated flags are kept.
         assert!(
             lib.rustc_flags
-                .contains("@$(location :manifest[env_flags])")
+                .contains(&"@$(location :manifest[env_flags])".to_owned())
         );
 
         // Other packages are untouched.
@@ -832,6 +835,70 @@ mod tests {
                 assert!(r.env.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn test_fixup_rustc_flags_keep_order_and_repeats() {
+        let lib = mock_target("sdk", TargetKind::Lib);
+        let build = mock_target("build-script-build", TargetKind::CustomBuild);
+        let node = mock_node("sdk", vec![lib, build]);
+        let flags: Vec<String> = ["-C", "opt-level=2", "-C", "debuginfo=1"]
+            .map(str::to_owned)
+            .into();
+        let mut ctx = test_ctx();
+        ctx.repo_config.fixups.insert(
+            "sdk".to_owned(),
+            crate::config::PackageFixup {
+                rustc_flags: flags.clone(),
+                ..Default::default()
+            },
+        );
+
+        let rules = buckify_root_node(&node, &ctx);
+        let lib = rules
+            .iter()
+            .find_map(|r| match r {
+                Rule::RustLibrary(l) => Some(l),
+                _ => None,
+            })
+            .expect("rust_library");
+        let mut expected = vec![
+            "@$(location :build-script-run[rustc_flags])".to_owned(),
+            "@$(location :manifest[env_flags])".to_owned(),
+        ];
+        expected.extend(flags.iter().cloned());
+        assert_eq!(lib.rustc_flags, expected);
+
+        // Serialized in that order, with both `-C`.
+        let content = gen_buck_content(&rules);
+        assert!(
+            content.contains(
+                "        \"-C\",\n        \"opt-level=2\",\n        \"-C\",\n        \"debuginfo=1\",\n"
+            ),
+            "{content}"
+        );
+
+        // Read back from the BUCK file in the same order, and a merge with the existing
+        // file neither drops nor duplicates arguments.
+        let dir = tempfile::tempdir().unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.path().join("BUCK")).unwrap();
+        std::fs::write(&path, &content).unwrap();
+        let existing = crate::buck::parse_buck_file(&path).unwrap();
+        let parsed = existing
+            .values()
+            .find_map(|r| match r {
+                Rule::RustLibrary(l) if l.name == "sdk" => Some(l),
+                _ => None,
+            })
+            .expect("parsed rust_library");
+        assert_eq!(parsed.rustc_flags, expected);
+        let mut regenerated = rules.clone();
+        crate::buck::patch_buck_rules(
+            &existing,
+            &mut regenerated,
+            &Set::from(["rustc_flags".to_owned()]),
+        );
+        assert_eq!(gen_buck_content(&regenerated), content);
     }
 
     #[test]
@@ -1095,12 +1162,12 @@ mod tests {
         );
         assert!(
             host.rustc_flags
-                .contains("@$(location :build-script-host-run[rustc_flags])")
+                .contains(&"@$(location :build-script-host-run[rustc_flags])".to_owned())
         );
         assert!(
             !host
                 .rustc_flags
-                .contains("@$(location :build-script-run[rustc_flags])")
+                .contains(&"@$(location :build-script-run[rustc_flags])".to_owned())
         );
 
         let run = rules

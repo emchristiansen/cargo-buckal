@@ -213,8 +213,8 @@ pub struct PackageFixup {
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub env: Map<String, String>,
     /// Extra rustc flags for the package's crates (library, binaries, tests).
-    #[serde(skip_serializing_if = "Set::is_empty")]
-    pub rustc_flags: Set<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rustc_flags: Vec<String>,
     /// Extra compile inputs for the package's crates, as the prelude's `mapped_srcs`:
     /// a label (e.g. an `export_file` of a nested package) to its path inside the
     /// crate's sources, relative to the package directory. For files that
@@ -322,7 +322,7 @@ mod tests {
             Some("/opt/openssl/lib")
         );
         assert!(fixup.env.is_empty());
-        assert!(fixup.rustc_flags.contains("-Lnative=/opt/openssl/lib"));
+        assert_eq!(fixup.rustc_flags, ["-Lnative=/opt/openssl/lib"]);
     }
 
     #[test]

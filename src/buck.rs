@@ -37,7 +37,7 @@ impl Rule {
 pub trait RustRule {
     fn deps_mut(&mut self) -> &mut Set<String>;
     fn os_deps_mut(&mut self) -> &mut Map<String, Set<String>>;
-    fn rustc_flags_mut(&mut self) -> &mut Set<String>;
+    fn rustc_flags_mut(&mut self) -> &mut Vec<String>;
     fn env_mut(&mut self) -> &mut Map<String, String>;
     fn named_deps_mut(&mut self) -> &mut Map<String, String>;
     fn os_named_deps_mut(&mut self) -> &mut Map<String, Map<String, String>>;
@@ -128,8 +128,10 @@ pub struct RustLibrary {
     /// (`{platform name: {attribute: values}}`), e.g. features one platform adds.
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub platform: PlatformAttrs,
-    #[serde(skip_serializing_if = "Set::is_empty")]
-    pub rustc_flags: Set<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Ordered rustc arguments: repeated and multi-argument options (`-C`, `opt-level=2`)
+    /// are meaningful, so this is a list, not a set.
+    pub rustc_flags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proc_macro: Option<bool>,
     #[serde(skip_serializing_if = "Map::is_empty")]
@@ -169,8 +171,10 @@ pub struct RustBinary {
     /// (`{platform name: {attribute: values}}`), e.g. features one platform adds.
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub platform: PlatformAttrs,
-    #[serde(skip_serializing_if = "Set::is_empty")]
-    pub rustc_flags: Set<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Ordered rustc arguments: repeated and multi-argument options (`-C`, `opt-level=2`)
+    /// are meaningful, so this is a list, not a set.
+    pub rustc_flags: Vec<String>,
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub named_deps: Map<String, String>,
     #[serde(skip_serializing_if = "Map::is_empty")]
@@ -219,8 +223,10 @@ pub struct RustTest {
     /// (`{platform name: {attribute: values}}`), e.g. features one platform adds.
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub platform: PlatformAttrs,
-    #[serde(skip_serializing_if = "Set::is_empty")]
-    pub rustc_flags: Set<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Ordered rustc arguments: repeated and multi-argument options (`-C`, `opt-level=2`)
+    /// are meaningful, so this is a list, not a set.
+    pub rustc_flags: Vec<String>,
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub named_deps: Map<String, String>,
     #[serde(skip_serializing_if = "Map::is_empty")]
@@ -368,6 +374,35 @@ impl Glob {
 }
 
 // Helper to extract string list from AST expression
+fn extract_ordered_string_list(expr: &AstExpr) -> Option<Vec<String>> {
+    if let ExprP::Op(left, _op, right) = &expr.node {
+        return match (
+            extract_ordered_string_list(left),
+            extract_ordered_string_list(right),
+        ) {
+            (Some(mut l), Some(r)) => {
+                l.extend(r);
+                Some(l)
+            }
+            (l, r) => l.or(r),
+        };
+    }
+    if let ExprP::List(items) = &expr.node {
+        return Some(
+            items
+                .iter()
+                .filter_map(|item| match &item.node {
+                    ExprP::Literal(starlark_syntax::syntax::ast::AstLiteral::String(s)) => {
+                        Some(s.node.to_string())
+                    }
+                    _ => None,
+                })
+                .collect(),
+        );
+    }
+    None
+}
+
 fn extract_string_list(expr: &AstExpr) -> Option<Set<String>> {
     // Handle binary operations like: `["item1"] + select({...})` or `select({...}) + ["item2"]`
     // We only extract the literal list part, ignoring dynamic select() regardless of order
@@ -511,6 +546,14 @@ impl RuleKwargs {
         self.args.get(key).and_then(extract_bool)
     }
 
+    /// A string list in its written order, with repeats (literal parts only).
+    fn get_ordered_list(&self, key: &str) -> Vec<String> {
+        self.args
+            .get(key)
+            .and_then(extract_ordered_string_list)
+            .unwrap_or_default()
+    }
+
     fn get_list(&self, key: &str) -> Set<String> {
         self.args
             .get(key)
@@ -574,7 +617,7 @@ macro_rules! impl_rust_rule {
                 &mut self.os_deps
             }
 
-            fn rustc_flags_mut(&mut self) -> &mut Set<String> {
+            fn rustc_flags_mut(&mut self) -> &mut Vec<String> {
                 &mut self.rustc_flags
             }
 
@@ -608,6 +651,20 @@ where
 {
     for (k, v) in src {
         dst.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+}
+
+/// Merge an ordered argument list from an existing rule (`src`) into a generated one
+/// (`dst`): the arguments of `src` that are not accounted for by `dst` (as a multiset,
+/// so repeated arguments such as `-C` survive) are appended in their order.
+fn patch_list(dst: &mut Vec<String>, src: &[String]) {
+    let mut generated = dst.clone();
+    for arg in src {
+        if let Some(pos) = generated.iter().position(|g| g == arg) {
+            generated.remove(pos);
+        } else {
+            dst.push(arg.clone());
+        }
     }
 }
 
@@ -685,7 +742,7 @@ macro_rules! impl_patch_from {
                 }
                 // Patch rustc_flags set
                 if patch_fields.contains("rustc_flags") {
-                    patch_set(&mut self.rustc_flags, &other.rustc_flags);
+                    patch_list(&mut self.rustc_flags, &other.rustc_flags);
                 }
                 // Patch visibility set
                 if patch_fields.contains("visibility") {
@@ -727,7 +784,7 @@ impl RustLibrary {
         let exec_compatible_with = kwargs.get_list("exec_compatible_with");
         let env = kwargs.get_dict("env");
         let features = kwargs.get_list("features");
-        let rustc_flags = kwargs.get_list("rustc_flags");
+        let rustc_flags = kwargs.get_ordered_list("rustc_flags");
         let proc_macro = kwargs.get_bool_opt("proc_macro");
         let named_deps = kwargs.get_dict("named_deps");
         let os_named_deps = kwargs.get_nested_dict("os_named_deps");
@@ -771,7 +828,7 @@ impl RustBinary {
         let exec_compatible_with = kwargs.get_list("exec_compatible_with");
         let env = kwargs.get_dict("env");
         let features = kwargs.get_list("features");
-        let rustc_flags = kwargs.get_list("rustc_flags");
+        let rustc_flags = kwargs.get_ordered_list("rustc_flags");
         let named_deps = kwargs.get_dict("named_deps");
         let os_named_deps = kwargs.get_nested_dict("os_named_deps");
         let os_deps = kwargs.get_dict_of_lists("os_deps");
@@ -813,7 +870,7 @@ impl RustTest {
         let exec_compatible_with = kwargs.get_list("exec_compatible_with");
         let env = kwargs.get_dict("env");
         let features = kwargs.get_list("features");
-        let rustc_flags = kwargs.get_list("rustc_flags");
+        let rustc_flags = kwargs.get_ordered_list("rustc_flags");
         let named_deps = kwargs.get_dict("named_deps");
         let os_named_deps = kwargs.get_nested_dict("os_named_deps");
         let os_deps = kwargs.get_dict_of_lists("os_deps");
@@ -1293,7 +1350,7 @@ mod tests {
                 crate_root: "vendor/src/main.rs".to_string(),
                 edition: "2024".to_string(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1308,7 +1365,7 @@ mod tests {
                 crate_root: "vendor/src/lib.rs".to_string(),
                 edition: "2024".to_string(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1323,7 +1380,7 @@ mod tests {
                 crate_root: "vendor/src/lib.rs".to_string(),
                 edition: "2024".to_string(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1339,7 +1396,7 @@ mod tests {
                 edition: "2024".to_string(),
                 env: common_test_env(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1355,7 +1412,7 @@ mod tests {
                 edition: "2024".to_string(),
                 env: common_test_env(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1371,7 +1428,7 @@ mod tests {
                 edition: "2024".to_string(),
                 env: common_test_env(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1387,7 +1444,7 @@ mod tests {
                 edition: "2024".to_string(),
                 env: common_test_env(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1403,7 +1460,7 @@ mod tests {
                 edition: "2024".to_string(),
                 env: common_test_env(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1419,7 +1476,7 @@ mod tests {
                 edition: "2024".to_string(),
                 env: common_test_env(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1435,7 +1492,7 @@ mod tests {
                 edition: "2024".to_string(),
                 env: common_test_env(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1451,7 +1508,7 @@ mod tests {
                 edition: "2024".to_string(),
                 env: common_test_env(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1467,7 +1524,7 @@ mod tests {
                 edition: "2024".to_string(),
                 env: common_test_env(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1483,7 +1540,7 @@ mod tests {
                 edition: "2024".to_string(),
                 env: common_test_env(),
                 features: Set::from(["default".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 named_deps: common_named_deps(),
                 os_deps: common_os_deps(),
                 visibility: Set::from(["PUBLIC".to_string()]),
@@ -1565,7 +1622,7 @@ mod tests {
                     "ring-io".to_string(),
                     "ring-sig-verify".to_string(),
                 ]),
-                rustc_flags: Set::from([
+                rustc_flags: Vec::from([
                     "@$(location :build-script-run[rustc_flags])".to_string(),
                     "@$(location :manifest[env_flags])".to_string(),
                 ]),
@@ -1592,7 +1649,7 @@ mod tests {
                     "ring-io".to_string(),
                     "ring-sig-verify".to_string(),
                 ]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 ..Default::default()
             }),
             Rule::BuildscriptRun(BuildscriptRun {
@@ -1671,7 +1728,7 @@ mod tests {
                 crate_root: "vendor/src/lib.rs".to_string(),
                 edition: "2024".to_string(),
                 features: Set::from(["default".to_string(), "diff_mydrs".to_string()]),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 visibility: Set::from(["PUBLIC".to_string()]),
                 deps: Set::from([
                     "//third-party/rust/crates/ahash/0.8.12:ahash".to_string(),
@@ -1911,7 +1968,7 @@ mod tests {
             env: Map::from([("RUST_LOG".to_string(), "debug".to_string())]),
             features: Set::from(["default".to_string()]),
             platform: Map::new(),
-            rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+            rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
             proc_macro: Some(true),
             named_deps: Map::from([("serde".to_string(), ":serde_dep".to_string())]),
             os_named_deps: Map::from([(
@@ -1950,7 +2007,7 @@ mod tests {
             env: Map::from([("RUST_LOG".to_string(), "debug".to_string())]),
             features: Set::from(["default".to_string()]),
             platform: Map::new(),
-            rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+            rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
             deps: Set::from([":dep".to_string()]),
             os_deps: Map::from([("linux".to_string(), Set::from([":linux_dep".to_string()]))]),
             named_deps: Map::from([("serde".to_string(), ":serde_dep".to_string())]),
@@ -1991,7 +2048,7 @@ mod tests {
             cargo_bin_exes: Map::new(),
             features: Set::from(["default".to_string()]),
             platform: Map::new(),
-            rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+            rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
             deps: Set::from([":dep".to_string()]),
             os_deps: Map::from([("linux".to_string(), Set::from([":linux_dep".to_string()]))]),
             named_deps: Map::from([("serde".to_string(), ":serde_dep".to_string())]),
@@ -2077,7 +2134,7 @@ mod tests {
                 crate_name: "with_select".to_string(),
                 crate_root: "src/lib.rs".to_string(),
                 edition: "2024".to_string(),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 visibility: Set::from(["PUBLIC".to_string()]),
                 ..Default::default()
             }),
@@ -2088,7 +2145,7 @@ mod tests {
                 crate_name: "with_select_reversed".to_string(),
                 crate_root: "src/lib.rs".to_string(),
                 edition: "2024".to_string(),
-                rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
+                rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),
                 visibility: Set::from(["PUBLIC".to_string()]),
                 ..Default::default()
             }),
@@ -2099,7 +2156,7 @@ mod tests {
                 crate_name: "merge_both_sides".to_string(),
                 crate_root: "src/lib.rs".to_string(),
                 edition: "2024".to_string(),
-                rustc_flags: Set::from([
+                rustc_flags: Vec::from([
                     "@$(location //third-party/rust/crates/windows:build-script-run[rustc_flags])"
                         .to_string(),
                     "@$(location :manifest[env_flags])".to_string(),
