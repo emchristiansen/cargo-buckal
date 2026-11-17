@@ -47,13 +47,9 @@ pub fn execute(args: &PatchArgs) {
     // The cache saved below certifies every package's rules. Without a compatible
     // record of generated rules, regenerate all of them first.
     let last_cache = get_last_cache(args.manifest_path.as_deref());
-    let full = BuckalCache::from_resolve_with_fixups(
-        &ctx.resolve,
-        &ctx.workspace_root,
-        &ctx.repo_config.patch,
-        &ctx.repo_config.fixups,
-    )
-    .diff(&last_cache, &ctx.workspace_root);
+    let full =
+        BuckalCache::from_resolve_with_config(&ctx.resolve, &ctx.workspace_root, &ctx.repo_config)
+            .diff(&last_cache, &ctx.workspace_root);
     if last_cache.is_unverified_inventory() {
         changes.merge(full);
     } else {
@@ -84,13 +80,8 @@ pub fn execute(args: &PatchArgs) {
     );
 
     changes.apply(&ctx);
-    BuckalCache::from_resolve_with_fixups(
-        &ctx.resolve,
-        &ctx.workspace_root,
-        &ctx.repo_config.patch,
-        &ctx.repo_config.fixups,
-    )
-    .save();
+    BuckalCache::from_resolve_with_config(&ctx.resolve, &ctx.workspace_root, &ctx.repo_config)
+        .save();
 }
 
 fn select_patch_for_spec(ctx: &BuckalContext, spec: &str) -> Result<SelectedPatch> {

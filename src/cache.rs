@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::buckal_error;
 use crate::utils::{UnwrapOrExit, get_cache_path};
 
-use crate::config::{PackageFixup, RepoPatchConfig};
+use crate::config::{PackageFixup, RepoConfig, RepoPatchConfig};
 use crate::resolve::BuckalResolve;
 
 // type Fingerprint = [u8; 32];
@@ -144,10 +144,47 @@ impl BuckalCache {
         patch_config: &RepoPatchConfig,
         fixups: &BTreeMap<String, PackageFixup>,
     ) -> Self {
+        Self::from_resolve_with_options(resolve, workspace_root, patch_config, fixups, &[])
+    }
+
+    /// Fingerprints for the repository configuration `config`: its fixups (see
+    /// [`Self::from_resolve_with_fixups`]) and the workspace-level settings that
+    /// change first-party packages' rules.
+    pub fn from_resolve_with_config(
+        resolve: &BuckalResolve,
+        workspace_root: &Utf8PathBuf,
+        config: &RepoConfig,
+    ) -> Self {
+        Self::from_resolve_with_options(
+            resolve,
+            workspace_root,
+            &config.patch,
+            &config.fixups,
+            &config.first_party_generation_key(),
+        )
+    }
+
+    fn from_resolve_with_options(
+        resolve: &BuckalResolve,
+        workspace_root: &Utf8PathBuf,
+        patch_config: &RepoPatchConfig,
+        fixups: &BTreeMap<String, PackageFixup>,
+        first_party_key: &[u8],
+    ) -> Self {
         let fingerprints = resolve
             .nodes()
             .map(|node| {
-                let base = resolve.fingerprint_of(&node.package_id, workspace_root, patch_config);
+                let mut base =
+                    resolve.fingerprint_of(&node.package_id, workspace_root, patch_config);
+                if !first_party_key.is_empty()
+                    && matches!(node.kind, crate::resolve::NodeKind::FirstParty { .. })
+                {
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(&base.0);
+                    hasher.update(b"workspace");
+                    hasher.update(first_party_key);
+                    base = Fingerprint(*hasher.finalize().as_bytes());
+                }
                 let fingerprint = match fixups.get(&node.name) {
                     None => base,
                     Some(fixup) => {

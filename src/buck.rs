@@ -325,6 +325,15 @@ impl Serialize for Srcs {
     }
 }
 
+/// A `filegroup` whose sources are named: output path to file or label.
+#[derive(Serialize, Default, Debug, PartialEq, Clone)]
+#[serde(rename = "filegroup")]
+pub struct NamedFileGroup {
+    pub name: String,
+    pub srcs: Map<String, String>,
+    pub visibility: Set<String>,
+}
+
 #[derive(Serialize, Default, Debug, PartialEq, Clone)]
 #[serde(rename = "filegroup")]
 pub struct FileGroup {

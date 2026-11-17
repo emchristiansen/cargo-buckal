@@ -2,18 +2,21 @@ use cargo_metadata::camino::Utf8Path;
 use regex::Regex;
 
 use crate::{
-    buck::{Rule, TopLevelKind, parse_buck_file, patch_buck_rules, top_level_statements},
+    buck::{
+        GENERATED_HEADER, NamedFileGroup, Rule, TopLevelKind, parse_buck_file, patch_buck_rules,
+        top_level_statements,
+    },
     buckal_log,
     buckify::emit::emit_export_file,
     cache::{BuckalChange, ChangeType},
     context::BuckalContext,
     resolve::{BuckalNode, NodeKind},
-    utils::{UnwrapOrExit, get_vendor_dir},
+    utils::{UnwrapOrExit, get_buck2_root, get_vendor_dir},
 };
 
 use super::{
     buckify_dep_node, buckify_root_node, cross, gen_buck_content, gen_buck_content_preserving,
-    vendor_package, windows,
+    rules::MANIFEST_EXPORT, vendor_package, windows,
 };
 
 impl BuckalChange {
@@ -118,26 +121,86 @@ impl BuckalChange {
             }
         }
 
-        // Export workspace manifest for virtual workspace. Generation owns only this
-        // rule of the root BUCK file; everything else in it is kept byte for byte.
+        // The rules generation owns in the workspace-root BUCK file outside a root
+        // package's own rules: the workspace manifest's export (for a virtual
+        // workspace, or a root package not regenerated now) and the
+        // `workspace_manifests` filegroup. They are replaced in place or appended;
+        // everything else in the file is kept byte for byte.
+        let mut owned: Vec<(&str, &str, String)> = Vec::new();
         if !workspace_emitted && ctx.workspace_inherit {
-            let buck_path = ctx.workspace_root.join("BUCK");
-            let buck_content = if buck_path.exists() {
-                let existing = std::fs::read_to_string(&buck_path)
-                    .unwrap_or_exit_ctx(format!("Failed to read {}", buck_path));
-                let export =
-                    serde_starlark::to_string(&emit_export_file()).expect("serialize export_file");
-                splice_rules(
-                    buck_path.as_str(),
-                    &existing,
-                    &[("export_file", "workspace", export.trim_end())],
-                )
-                .unwrap_or_exit_ctx(format!("Failed to parse {}", buck_path))
-            } else {
-                gen_buck_content(&[Rule::ExportFile(emit_export_file())])
-            };
+            let export =
+                serde_starlark::to_string(&emit_export_file()).expect("serialize export_file");
+            owned.push(("export_file", "workspace", export));
+        }
+        if ctx.repo_config.workspace_manifests {
+            let group =
+                serde_starlark::to_string(&workspace_manifests(ctx)).expect("serialize filegroup");
+            owned.push(("filegroup", WORKSPACE_MANIFESTS, group));
+        }
+        let removed: &[(&str, &str)] = if ctx.repo_config.workspace_manifests {
+            &[]
+        } else {
+            &[("filegroup", WORKSPACE_MANIFESTS)]
+        };
+        let buck_path = ctx.workspace_root.join("BUCK");
+        if buck_path.exists() {
+            let existing = std::fs::read_to_string(&buck_path)
+                .unwrap_or_exit_ctx(format!("Failed to read {}", buck_path));
+            let rules: Vec<_> = owned
+                .iter()
+                .map(|(function, name, text)| (*function, *name, text.trim_end()))
+                .collect();
+            let buck_content = splice_rules(buck_path.as_str(), &existing, &rules, removed)
+                .unwrap_or_exit_ctx(format!("Failed to parse {}", buck_path));
+            if buck_content != existing {
+                std::fs::write(&buck_path, buck_content).expect("Failed to write BUCK file");
+            }
+        } else if !owned.is_empty() {
+            let texts: Vec<&str> = owned.iter().map(|(_, _, text)| text.as_str()).collect();
+            let buck_content = format!("{GENERATED_HEADER}\n\n{}", texts.join("\n"));
             std::fs::write(&buck_path, buck_content).expect("Failed to write BUCK file");
         }
+    }
+}
+
+/// The name of the workspace-root filegroup of the workspace's manifests.
+const WORKSPACE_MANIFESTS: &str = "workspace_manifests";
+
+/// `filegroup(name = "workspace_manifests")`: the workspace's `Cargo.toml` and
+/// `Cargo.lock` and every first-party package's `Cargo.toml`, at their project
+/// paths. A package's manifest comes from its `Cargo.toml` export, the root
+/// package's files directly.
+fn workspace_manifests(ctx: &BuckalContext) -> NamedFileGroup {
+    let root = get_buck2_root().unwrap_or_exit_ctx("failed to get Buck2 root");
+    let project_path = |path: &Utf8Path| -> String {
+        path.strip_prefix(&root)
+            .unwrap_or_exit_ctx("a workspace file is outside the Buck2 project")
+            .as_str()
+            .replace('\\', "/")
+    };
+    let mut srcs = std::collections::BTreeMap::new();
+    for file in ["Cargo.toml", "Cargo.lock"] {
+        let path = ctx.workspace_root.join(file);
+        if path.exists() {
+            srcs.insert(project_path(&path), file.to_owned());
+        }
+    }
+    for node in ctx.resolve.nodes() {
+        if !matches!(node.kind, NodeKind::FirstParty { .. }) {
+            continue;
+        }
+        let dir = node.manifest_path.parent().expect("manifest has a parent");
+        let source = if dir == ctx.workspace_root {
+            "Cargo.toml".to_owned()
+        } else {
+            format!("//{}:{MANIFEST_EXPORT}", project_path(dir))
+        };
+        srcs.insert(project_path(&node.manifest_path), source);
+    }
+    NamedFileGroup {
+        name: WORKSPACE_MANIFESTS.to_owned(),
+        srcs,
+        visibility: ["PUBLIC".to_owned()].into(),
     }
 }
 
@@ -184,12 +247,37 @@ fn hand_written(buck_path: &Utf8Path) -> (Vec<String>, Vec<String>) {
     (loads, kept)
 }
 
-/// `content` of a BUCK file that generation does not own as a whole, with each
+/// `content` of a BUCK file that generation does not own as a whole, without the
+/// top-level calls `removed` (`(function, name)`), and with each
 /// `(function, name, text)` rule replacing the top-level call of `function` with
 /// that `name` in place, or appended if there is none. Everything else is kept
 /// byte for byte.
-fn splice_rules(path: &str, content: &str, rules: &[(&str, &str, &str)]) -> anyhow::Result<String> {
+fn splice_rules(
+    path: &str,
+    content: &str,
+    rules: &[(&str, &str, &str)],
+    removed: &[(&str, &str)],
+) -> anyhow::Result<String> {
     let mut spliced = content.to_owned();
+    for (function, name) in removed {
+        let (statements, _) = top_level_statements(path, &spliced)?;
+        if let Some(statement) = statements.iter().find(|statement| {
+            matches!(
+                &statement.kind,
+                TopLevelKind::Call { function: f, name: Some(n) } if f == function && n == name
+            )
+        }) {
+            let mut start = statement.span.start;
+            let mut end = statement.span.end;
+            if spliced[end..].starts_with('\n') {
+                end += 1;
+            }
+            if spliced[..start].ends_with("\n\n") {
+                start -= 1;
+            }
+            spliced.replace_range(start..end, "");
+        }
+    }
     for (function, name, text) in rules {
         let (statements, _) = top_level_statements(path, &spliced)?;
         let existing = statements.iter().find(|statement| {

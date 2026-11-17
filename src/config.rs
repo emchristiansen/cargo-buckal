@@ -183,6 +183,27 @@ pub struct RepoConfig {
     /// Each dropped edge is reported; the dependent's tests lose that dev-dependency.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub skip_dev_dependency_cycles: bool,
+    /// Emit `filegroup(name = "workspace_manifests")` in the workspace-root BUCK
+    /// file: the workspace's `Cargo.toml` and `Cargo.lock` and every first-party
+    /// package's `Cargo.toml`, each at its project path, for tests that read the
+    /// whole workspace's manifests. Each package exports its manifest for it as
+    /// `export_file(name = "Cargo.toml")`, visible to the root package (and as its
+    /// `export_files` entry for `Cargo.toml` says, if it has one). The filegroup name
+    /// is reserved: with this unset, generation removes such a filegroup.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub workspace_manifests: bool,
+}
+
+impl RepoConfig {
+    /// Workspace-level settings that change the rules of every first-party package,
+    /// serialized for the cache fingerprints (empty when none is set).
+    pub fn first_party_generation_key(&self) -> Vec<u8> {
+        if self.workspace_manifests {
+            b"workspace_manifests".to_vec()
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 impl Default for RepoConfig {
@@ -195,6 +216,7 @@ impl Default for RepoConfig {
             fixups: Map::new(),
             feature_platforms: Map::new(),
             skip_dev_dependency_cycles: false,
+            workspace_manifests: false,
         }
     }
 }

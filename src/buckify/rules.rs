@@ -284,8 +284,56 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
             std::process::exit(1);
         }
     }
+    if ctx.repo_config.workspace_manifests {
+        export_manifest_to_workspace_root(node, &mut buck_rules, ctx);
+    }
 
     buck_rules
+}
+
+/// The name under which a first-party package exports its `Cargo.toml` for the
+/// workspace-root `workspace_manifests` filegroup.
+pub(super) const MANIFEST_EXPORT: &str = "Cargo.toml";
+
+/// The visibility pattern of the workspace-root package.
+pub(super) fn workspace_root_package(ctx: &BuckalContext) -> String {
+    let root = get_buck2_root().unwrap_or_exit_ctx("failed to get Buck2 root");
+    let package = ctx
+        .workspace_root
+        .strip_prefix(&root)
+        .unwrap_or_exit_ctx("the workspace root is outside the Buck2 project");
+    format!("//{package}:")
+}
+
+/// Export `node`'s `Cargo.toml` to the workspace-root package (for
+/// `workspace_manifests`), unless the package is the root package itself, widening
+/// an `export_files` export of it if there is one.
+fn export_manifest_to_workspace_root(
+    node: &BuckalNode,
+    rules: &mut Vec<Rule>,
+    ctx: &BuckalContext,
+) {
+    if node.manifest_path.parent() == Some(ctx.workspace_root.as_path()) {
+        return;
+    }
+    let root_package = workspace_root_package(ctx);
+    let existing = rules.iter_mut().find_map(|rule| match rule {
+        Rule::ExportFile(export) if export.name == MANIFEST_EXPORT => Some(export),
+        _ => None,
+    });
+    match existing {
+        Some(export) => {
+            if !export.visibility.contains("PUBLIC") {
+                export.visibility.insert(root_package);
+            }
+        }
+        None => rules.push(Rule::ExportFile(ExportFile {
+            name: MANIFEST_EXPORT.to_owned(),
+            src: "Cargo.toml".to_owned(),
+            mode: Some("reference".to_owned()),
+            visibility: Set::from([root_package]),
+        })),
+    }
 }
 
 /// The `export_file` rules of `[fixups.<package>] export_files` for a first-party

@@ -62,12 +62,8 @@ pub fn execute(args: &RemoveArgs) {
 
     let ctx = BuckalContext::new(args.manifest_path.clone());
 
-    let new_cache = BuckalCache::from_resolve_with_fixups(
-        &ctx.resolve,
-        &ctx.workspace_root,
-        &ctx.repo_config.patch,
-        &ctx.repo_config.fixups,
-    );
+    let new_cache =
+        BuckalCache::from_resolve_with_config(&ctx.resolve, &ctx.workspace_root, &ctx.repo_config);
     let changes = new_cache.diff(&last_cache, &ctx.workspace_root);
 
     changes.apply(&ctx);
