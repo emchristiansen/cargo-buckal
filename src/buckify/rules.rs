@@ -186,23 +186,20 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
 
             let mut rust_test = emit_rust_test(node, test_target, &manifest_dir, &buckal_name, ctx);
 
-            let package_name = node.name.replace("-", "_");
-            let mut lib_alias = false;
-            if bin_targets.iter().any(|b| b.name == package_name) {
-                lib_alias = true;
+            // Cargo provides `CARGO_BIN_EXE_<name>` to integration tests for every binary
+            // target of the package, keyed by the binary's own name (hyphens kept).
+            // The prelude's rust_test applies `env` both when compiling and when running
+            // the test, so this serves `env!` and `std::env::var` alike.
+            for bin_target in &bin_targets {
                 rust_test.env_mut().insert(
-                    format!("CARGO_BIN_EXE_{}", package_name),
-                    format!("$(location :{})", package_name),
+                    format!("CARGO_BIN_EXE_{}", bin_target.name),
+                    format!("$(location :{})", bin_target.name),
                 );
             }
-            if lib_targets.iter().any(|l| l.name == package_name) {
-                if lib_alias {
-                    rust_test
-                        .deps_mut()
-                        .insert(format!(":{}-lib", package_name));
-                } else {
-                    rust_test.deps_mut().insert(format!(":{}", package_name));
-                }
+
+            // Integration tests may use the package's library under its crate name.
+            if let Some(lib_name) = &lib_buck_name {
+                rust_test.deps_mut().insert(format!(":{lib_name}"));
             }
 
             buck_rules.push(Rule::RustTest(rust_test));
@@ -436,5 +433,95 @@ mod tests {
         assert!(test_rule.is_some());
         let test_rule = test_rule.unwrap();
         assert!(test_rule.deps.contains(":foo-lib"));
+    }
+
+    fn test_ctx() -> BuckalContext {
+        BuckalContext {
+            root: None,
+            resolve: empty_resolve(),
+            repo_config: RepoConfig {
+                ignore_tests: false,
+                ..RepoConfig::default()
+            },
+            workspace_root: Utf8PathBuf::from("/tmp"),
+            workspace_inherit: false,
+            no_merge: false,
+        }
+    }
+
+    fn find_test<'a>(rules: &'a [Rule], name: &str) -> &'a crate::buck::RustTest {
+        rules
+            .iter()
+            .find_map(|r| match r {
+                Rule::RustTest(t) if t.name == name => Some(t),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no rust_test named {name}"))
+    }
+
+    #[test]
+    fn test_integration_test_gets_cargo_bin_exe_for_every_binary() {
+        // Package `my-tool` whose binaries are not named after the package
+        // (as in a package `observatory_db_feedback_cli` with binary `observatory-feedback`).
+        let lib = mock_target("my_tool", TargetKind::Lib);
+        let bin_a = mock_target("my-cli", TargetKind::Bin);
+        let bin_b = mock_target("helper", TargetKind::Bin);
+        let test = mock_target("cli", TargetKind::Test);
+
+        let node = mock_node("my-tool", vec![lib, bin_a, bin_b, test]);
+        let rules = buckify_root_node(&node, &test_ctx());
+        let test_rule = find_test(&rules, "cli");
+
+        assert_eq!(
+            test_rule
+                .env
+                .get("CARGO_BIN_EXE_my-cli")
+                .map(String::as_str),
+            Some("$(location :my-cli)")
+        );
+        assert_eq!(
+            test_rule
+                .env
+                .get("CARGO_BIN_EXE_helper")
+                .map(String::as_str),
+            Some("$(location :helper)")
+        );
+        assert!(test_rule.deps.contains(":my_tool"));
+    }
+
+    #[test]
+    fn test_integration_test_cargo_bin_exe_keeps_hyphenated_package_binary_name() {
+        // The binary takes the package's hyphenated name; Cargo names the variable
+        // after the binary, not after the underscored crate name.
+        let lib = mock_target("my_tool", TargetKind::Lib);
+        let bin = mock_target("my-tool", TargetKind::Bin);
+        let test = mock_target("cli", TargetKind::Test);
+
+        let node = mock_node("my-tool", vec![lib, bin, test]);
+        let rules = buckify_root_node(&node, &test_ctx());
+        let test_rule = find_test(&rules, "cli");
+
+        assert_eq!(
+            test_rule
+                .env
+                .get("CARGO_BIN_EXE_my-tool")
+                .map(String::as_str),
+            Some("$(location :my-tool)")
+        );
+        assert!(!test_rule.env.contains_key("CARGO_BIN_EXE_my_tool"));
+        assert!(test_rule.deps.contains(":my_tool"));
+    }
+
+    #[test]
+    fn test_unit_test_gets_no_cargo_bin_exe() {
+        // Cargo sets CARGO_BIN_EXE_* for integration tests and benches only.
+        let lib = mock_target("my_tool", TargetKind::Lib);
+        let bin = mock_target("my-tool", TargetKind::Bin);
+
+        let node = mock_node("my-tool", vec![lib, bin]);
+        let rules = buckify_root_node(&node, &test_ctx());
+        let unit = find_test(&rules, "unittest");
+
+        assert!(!unit.env.keys().any(|k| k.starts_with("CARGO_BIN_EXE_")));
     }
 }
