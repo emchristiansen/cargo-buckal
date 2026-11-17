@@ -27,11 +27,22 @@ use crate::resolve::BuckalResolve;
 ///            tells them from manual edits after the fixup changes or is removed.
 /// Version 7: `mapped_srcs` destinations are emitted as repository paths. A version 6
 ///            cache vouches for package-relative destinations, so it is stale.
+/// Version 8: rules change from an unchanged resolution (headers, the library's own
+///            context for proc-macro unit tests, binary unit tests, build-script
+///            output on tests, kept dev edges, ...). A version 6 or 7 cache certifies
+///            rules this version would not write, so every package is regenerated;
+///            its record of the fixups that generation applied stays valid and is
+///            kept for `--merge`.
 ///
 /// Migration strategy:
 /// - If found < expected (stale cache from older Buckal): ignore the old cache and rebuild.
 /// - If found > expected (cache from newer Buckal): exit immediately and prompt the user to upgrade.
-const CACHE_VERSION: u32 = 7;
+const CACHE_VERSION: u32 = 8;
+
+/// The oldest cache version whose record of the fixups a generation applied
+/// (`fixup_rustc_flags`, `fixups`) is still read, from a cache whose rules are
+/// outdated.
+const OLDEST_RECORD_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fingerprint([u8; 32]);
@@ -124,6 +135,11 @@ pub struct BuckalCache {
     /// (`fixup_rustc_flags`) are known.
     #[serde(skip)]
     recorded: bool,
+    /// Loaded from an older cache version: it records what that generation applied,
+    /// but its fingerprints do not certify rules this version writes, so every
+    /// package is regenerated.
+    #[serde(skip)]
+    rules_outdated: bool,
     /// The fixup `rustc_flags` this generation added, by package name, so that a
     /// later `--merge` can tell them from manual edits once they change or go away.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -220,6 +236,7 @@ impl BuckalCache {
             version: CACHE_VERSION,
             regenerate_all: false,
             recorded: false,
+            rules_outdated: false,
             fixup_rustc_flags,
             fixups: Some(fixups.clone()),
         }
@@ -231,6 +248,7 @@ impl BuckalCache {
             version: CACHE_VERSION,
             regenerate_all: false,
             recorded: false,
+            rules_outdated: false,
             fixup_rustc_flags: BTreeMap::new(),
             fixups: None,
         }
@@ -264,13 +282,14 @@ impl BuckalCache {
             );
             std::process::exit(1);
         }
-        if cache.version < CACHE_VERSION {
+        if cache.version < OLDEST_RECORD_VERSION {
             return Err(anyhow!(
                 "Cache version is stale (found {}, expected {})",
                 cache.version,
                 CACHE_VERSION
             ));
         }
+        cache.rules_outdated = cache.version < CACHE_VERSION;
         cache.recorded = true;
         Ok(cache)
     }
@@ -303,7 +322,7 @@ impl BuckalCache {
         };
         for (id, fp) in &self.fingerprints {
             if let Some(other_fp) = other.fingerprints.get(id) {
-                if fp != other_fp || other.regenerate_all {
+                if fp != other_fp || other.regenerate_all || other.rules_outdated {
                     _diff
                         .changes
                         .insert(id.resolve(workspace_root), ChangeType::Changed);
