@@ -217,6 +217,11 @@ fn compare(
             if tests.is_some() {
                 if let Some(test) = &resolution.test_variant {
                     target = test.features.get(platform).cloned();
+                } else if let Some(t) = resolution.tests.as_ref().filter(|t| !t.host_context) {
+                    // No library the tests build (a binary-only or cdylib-only
+                    // member): its tests' own compilations have the tests'
+                    // resolution.
+                    target = t.features.get(platform).cloned();
                 }
                 if let Some(test_host) = &resolution.test_host_variant {
                     host = test_host.features.get(platform).cloned();
