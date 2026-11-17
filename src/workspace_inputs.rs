@@ -241,20 +241,38 @@ fn expand(input: &str, workspace_root: &Utf8Path) -> Result<Vec<String>, String>
         return Err("matches no file".to_owned());
     }
     let mut files: Vec<String> = Vec::new();
+    // Symbolic links to directories are followed below the base as at it, so
+    // the glob sees the tree a build script reading through them sees (a loop
+    // is an error the walk reports).
     for entry in walkdir::WalkDir::new(&start)
+        .follow_links(true)
         .into_iter()
         .filter_entry(|entry| entry.file_name() != ".git")
     {
-        // An entry the walk cannot read could hold a matching file: refuse
-        // rather than give the build script fewer files than Cargo would.
-        let entry = entry.map_err(|error| {
-            let at = error
-                .path()
-                .and_then(Utf8Path::from_path)
-                .and_then(|p| relative(p, workspace_root).ok())
-                .unwrap_or_else(|| base.to_string());
-            format!("cannot read `{at}`: {error}")
-        })?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                let at = error.path().and_then(Utf8Path::from_path);
+                let at_relative = at.and_then(|p| relative(p, workspace_root).ok());
+                // A link that leads nowhere: refused when the glob matches it,
+                // as its literal path is; otherwise it gives no file whatever it
+                // was meant to be.
+                if let (Some(at), Some(at_relative)) = (at, &at_relative)
+                    && at.is_symlink()
+                    && !at.exists()
+                {
+                    if matcher.is_match(at_relative) {
+                        return Err(format!("`{at_relative}` is a dangling symbolic link"));
+                    }
+                    continue;
+                }
+                // An entry the walk cannot read could hold a matching file:
+                // refuse rather than give the build script fewer files than Cargo
+                // would.
+                let at = at_relative.unwrap_or_else(|| base.to_string());
+                return Err(format!("cannot read `{at}`: {error}"));
+            }
+        };
         let Some(path) = Utf8Path::from_path(entry.path()) else {
             continue;
         };
@@ -262,16 +280,8 @@ fn expand(input: &str, workspace_root: &Utf8Path) -> Result<Vec<String>, String>
             continue;
         };
         // A symbolic link to a file counts as the file, as a literal path does;
-        // where it leads is checked with every match. A matching link that
-        // leads nowhere is refused, as its literal path is; one the glob does
-        // not match gives no file whatever it was meant to be.
-        if !path.is_file() {
-            if entry.path_is_symlink() && !path.exists() && matcher.is_match(&relative_path) {
-                return Err(format!("`{relative_path}` is a dangling symbolic link"));
-            }
-            continue;
-        }
-        if matcher.is_match(&relative_path) {
+        // where it leads is checked with every match.
+        if entry.file_type().is_file() && matcher.is_match(&relative_path) {
             files.push(relative_path);
         }
     }
@@ -340,6 +350,44 @@ mod tests {
             "{error}"
         );
         assert_eq!(expand("conf/a*", &root).unwrap(), ["conf/a.toml"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_a_glob_descends_a_symlinked_directory_as_it_follows_a_symlinked_base() {
+        // N9 residual (b) (Fable g4, g5): the walk follows a symbolic link to a
+        // directory below the glob's base, as it follows one that is the base.
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
+        std::fs::create_dir_all(root.join("sdk/real/deep")).unwrap();
+        std::fs::write(root.join("sdk/real/deep/d.toml"), "").unwrap();
+        std::os::unix::fs::symlink("real", root.join("sdk/linkdir")).unwrap();
+        assert_eq!(
+            expand("sdk/linkdir/**/*.toml", &root).unwrap(),
+            ["sdk/linkdir/deep/d.toml"]
+        );
+        assert_eq!(
+            expand("sdk/**/*.toml", &root).unwrap(),
+            ["sdk/linkdir/deep/d.toml", "sdk/real/deep/d.toml"]
+        );
+        // A link back up is a loop, refused by name rather than walked forever.
+        std::os::unix::fs::symlink("..", root.join("sdk/real/up")).unwrap();
+        let error = expand("sdk/**/*.toml", &root).unwrap_err();
+        assert!(error.contains("cannot read `sdk/"), "{error}");
+        std::fs::remove_file(root.join("sdk/real/up")).unwrap();
+        // A dangling link the glob matches is still refused; one it does not
+        // match is still passed over.
+        std::os::unix::fs::symlink("gone", root.join("sdk/real/stale")).unwrap();
+        assert_eq!(
+            expand("sdk/real/**/*.toml", &root).unwrap(),
+            ["sdk/real/deep/d.toml"]
+        );
+        std::os::unix::fs::symlink("gone.toml", root.join("sdk/real/x.toml")).unwrap();
+        let error = expand("sdk/real/**/*.toml", &root).unwrap_err();
+        assert!(
+            error.contains("`sdk/real/x.toml` is a dangling symbolic link"),
+            "{error}"
+        );
     }
 
     #[test]
