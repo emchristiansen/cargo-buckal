@@ -7,7 +7,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    buckal_warn,
+    buckal_error,
     utils::{UnwrapOrExit, get_buck2_root},
 };
 
@@ -161,7 +161,7 @@ fn set_permissions(_file: &File) -> Result<()> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RepoConfig {
     pub align_cells: bool,
     pub ignore_tests: bool,
@@ -441,19 +441,24 @@ impl ExportFileEntry {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RepoPatchConfig {
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub version: Map<String, VersionPatch>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct VersionPatch {
     pub from: String,
     pub to: String,
 }
 
 impl RepoConfig {
+    /// The repository's `buckal.toml`, or the defaults when there is none. A file
+    /// that cannot be read or parsed, including one with a key generation does not
+    /// know, stops the command: falling back to defaults would generate rules
+    /// without the configuration the file asks for.
     pub fn load() -> Self {
         let repo_config_path = Self::repo_config_path();
 
@@ -461,25 +466,25 @@ impl RepoConfig {
             return Self::default();
         }
 
-        match fs::read_to_string(&repo_config_path) {
-            Ok(content) => match toml::from_str::<RepoConfig>(&content) {
-                Ok(config) => config,
-                Err(_) => {
-                    buckal_warn!(
-                        "Failed to parse repo config file at {}, using defaults",
-                        repo_config_path.display()
-                    );
-                    Self::default()
-                }
-            },
-            Err(_) => {
-                buckal_warn!(
-                    "Failed to read repo config file at {}, using defaults",
-                    repo_config_path.display()
-                );
-                Self::default()
-            }
-        }
+        let content = fs::read_to_string(&repo_config_path).unwrap_or_else(|error| {
+            buckal_error!(format!(
+                "failed to read the repository configuration {}: {error}",
+                repo_config_path.display()
+            ));
+            std::process::exit(1);
+        });
+        Self::parse(&content).unwrap_or_else(|error| {
+            buckal_error!(format!(
+                "invalid repository configuration {}: {error}",
+                repo_config_path.display()
+            ));
+            std::process::exit(1);
+        })
+    }
+
+    /// Parse a `buckal.toml`; an unknown key is an error that names it.
+    pub fn parse(content: &str) -> Result<Self, toml::de::Error> {
+        toml::from_str(content)
     }
 
     pub fn repo_config_path() -> PathBuf {

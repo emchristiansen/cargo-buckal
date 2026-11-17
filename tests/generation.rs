@@ -3012,3 +3012,32 @@ fn test_a_host_only_library_the_tests_build_for_the_target_uses_target_flavours(
         "{app}"
     );
 }
+
+#[test]
+fn test_unknown_buckal_toml_keys_are_refused() {
+    // A key generation does not know must not be ignored, nor make the whole
+    // file fall back to defaults: migration stops, naming the key and the file,
+    // and writes nothing.
+    let config = BUCKAL_TOML.split("[fixups.extra]").next().unwrap();
+    for (extra, key) in [
+        ("test_featurs = [\"x\"]\n", "test_featurs"),
+        (
+            "\n[fixups.app]\ntarget_compatible = [\"//cfg:x\"]\n",
+            "target_compatible",
+        ),
+    ] {
+        let f = fixture();
+        let toml = if extra.starts_with('\n') {
+            format!("{config}{extra}")
+        } else {
+            format!("{extra}{config}")
+        };
+        write(&f.ws.join("buckal.toml"), &toml);
+        let output = f.output(&["migrate"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{key}: {stderr}");
+        assert!(stderr.contains(key), "{key}: {stderr}");
+        assert!(stderr.contains("buckal.toml"), "{key}: {stderr}");
+        assert!(!f.ws.join("app/BUCK").exists(), "{key}: {stderr}");
+    }
+}
