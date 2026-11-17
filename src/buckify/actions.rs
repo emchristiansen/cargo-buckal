@@ -3,8 +3,8 @@ use regex::Regex;
 
 use crate::{
     buck::{
-        FixupFlags, GENERATED_HEADER, NamedFileGroup, PARTLY_GENERATED_HEADER, Rule, TopLevelKind,
-        parse_buck_file, patch_buck_rules, top_level_statements,
+        FixupFlags, FixupSets, GENERATED_HEADER, NamedFileGroup, PARTLY_GENERATED_HEADER, Rule,
+        TopLevelKind, parse_buck_file, patch_buck_rules, top_level_statements,
     },
     buckal_error, buckal_log,
     buckify::emit::emit_export_file,
@@ -16,7 +16,8 @@ use crate::{
 
 use super::{
     buckify_dep_node, buckify_root_node, cross, gen_buck_content, gen_buck_content_preserving,
-    rules::MANIFEST_EXPORT, vendor_package, windows,
+    rules::{MANIFEST_EXPORT, build_script_names, fixup_set_contributions},
+    vendor_package, windows,
 };
 
 impl BuckalChange {
@@ -80,7 +81,29 @@ impl BuckalChange {
                                 flags.get(&node.name).map(Vec::as_slice).unwrap_or_default()
                             }),
                         };
-                        merge_rules(&buck_path, &mut buck_rules, ctx, fixup_flags);
+                        // What the previous generation's fixup added to each rule's
+                        // sets (known when the cache records its fixups).
+                        let previous_sets = self.previous_fixups.as_ref().map(|fixups| {
+                            let build_scripts = build_script_names(&buck_rules);
+                            let fixup = fixups.get(&node.name).cloned().unwrap_or_default();
+                            buck_rules
+                                .iter()
+                                .filter_map(|rule| {
+                                    let name = rule.name()?.to_owned();
+                                    Some((
+                                        name,
+                                        fixup_set_contributions(&fixup, rule, &build_scripts),
+                                    ))
+                                })
+                                .collect::<std::collections::BTreeMap<_, _>>()
+                        });
+                        merge_rules(
+                            &buck_path,
+                            &mut buck_rules,
+                            ctx,
+                            fixup_flags,
+                            previous_sets.as_ref(),
+                        );
 
                         // Generate the BUCK file, keeping what a first-party package's
                         // BUCK file has beyond the rules generation owns.
@@ -435,6 +458,7 @@ fn merge_rules(
     buck_rules: &mut [Rule],
     ctx: &BuckalContext,
     fixup_flags: FixupFlags,
+    previous_sets: Option<&std::collections::BTreeMap<String, FixupSets>>,
 ) {
     if buck_path.exists() {
         // Skip merging manual changes if `--no-merge` is set
@@ -446,6 +470,7 @@ fn merge_rules(
                 buck_rules,
                 &ctx.repo_config.patch_fields,
                 fixup_flags,
+                previous_sets,
             );
         }
     } else {

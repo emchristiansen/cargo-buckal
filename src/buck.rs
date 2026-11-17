@@ -735,6 +735,30 @@ pub struct FixupFlags<'a> {
     pub previous: Option<&'a [String]>,
 }
 
+/// What a fixup adds to one rule's set-valued attributes that `--merge` keeps.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FixupSets {
+    pub deps: Set<String>,
+    pub target_compatible_with: Set<String>,
+    pub env: Map<String, String>,
+}
+
+impl FixupSets {
+    /// Remove these contributions from an existing rule's values: what the previous
+    /// generation's fixup added is not a manual edit. (A manual value equal to one
+    /// the fixup added cannot be told from it.)
+    fn strip(
+        &self,
+        deps: &mut Set<String>,
+        target_compatible_with: &mut Set<String>,
+        env: &mut Map<String, String>,
+    ) {
+        deps.retain(|dep| !self.deps.contains(dep));
+        target_compatible_with.retain(|label| !self.target_compatible_with.contains(label));
+        env.retain(|key, value| self.env.get(key) != Some(value));
+    }
+}
+
 /// Merge the ordered argument list of an existing rule (`src`) into a generated one
 /// (`dst`), keeping only the existing rule's manual additions, in their order. The
 /// comparison is by whole argument group (`-C` with its value), never by single
@@ -1352,13 +1376,21 @@ pub fn top_level_statements(
 
 /// Keep the configured `patch_fields` of the existing rules (manual edits) in the
 /// regenerated ones. `fixup_flags` are the fixup `rustc_flags` this and the
-/// previous generation added to this package's rules; they are not manual edits.
+/// previous generation added to this package's rules, and `previous_sets` (by rule
+/// name, `None` without a record) what the previous generation's fixup added to
+/// their sets; they are not manual edits.
 pub fn patch_buck_rules(
     existing: &Map<String, Rule>,
     to_patch: &mut [Rule],
     patch_fields: &Set<String>,
     fixup_flags: FixupFlags,
+    previous_sets: Option<&Map<String, FixupSets>>,
 ) {
+    let previous = |name: &str| -> FixupSets {
+        previous_sets
+            .and_then(|sets| sets.get(name).cloned())
+            .unwrap_or_default()
+    };
     fn find_existing<'a>(existing: &'a Map<String, Rule>, rule: &Rule) -> Option<&'a Rule> {
         existing.get(&rule_map_key(rule))
     }
@@ -1371,7 +1403,13 @@ pub fn patch_buck_rules(
                     ..RustLibrary::default()
                 });
                 if let Some(Rule::RustLibrary(existing_rule)) = find_existing(existing, &probe) {
-                    new_rule.patch_from(existing_rule, patch_fields, fixup_flags);
+                    let mut existing_rule = existing_rule.clone();
+                    previous(&new_rule.name).strip(
+                        &mut existing_rule.deps,
+                        &mut existing_rule.target_compatible_with,
+                        &mut existing_rule.env,
+                    );
+                    new_rule.patch_from(&existing_rule, patch_fields, fixup_flags);
                 }
             }
             Rule::RustBinary(new_rule) => {
@@ -1380,7 +1418,13 @@ pub fn patch_buck_rules(
                     ..RustBinary::default()
                 });
                 if let Some(Rule::RustBinary(existing_rule)) = find_existing(existing, &probe) {
-                    new_rule.patch_from(existing_rule, patch_fields, fixup_flags);
+                    let mut existing_rule = existing_rule.clone();
+                    previous(&new_rule.name).strip(
+                        &mut existing_rule.deps,
+                        &mut existing_rule.target_compatible_with,
+                        &mut existing_rule.env,
+                    );
+                    new_rule.patch_from(&existing_rule, patch_fields, fixup_flags);
                 }
             }
             Rule::RustTest(new_rule) => {
@@ -1389,7 +1433,13 @@ pub fn patch_buck_rules(
                     ..RustTest::default()
                 });
                 if let Some(Rule::RustTest(existing_rule)) = find_existing(existing, &probe) {
-                    new_rule.patch_from(existing_rule, patch_fields, fixup_flags);
+                    let mut existing_rule = existing_rule.clone();
+                    previous(&new_rule.name).strip(
+                        &mut existing_rule.deps,
+                        &mut existing_rule.target_compatible_with,
+                        &mut existing_rule.env,
+                    );
+                    new_rule.patch_from(&existing_rule, patch_fields, fixup_flags);
                 }
             }
             Rule::BuildscriptRun(new_rule) => {
@@ -1398,7 +1448,12 @@ pub fn patch_buck_rules(
                     ..BuildscriptRun::default()
                 });
                 if let Some(Rule::BuildscriptRun(existing_rule)) = find_existing(existing, &probe) {
-                    new_rule.patch_from(existing_rule, patch_fields);
+                    let mut existing_rule = existing_rule.clone();
+                    let previous = previous(&new_rule.name);
+                    existing_rule
+                        .env
+                        .retain(|key, value| previous.env.get(key) != Some(value));
+                    new_rule.patch_from(&existing_rule, patch_fields);
                 }
             }
             _ => {}

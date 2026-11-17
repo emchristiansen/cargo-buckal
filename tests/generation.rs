@@ -1988,3 +1988,80 @@ fn test_mapped_srcs_refuse_a_destination_above_the_package() {
     let b = f.buck("a/b");
     assert!(b.contains("\"//:data.txt\": \"a/data.txt\""), "{b}");
 }
+
+#[test]
+fn test_merge_drops_changed_and_removed_set_fixups_and_keeps_manual_values() {
+    // CFG-1 (t_7c72255f): with `patch_fields` covering dependencies and
+    // compatibility, a changed or removed fixup's earlier labels are not manual
+    // edits under an ordinary cached `migrate --merge`; manual labels are.
+    let f = fixture();
+    write(&f.ws.join("extra/build.rs"), "fn main() {}\n");
+    let config = |fixup: &str| {
+        format!(
+            "ignore_tests = false\npatch_fields = [\"target_compatible_with\", \"deps\"]\n[fixups.extra]\n{fixup}"
+        )
+    };
+    let fixup = |v: &str| {
+        format!(
+            "test_target_compatible_with = [\"//c:{v}\"]\nextra_deps = [\"//n:{v}\"]\n\
+             [fixups.extra.buildscript.build]\nextra_deps = [\"//n:b{v}\"]\n\
+             [fixups.extra.tests.unittest]\ntarget_compatible_with = [\"//c:t{v}\"]\n"
+        )
+    };
+    let labels = |rule: &str, of: &[&str]| -> Vec<String> {
+        of.iter()
+            .filter(|l| rule.contains(&format!("\"{l}\"")))
+            .map(|l| l.to_string())
+            .collect()
+    };
+    let all = [
+        "//c:old",
+        "//c:told",
+        "//n:old",
+        "//n:bold",
+        "//c:new",
+        "//c:tnew",
+        "//n:new",
+        "//n:bnew",
+        "//manual:dep",
+        "//manual:bdep",
+        "//manual:c",
+    ];
+    let check = |expected: &[(&str, &[&str])]| {
+        let buck = f.buck("extra");
+        for (name, want) in expected {
+            assert_eq!(labels(rule(&buck, name), &all), *want, "{name}:\n{buck}");
+        }
+    };
+
+    write(&f.ws.join("buckal.toml"), &config(&fixup("old")));
+    f.migrate(&["--merge"]);
+    check(&[
+        ("extra", &["//n:old"]),
+        ("build-script-build", &["//n:bold"]),
+        ("unittest", &["//c:old", "//c:told"]),
+    ]);
+    // Manual additions next to the generated labels.
+    let buck = f
+        .buck("extra")
+        .replacen("\"//n:old\"", "\"//n:old\", \"//manual:dep\"", 1)
+        .replacen("\"//n:bold\"", "\"//n:bold\", \"//manual:bdep\"", 1)
+        .replacen("\"//c:old\"", "\"//c:old\", \"//manual:c\"", 1);
+    write(&f.ws.join("extra/BUCK"), &buck);
+
+    write(&f.ws.join("buckal.toml"), &config(&fixup("new")));
+    f.migrate(&["--merge"]);
+    check(&[
+        ("extra", &["//n:new", "//manual:dep"]),
+        ("build-script-build", &["//n:bnew", "//manual:bdep"]),
+        ("unittest", &["//c:new", "//c:tnew", "//manual:c"]),
+    ]);
+
+    write(&f.ws.join("buckal.toml"), &config(""));
+    f.migrate(&["--merge"]);
+    check(&[
+        ("extra", &["//manual:dep"]),
+        ("build-script-build", &["//manual:bdep"]),
+        ("unittest", &["//manual:c"]),
+    ]);
+}

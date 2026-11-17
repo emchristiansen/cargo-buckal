@@ -129,11 +129,14 @@ pub fn execute(args: &MigrateArgs) {
     let mut changes = new_cache.diff(last_cache, &ctx.workspace_root);
     // Which packages to regenerate is one question; what the previous generation
     // emitted is another. A compatible cache records the fixup flags that generation
-    // added, so `--merge` does not take them for manual edits under `--no-cache`
-    // either.
+    // added (its flags and fixups), so `--merge` does not take them for manual
+    // edits under `--no-cache` either.
     changes.previous_fixup_rustc_flags = recorded
         .as_ref()
         .and_then(BuckalCache::previous_fixup_record);
+    changes.previous_fixups = recorded
+        .as_ref()
+        .and_then(BuckalCache::previous_fixups_record);
 
     // Apply changes to BUCK files
     changes.apply(&ctx);

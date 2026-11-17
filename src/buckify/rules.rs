@@ -761,24 +761,16 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
         Some(crate::config::BuildscriptRunEntry::Table(run)) => run.clone(),
         _ => Default::default(),
     };
-    let build_scripts: Set<String> = rules
-        .iter()
-        .filter_map(|rule| match rule {
-            Rule::BuildscriptRun(r) => r.buildscript_rule.strip_prefix(':').map(str::to_owned),
-            _ => None,
-        })
-        .collect();
+    let build_scripts = build_script_names(rules);
     for rule in rules {
+        let sets = fixup_set_contributions(fixup, rule, &build_scripts);
         let (env, rustc_flags, mapped_srcs) = match rule {
             Rule::RustLibrary(r) => {
-                r.deps.extend(fixup.extra_deps.iter().cloned());
+                r.deps.extend(sets.deps);
                 (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs)
             }
             Rule::RustBinary(r) => {
-                if build_scripts.contains(&r.name) {
-                    r.deps
-                        .extend(fixup.buildscript.build.extra_deps.iter().cloned());
-                }
+                r.deps.extend(sets.deps);
                 (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs)
             }
             Rule::RustTest(r) => {
@@ -792,29 +784,77 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
                     r.runtime_tools = Some(runtime_tools.clone());
                 }
                 r.labels.extend(fixup.test_labels.iter().cloned());
-                r.target_compatible_with
-                    .extend(fixup.test_target_compatible_with.iter().cloned());
+                r.target_compatible_with.extend(sets.target_compatible_with);
                 r.args.extend(fixup.test_args.iter().cloned());
                 if let Some(test) = fixup.tests.get(&r.name) {
                     r.labels.extend(test.labels.iter().cloned());
-                    r.target_compatible_with
-                        .extend(test.target_compatible_with.iter().cloned());
                     r.args.extend(test.args.iter().cloned());
                 }
                 (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs)
             }
             Rule::BuildscriptRun(r) => {
-                r.env.extend(fixup.buildscript_env.clone());
+                r.env.extend(sets.env);
                 r.rustc_link_lib |= run.rustc_link_lib;
                 r.rustc_link_search |= run.rustc_link_search;
                 continue;
             }
             _ => continue,
         };
-        env.extend(fixup.env.clone());
+        env.extend(sets.env);
         rustc_flags.extend(fixup.rustc_flags.iter().cloned());
         mapped_srcs.extend(mapped.clone());
     }
+}
+
+/// The names of the build-script binaries among `rules` (those a
+/// `buildscript_run` runs).
+pub(crate) fn build_script_names(rules: &[Rule]) -> Set<String> {
+    rules
+        .iter()
+        .filter_map(|rule| match rule {
+            Rule::BuildscriptRun(r) => r.buildscript_rule.strip_prefix(':').map(str::to_owned),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What `fixup` adds to `rule`'s set-valued attributes that `--merge` keeps
+/// (`deps`, `target_compatible_with`, `env`): the library's `extra_deps`, the
+/// build script binary's `buildscript.build.extra_deps`, the tests' package-wide
+/// and per-test `target_compatible_with`, `env` on the Rust rules and
+/// `buildscript_env` on the build script run. `build_scripts` are the names of the
+/// package's build-script binaries.
+pub(crate) fn fixup_set_contributions(
+    fixup: &crate::config::PackageFixup,
+    rule: &Rule,
+    build_scripts: &Set<String>,
+) -> crate::buck::FixupSets {
+    let mut sets = crate::buck::FixupSets::default();
+    match rule {
+        Rule::RustLibrary(_) => {
+            sets.deps.extend(fixup.extra_deps.iter().cloned());
+            sets.env.extend(fixup.env.clone());
+        }
+        Rule::RustBinary(r) => {
+            if build_scripts.contains(&r.name) {
+                sets.deps
+                    .extend(fixup.buildscript.build.extra_deps.iter().cloned());
+            }
+            sets.env.extend(fixup.env.clone());
+        }
+        Rule::RustTest(r) => {
+            sets.target_compatible_with
+                .extend(fixup.test_target_compatible_with.iter().cloned());
+            if let Some(test) = fixup.tests.get(&r.name) {
+                sets.target_compatible_with
+                    .extend(test.target_compatible_with.iter().cloned());
+            }
+            sets.env.extend(fixup.env.clone());
+        }
+        Rule::BuildscriptRun(_) => sets.env.extend(fixup.buildscript_env.clone()),
+        _ => {}
+    }
+    sets
 }
 
 /// Refuse what generation cannot honour in `[fixups.<package>.buildscript]`: not
@@ -1619,6 +1659,7 @@ mod tests {
             &mut regenerated,
             &Set::from(["rustc_flags".to_owned()]),
             crate::buck::FixupFlags::default(),
+            None,
         );
         assert_eq!(gen_buck_content(&regenerated), content);
     }

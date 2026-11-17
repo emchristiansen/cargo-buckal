@@ -128,6 +128,12 @@ pub struct BuckalCache {
     /// later `--merge` can tell them from manual edits once they change or go away.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     fixup_rustc_flags: BTreeMap<String, Vec<String>>,
+    /// The fixups this generation applied, by package name, so that a later
+    /// `--merge` can tell their set-valued contributions (dependencies,
+    /// compatibility, environment) from manual edits once they change or go away.
+    /// `None` in a cache written before this was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fixups: Option<BTreeMap<String, PackageFixup>>,
 }
 
 impl BuckalCache {
@@ -215,6 +221,7 @@ impl BuckalCache {
             regenerate_all: false,
             recorded: false,
             fixup_rustc_flags,
+            fixups: Some(fixups.clone()),
         }
     }
 
@@ -225,6 +232,7 @@ impl BuckalCache {
             regenerate_all: false,
             recorded: false,
             fixup_rustc_flags: BTreeMap::new(),
+            fixups: None,
         }
     }
 
@@ -280,9 +288,17 @@ impl BuckalCache {
         (self.recorded && !self.regenerate_all).then(|| self.fixup_rustc_flags.clone())
     }
 
+    /// The fixups of the generation this cache records, if it records them.
+    pub fn previous_fixups_record(&self) -> Option<BTreeMap<String, PackageFixup>> {
+        (self.recorded && !self.regenerate_all)
+            .then(|| self.fixups.clone())
+            .flatten()
+    }
+
     pub fn diff(&self, other: &BuckalCache, workspace_root: &Utf8PathBuf) -> BuckalChange {
         let mut _diff = BuckalChange {
             previous_fixup_rustc_flags: other.previous_fixup_record(),
+            previous_fixups: other.previous_fixups_record(),
             ..Default::default()
         };
         for (id, fp) in &self.fingerprints {
@@ -318,6 +334,10 @@ pub struct BuckalChange {
     /// a cache records them (`None`: unknown, so `--merge` cannot tell them from
     /// manual edits).
     pub previous_fixup_rustc_flags: Option<BTreeMap<String, Vec<String>>>,
+    /// The fixups the previous generation applied, by package name, when a cache
+    /// records them (`None`: unknown, so `--merge` cannot tell their set-valued
+    /// contributions from manual edits).
+    pub previous_fixups: Option<BTreeMap<String, PackageFixup>>,
 }
 
 impl BuckalChange {
@@ -328,6 +348,9 @@ impl BuckalChange {
         }
         if self.previous_fixup_rustc_flags.is_none() {
             self.previous_fixup_rustc_flags = other.previous_fixup_rustc_flags;
+        }
+        if self.previous_fixups.is_none() {
+            self.previous_fixups = other.previous_fixups;
         }
     }
 }
