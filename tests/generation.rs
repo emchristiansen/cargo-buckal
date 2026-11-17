@@ -2287,3 +2287,39 @@ fn test_host_compilations_differing_by_platform_are_reported() {
     assert!(output.status.success(), "{stderr}");
     assert!(!stderr.contains("resolve differently"), "{stderr}");
 }
+
+#[test]
+fn test_binary_unit_tests_get_cargo_bin_name() {
+    // F1 (Fable review): Cargo sets `CARGO_BIN_NAME` (the binary's name, hyphens
+    // kept) for a binary's unit-test compilation; `env!("CARGO_BIN_NAME")` in its
+    // crate root needs it.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"cli\"]\n",
+    );
+    write(
+        &f.ws.join("cli/Cargo.toml"),
+        &manifest(
+            "cli",
+            "[[bin]]\nname = \"my-cli\"\npath = \"src/main.rs\"\n",
+        ),
+    );
+    write(
+        &f.ws.join("cli/src/main.rs"),
+        "const NAME: &str = env!(\"CARGO_BIN_NAME\");\nfn main() {\n    println!(\"{NAME}\");\n}\n#[test]\nfn name() {\n    assert_eq!(NAME, \"my-cli\");\n}\n",
+    );
+    write(
+        &f.ws.join("buckal.toml"),
+        BUCKAL_TOML.split("[fixups.extra]").next().unwrap(),
+    );
+    f.migrate(&[]);
+    let cli = f.buck("cli");
+    let unittest = rule(&cli, "my-cli-unittest");
+    assert!(
+        unittest.contains("\"CARGO_BIN_NAME\": \"my-cli\""),
+        "{unittest}"
+    );
+    assert!(unittest.contains("crate = \"my_cli\""), "{unittest}");
+    assert!(!unittest.contains("CARGO_BIN_EXE"), "{unittest}");
+}

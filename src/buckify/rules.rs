@@ -322,7 +322,8 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
     // default) and whose `required-features` the tests' resolution enables: a test
     // harness over the binary's crate root, compiled in the test context (like the
     // library's), with the dev-dependencies and the package's library. Cargo gives
-    // it no `CARGO_BIN_EXE_*` (only integration tests and benches get those).
+    // it `CARGO_BIN_NAME` but no `CARGO_BIN_EXE_*` (only integration tests and
+    // benches get those).
     if !ctx.repo_config.ignore_tests {
         let per_platform = !ctx.repo_config.feature_platforms.is_empty();
         for bin_target in bin_targets
@@ -343,6 +344,11 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
             }
             let mut rust_test =
                 emit_rust_test(&test_node, bin_target, &manifest_dir, &buckal_name, ctx);
+            // Cargo sets `CARGO_BIN_NAME` for every compilation of a binary target,
+            // its unit tests included; the rule's name is not the binary's.
+            rust_test
+                .env
+                .insert("CARGO_BIN_NAME".to_owned(), bin_target.name.clone());
             if let Some(lib_name) = &lib_buck_name {
                 let lib = test_context_lib(lib_name);
                 rust_test.deps_mut().insert(format!(":{lib}"));
