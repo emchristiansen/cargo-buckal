@@ -110,6 +110,12 @@ impl PackageIdExt for PackageId {
 pub struct BuckalCache {
     fingerprints: BTreeMap<PackageId, Fingerprint>,
     version: u32,
+    /// This is not a record of generated rules, only an inventory of the packages
+    /// (rebuilt from current metadata because no compatible cache exists). It still
+    /// detects removals, but every surviving package must be regenerated: their BUCK
+    /// files may come from another generator version, or from nothing at all.
+    #[serde(skip)]
+    regenerate_all: bool,
 }
 
 impl BuckalCache {
@@ -152,6 +158,7 @@ impl BuckalCache {
         Self {
             fingerprints,
             version: CACHE_VERSION,
+            regenerate_all: false,
         }
     }
 
@@ -159,7 +166,20 @@ impl BuckalCache {
         Self {
             fingerprints: BTreeMap::new(),
             version: CACHE_VERSION,
+            regenerate_all: false,
         }
+    }
+
+    /// Mark this cache as an inventory rebuilt from metadata, not a record of
+    /// generated rules: diffing against it regenerates every surviving package.
+    pub fn into_unverified_inventory(mut self) -> Self {
+        self.regenerate_all = true;
+        self
+    }
+
+    /// Whether this is an inventory whose packages must all be regenerated.
+    pub fn is_unverified_inventory(&self) -> bool {
+        self.regenerate_all
     }
 
     pub fn load() -> Result<Self, Error> {
@@ -199,7 +219,7 @@ impl BuckalCache {
         let mut _diff = BuckalChange::default();
         for (id, fp) in &self.fingerprints {
             if let Some(other_fp) = other.fingerprints.get(id) {
-                if fp != other_fp {
+                if fp != other_fp || other.regenerate_all {
                     _diff
                         .changes
                         .insert(id.resolve(workspace_root), ChangeType::Changed);
@@ -226,6 +246,15 @@ impl BuckalCache {
 #[derive(Debug, Default)]
 pub struct BuckalChange {
     pub changes: BTreeMap<PackageId, ChangeType>,
+}
+
+impl BuckalChange {
+    /// Add `other`'s changes for packages this one does not change already.
+    pub fn merge(&mut self, other: BuckalChange) {
+        for (id, change) in other.changes {
+            self.changes.entry(id).or_insert(change);
+        }
+    }
 }
 
 #[derive(Debug)]

@@ -1211,3 +1211,24 @@ fn test_fixup_changes_invalidate_only_their_package() {
         assert!(changes.values().all(|c| matches!(c, ChangeType::Changed)));
     }
 }
+
+/// A cache rebuilt from metadata is an inventory, not a record of generated rules:
+/// diffing against it regenerates every surviving package and still finds removals.
+#[test]
+fn test_unverified_inventory_regenerates_every_package() {
+    let resolve = resolve_from_fixture("diamond-deps");
+    let ws = cargo_metadata::camino::Utf8PathBuf::from(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/diamond-deps")
+            .to_str()
+            .unwrap(),
+    );
+    let current = BuckalCache::from_resolve(&resolve, &ws, &RepoPatchConfig::default());
+    let same = BuckalCache::from_resolve(&resolve, &ws, &RepoPatchConfig::default());
+    assert!(current.diff(&same, &ws).changes.is_empty());
+    let inventory = BuckalCache::from_resolve(&resolve, &ws, &RepoPatchConfig::default())
+        .into_unverified_inventory();
+    let changes = current.diff(&inventory, &ws).changes;
+    assert_eq!(changes.len(), resolve.nodes().count());
+    assert!(changes.values().all(|c| matches!(c, ChangeType::Changed)));
+}

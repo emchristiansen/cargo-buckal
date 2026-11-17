@@ -151,13 +151,19 @@ extra = { path = "../extra" }
 
 impl Fixture {
     fn migrate(&self, args: &[&str]) {
+        let mut all = vec!["migrate"];
+        all.extend_from_slice(args);
+        self.run(&all);
+    }
+
+    fn run(&self, args: &[&str]) {
         let cargo_home = std::env::var_os("CARGO_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
                 PathBuf::from(std::env::var_os("HOME").expect("HOME")).join(".cargo")
             });
         let output = Command::new(env!("CARGO_BIN_EXE_cargo-buckal"))
-            .args(["buckal", "migrate"])
+            .arg("buckal")
             .args(args)
             .current_dir(&self.ws)
             .env("HOME", &self.home)
@@ -167,7 +173,7 @@ impl Fixture {
             .expect("run cargo-buckal");
         assert!(
             output.status.success(),
-            "migrate {args:?} exited with {}\nstdout:\n{}\nstderr:\n{}",
+            "cargo buckal {args:?} exited with {}\nstdout:\n{}\nstderr:\n{}",
             output.status,
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
@@ -424,4 +430,33 @@ fn test_proc_macro_with_integration_test_through_generation() {
             assert!(api.contains("\"//shared:shared\""), "{api}");
         }
     }
+}
+
+#[test]
+fn test_update_after_an_old_cache_regenerates_before_certifying() {
+    // No feature_platforms: the plain metadata path.
+    let f = fixture();
+    write(&f.ws.join("buckal.toml"), "ignore_tests = false\n");
+    f.migrate(&[]);
+    let current = f.buck("extra");
+
+    // Rules and cache from an older generator (cache version 4).
+    let snap = f.ws.join("buckal.snap");
+    let cache = std::fs::read_to_string(&snap).unwrap();
+    std::fs::write(&snap, cache.replace("version = 5", "version = 4")).unwrap();
+    let stale = "# stale rules from v4\n";
+    write(&f.ws.join("extra/BUCK"), stale);
+
+    // A no-op update must regenerate the surviving packages before it writes a
+    // version 5 cache...
+    f.run(&["update", "--workspace"]);
+    assert!(
+        std::fs::read_to_string(&snap)
+            .unwrap()
+            .contains("version = 5")
+    );
+    assert_eq!(f.buck("extra"), current);
+    // ...so that an ordinary migrate afterwards finds current rules.
+    f.migrate(&[]);
+    assert_eq!(f.buck("extra"), current);
 }

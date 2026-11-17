@@ -13,7 +13,7 @@ use crate::{
     config::{RepoConfig, VersionPatch},
     context::BuckalContext,
     resolve::{BuckalNode, NodeKind},
-    utils::{UnwrapOrExit, ensure_prerequisites, section},
+    utils::{UnwrapOrExit, ensure_prerequisites, get_last_cache, section},
 };
 
 #[derive(Parser, Debug)]
@@ -42,8 +42,20 @@ pub fn execute(args: &PatchArgs) {
 
     // Compute targeted BUCK changes before persisting to buckal.toml so that
     // a failure here does not leave a partially-written config file.
-    let changes = targeted_patch_changes(&ctx, &selected)
+    let mut changes = targeted_patch_changes(&ctx, &selected)
         .unwrap_or_exit_ctx("failed to compute patched BUCK updates");
+    // The cache saved below certifies every package's rules. Without a compatible
+    // record of generated rules, regenerate all of them first.
+    let last_cache = get_last_cache(args.manifest_path.as_deref());
+    if last_cache.is_unverified_inventory() {
+        let current = BuckalCache::from_resolve_with_fixups(
+            &ctx.resolve,
+            &ctx.workspace_root,
+            &ctx.repo_config.patch,
+            &ctx.repo_config.fixups,
+        );
+        changes.merge(current.diff(&last_cache, &ctx.workspace_root));
+    }
 
     upsert_version_patch(
         &RepoConfig::repo_config_path(),

@@ -465,6 +465,10 @@ pub fn get_vendor_dir(package_id: &PackageId) -> Result<Utf8PathBuf> {
 
 /// Retrieve the last saved BuckalCache from the cache file, or rebuild from metadata if unavailable.
 ///
+/// A rebuilt cache is an unverified inventory: it lets `diff()` detect removals, but
+/// every surviving package is regenerated, since no compatible record says their BUCK
+/// files are current.
+///
 /// `manifest_path` should match the `--manifest-path` argument passed to the command,
 /// so that the fallback cache is built from the correct workspace (not always cwd).
 ///
@@ -480,7 +484,7 @@ pub fn get_last_cache(manifest_path: Option<&str>) -> BuckalCache {
             Ok(root) => root,
             Err(_) => {
                 buckal_warn!("could not locate buck2 root; falling back to empty cache (removal detection disabled)");
-                return BuckalCache::new_empty();
+                return BuckalCache::new_empty().into_unverified_inventory();
             }
         };
         let mut cmd = cargo_metadata::MetadataCommand::new();
@@ -491,7 +495,7 @@ pub fn get_last_cache(manifest_path: Option<&str>) -> BuckalCache {
             Ok(m) => m,
             Err(e) => {
                 buckal_warn!("cargo metadata failed: {}; falling back to empty cache (removal detection disabled)", e);
-                return BuckalCache::new_empty();
+                return BuckalCache::new_empty().into_unverified_inventory();
             }
         };
         let packages_map: std::collections::HashMap<_, _> = metadata
@@ -520,7 +524,7 @@ pub fn get_last_cache(manifest_path: Option<&str>) -> BuckalCache {
                     "dependency cycle in workspace: {}; falling back to empty cache",
                     e
                 );
-                return BuckalCache::new_empty();
+                return BuckalCache::new_empty().into_unverified_inventory();
             }
         };
         let repo_config = load_repo_config(&metadata.workspace_root);
@@ -530,6 +534,7 @@ pub fn get_last_cache(manifest_path: Option<&str>) -> BuckalCache {
             &repo_config.patch,
             &repo_config.fixups,
         )
+        .into_unverified_inventory()
     })
 }
 
