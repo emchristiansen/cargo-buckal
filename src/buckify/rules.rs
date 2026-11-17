@@ -524,4 +524,93 @@ mod tests {
 
         assert!(!unit.env.keys().any(|k| k.starts_with("CARGO_BIN_EXE_")));
     }
+
+    #[test]
+    fn test_buckify_git_dep_in_repository_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        let write = |rel: &str, content: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+        };
+        write(".cargo-ok", "");
+        write("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+        write(
+            "crates/rig-core/Cargo.toml",
+            "[package]\nname = \"rig-core\"\n",
+        );
+        write("crates/rig-core/src/lib.rs", "");
+        write("crates/rig-core/build.rs", "fn main() {}");
+
+        let rev = "6871da91c889479c679951aad12d5f367152b01a";
+        let manifest_dir = root.join("crates/rig-core");
+        let target = |name: &str, kind: TargetKind, file: &str| BuckalTarget {
+            name: name.to_owned(),
+            kind: vec![kind],
+            src_path: manifest_dir.join(file),
+            doctest: true,
+            test: true,
+        };
+        let node = BuckalNode {
+            package_id: PackageId {
+                repr: format!(
+                    "git+https://github.com/emchristiansen/rig?rev={rev}#rig-core@0.42.0"
+                ),
+            },
+            name: "rig-core".to_owned(),
+            version: "0.42.0".to_owned(),
+            features: vec![],
+            kind: NodeKind::ThirdParty,
+            edition: Edition::E2021,
+            manifest_path: manifest_dir.join("Cargo.toml"),
+            targets: vec![
+                target("rig_core", TargetKind::Lib, "src/lib.rs"),
+                target("build-script-build", TargetKind::CustomBuild, "build.rs"),
+            ],
+            source: Some(format!(
+                "git+https://github.com/emchristiansen/rig?rev={rev}#{rev}"
+            )),
+            links: None,
+            checksum: None,
+        };
+
+        let rules = buckify_dep_node(&node, &test_ctx());
+
+        let git_fetch = rules
+            .iter()
+            .find_map(|r| match r {
+                Rule::GitFetch(g) => Some(g),
+                _ => None,
+            })
+            .expect("git_fetch");
+        assert_eq!(git_fetch.name, "vendor");
+        assert_eq!(git_fetch.repo, "https://github.com/emchristiansen/rig");
+        assert_eq!(git_fetch.rev, rev);
+        assert_eq!(
+            git_fetch.sub_targets,
+            Set::from(["Cargo.toml".to_owned(), "crates/rig-core".to_owned()])
+        );
+
+        for rule in &rules {
+            match rule {
+                Rule::CargoManifest(m) => {
+                    assert_eq!(m.vendor, ":vendor[crates/rig-core]");
+                    assert_eq!(m.workspace.as_deref(), Some(":vendor[Cargo.toml]"));
+                }
+                Rule::RustLibrary(l) => {
+                    assert_eq!(l.srcs, Set::from([":vendor[crates/rig-core]".to_owned()]));
+                    assert_eq!(l.crate_root, "vendor/crates/rig-core/src/lib.rs");
+                }
+                Rule::RustBinary(b) => {
+                    assert_eq!(b.srcs, Set::from([":vendor[crates/rig-core]".to_owned()]));
+                    assert_eq!(b.crate_root, "vendor/crates/rig-core/build.rs");
+                }
+                Rule::BuildscriptRun(r) => {
+                    assert_eq!(r.manifest_dir, ":vendor[crates/rig-core]");
+                }
+                _ => {}
+            }
+        }
+    }
 }

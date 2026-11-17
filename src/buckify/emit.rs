@@ -1,6 +1,9 @@
 use std::{borrow::Cow, collections::BTreeSet as Set};
 
-use cargo_metadata::{TargetKind, camino::Utf8PathBuf};
+use cargo_metadata::{
+    TargetKind,
+    camino::{Utf8Path, Utf8PathBuf},
+};
 use cargo_util_schemas::lockfile::TomlLockfileSourceId;
 
 use crate::{
@@ -25,9 +28,10 @@ pub(super) fn emit_rust_library(
     buckal_name: &str,
     ctx: &BuckalContext,
 ) -> RustLibrary {
+    let vendor = vendor_ref(node);
     let mut rust_library = RustLibrary {
         name: buckal_name.to_owned(),
-        srcs: Set::from([get_vendor_target()]),
+        srcs: Set::from([vendor.label.clone()]),
         crate_name: lib_target.name.to_owned().replace("-", "_"),
         edition: node.edition.to_string(),
         features: Set::from_iter(node.features.iter().map(|f| f.to_string())),
@@ -43,7 +47,7 @@ pub(super) fn emit_rust_library(
     // Set the crate root path
     rust_library.crate_root = format!(
         "{}/{}",
-        get_vendor_name(),
+        vendor.root,
         normalize_path_for_buck(
             lib_target
                 .src_path
@@ -74,9 +78,10 @@ pub(super) fn emit_rust_binary(
     buckal_name: &str,
     ctx: &BuckalContext,
 ) -> RustBinary {
+    let vendor = vendor_ref(node);
     let mut rust_binary = RustBinary {
         name: buckal_name.to_owned(),
-        srcs: Set::from([get_vendor_target()]),
+        srcs: Set::from([vendor.label.clone()]),
         crate_name: bin_target.name.to_owned().replace("-", "_"),
         edition: node.edition.to_string(),
         features: Set::from_iter(node.features.iter().map(|f| f.to_string())),
@@ -88,7 +93,7 @@ pub(super) fn emit_rust_binary(
     // Set the crate root path
     rust_binary.crate_root = format!(
         "{}/{}",
-        get_vendor_name(),
+        vendor.root,
         normalize_path_for_buck(
             bin_target
                 .src_path
@@ -118,9 +123,10 @@ pub(super) fn emit_rust_test(
     buckal_name: &str,
     ctx: &BuckalContext,
 ) -> RustTest {
+    let vendor = vendor_ref(node);
     let mut rust_test = RustTest {
         name: buckal_name.to_owned(),
-        srcs: Set::from([get_vendor_target()]),
+        srcs: Set::from([vendor.label.clone()]),
         crate_name: test_target.name.to_owned().replace("-", "_"),
         edition: node.edition.to_string(),
         features: Set::from_iter(node.features.iter().map(|f| f.to_string())),
@@ -132,7 +138,7 @@ pub(super) fn emit_rust_test(
     // Set the crate root path
     rust_test.crate_root = format!(
         "{}/{}",
-        get_vendor_name(),
+        vendor.root,
         normalize_path_for_buck(
             test_target
                 .src_path
@@ -161,10 +167,11 @@ pub(super) fn emit_buildscript_build(
     manifest_dir: &Utf8PathBuf,
     ctx: &BuckalContext,
 ) -> RustBinary {
+    let vendor = vendor_ref(node);
     // create the build script rule
     let mut buildscript_build = RustBinary {
         name: build_target.name.to_owned(),
-        srcs: Set::from([get_vendor_target()]),
+        srcs: Set::from([vendor.label.clone()]),
         crate_name: build_target.name.to_owned().replace("-", "_"),
         edition: node.edition.to_string(),
         features: Set::from_iter(node.features.iter().map(|f| f.to_string())),
@@ -175,7 +182,7 @@ pub(super) fn emit_buildscript_build(
     // Set the crate root path for the build script
     buildscript_build.crate_root = format!(
         "{}/{}",
-        get_vendor_name(),
+        vendor.root,
         normalize_path_for_buck(
             build_target
                 .src_path
@@ -209,6 +216,7 @@ pub(super) fn emit_buildscript_run(
 ) -> BuildscriptRun {
     // create the build script run rule
     let build_name = get_build_name(&build_target.name);
+    let vendor = vendor_ref(node);
     let mut buildscript_run = BuildscriptRun {
         name: format!("{}-run", build_name),
         package_name: node.name.to_string(),
@@ -216,7 +224,7 @@ pub(super) fn emit_buildscript_run(
         env_srcs: Set::from([":manifest[env_dict]".to_owned()]),
         features: Set::from_iter(node.features.iter().map(|f| f.to_string())),
         version: node.version.to_string(),
-        manifest_dir: get_vendor_target(),
+        manifest_dir: vendor.label.clone(),
         visibility: Set::from(["PUBLIC".to_owned()]),
         ..Default::default()
     };
@@ -318,10 +326,17 @@ pub(super) fn emit_git_fetch(node: &BuckalNode) -> GitFetch {
     git_repo.set_fragment(None);
     git_repo.set_query(None);
 
+    let mut sub_targets = Set::new();
+    if let Some(layout) = git_checkout_layout(manifest_dir_of(node)) {
+        sub_targets.extend(layout.subdir);
+        sub_targets.extend(layout.workspace_manifest);
+    }
+
     GitFetch {
         name: get_vendor_name().to_string(),
         repo: git_repo.to_string(),
         rev: source_id.url().fragment().unwrap().to_string(),
+        sub_targets,
     }
 }
 
@@ -343,10 +358,11 @@ pub(super) fn emit_cargo_manifest(node: &BuckalNode, ctx: &BuckalContext) -> Car
             .into(),
         }
     } else {
+        let vendor = vendor_ref(node);
         CargoManifest {
             name: "manifest".to_owned(),
-            vendor: get_vendor_target(),
-            workspace: None,
+            vendor: vendor.label,
+            workspace: vendor.workspace_manifest,
         }
     }
 }
@@ -383,9 +399,220 @@ fn get_vendor_target() -> String {
     format!(":{}", get_vendor_name())
 }
 
+/// Where a package's sources are found relative to its BUCK file.
+#[derive(Debug, PartialEq)]
+pub(super) struct VendorRef {
+    /// Label of the package directory: `:vendor`, or `:vendor[<subdir>]` for a crate that lives
+    /// in a subdirectory of a fetched git repository.
+    pub label: String,
+    /// Path of the package directory inside the rule's sources, used as the `crate_root` prefix.
+    pub root: String,
+    /// Label of the enclosing workspace manifest a git crate inherits keys from, if any.
+    pub workspace_manifest: Option<String>,
+}
+
+/// The vendored location of `node`'s package directory.
+///
+/// Registry archives and first-party packages are the `vendor` target itself. A git
+/// dependency may live in a subdirectory of its repository (e.g. `crates/foo` of a
+/// multi-crate workspace); its `vendor` git_fetch then exposes that subdirectory and the
+/// enclosing workspace manifest as sub-targets, and every rule refers to those.
+pub(super) fn vendor_ref(node: &BuckalNode) -> VendorRef {
+    let is_git = node
+        .source
+        .as_deref()
+        .is_some_and(|source| source.starts_with("git+"));
+    let layout = if is_git {
+        git_checkout_layout(manifest_dir_of(node))
+    } else {
+        None
+    };
+    vendor_ref_for_layout(layout)
+}
+
+fn vendor_ref_for_layout(layout: Option<GitLayout>) -> VendorRef {
+    let name = get_vendor_name();
+    let layout = layout.unwrap_or_default();
+    let workspace_manifest = layout
+        .workspace_manifest
+        .map(|path| format!(":{name}[{path}]"));
+    match layout.subdir {
+        Some(subdir) => VendorRef {
+            label: format!(":{name}[{subdir}]"),
+            root: format!("{name}/{subdir}"),
+            workspace_manifest,
+        },
+        None => VendorRef {
+            label: get_vendor_target(),
+            root: name.to_string(),
+            workspace_manifest,
+        },
+    }
+}
+
+fn manifest_dir_of(node: &BuckalNode) -> &Utf8Path {
+    node.manifest_path
+        .parent()
+        .expect("manifest path has a parent directory")
+}
+
+/// Position of a git dependency inside its Cargo checkout.
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct GitLayout {
+    /// Package directory relative to the repository root; `None` at the root.
+    pub subdir: Option<String>,
+    /// Workspace manifest (relative to the repository root) that encloses the package and
+    /// that it may inherit `workspace = true` keys from; `None` if there is none or the
+    /// package is its own workspace root.
+    pub workspace_manifest: Option<String>,
+}
+
+/// Locate `manifest_dir` inside the Cargo git checkout that contains it.
+///
+/// Cargo marks the root of every git checkout with `.cargo-ok` (and keeps the `.git`
+/// directory there). Returns `None` when no checkout root is found above `manifest_dir`.
+pub(super) fn git_checkout_layout(manifest_dir: &Utf8Path) -> Option<GitLayout> {
+    let checkout_root = manifest_dir
+        .ancestors()
+        .find(|dir| dir.join(".cargo-ok").exists() || dir.join(".git").exists())?;
+    let relative = |dir: &Utf8Path| -> String {
+        normalize_path_for_buck(
+            dir.strip_prefix(checkout_root)
+                .expect("ancestor of the manifest directory")
+                .as_str(),
+        )
+    };
+
+    let subdir = Some(relative(manifest_dir)).filter(|path| !path.is_empty());
+
+    let workspace_manifest = if is_workspace_root(&manifest_dir.join("Cargo.toml")) {
+        None
+    } else {
+        manifest_dir
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| dir.starts_with(checkout_root))
+            .map(|dir| dir.join("Cargo.toml"))
+            .find(|manifest| is_workspace_root(manifest))
+            .map(|manifest| relative(&manifest))
+    };
+
+    Some(GitLayout {
+        subdir,
+        workspace_manifest,
+    })
+}
+
+fn is_workspace_root(manifest: &Utf8Path) -> bool {
+    std::fs::read_to_string(manifest)
+        .ok()
+        .and_then(|content| content.parse::<toml::Table>().ok())
+        .is_some_and(|table| table.contains_key("workspace"))
+}
+
 /// Normalize a path for Buck by converting backslashes to forward slashes.
 /// This normalization is critical on Windows, where paths use backslashes,
 /// as Buck2 requires forward slashes in all generated BUCK files regardless of the host platform.
 fn normalize_path_for_buck(path: &str) -> String {
     path.replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(path: &Utf8Path, content: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    /// A Cargo git checkout: `.cargo-ok` marker, workspace manifest at the root,
+    /// member crate in `crates/foo`.
+    fn checkout() -> (tempfile::TempDir, Utf8PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        write(&root.join(".cargo-ok"), "");
+        write(
+            &root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\n[workspace.package]\nversion = \"1.2.3\"\n",
+        );
+        write(
+            &root.join("crates/foo/Cargo.toml"),
+            "[package]\nname = \"foo\"\nversion.workspace = true\n",
+        );
+        (dir, root)
+    }
+
+    #[test]
+    fn test_git_layout_crate_in_subdirectory() {
+        let (_dir, root) = checkout();
+        let layout = git_checkout_layout(&root.join("crates/foo")).unwrap();
+        assert_eq!(
+            layout,
+            GitLayout {
+                subdir: Some("crates/foo".to_owned()),
+                workspace_manifest: Some("Cargo.toml".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_git_layout_crate_at_repository_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        write(&root.join(".cargo-ok"), "");
+        write(&root.join("Cargo.toml"), "[package]\nname = \"bar\"\n");
+        assert_eq!(git_checkout_layout(&root), Some(GitLayout::default()));
+    }
+
+    #[test]
+    fn test_git_layout_crate_that_is_its_own_workspace() {
+        let (_dir, root) = checkout();
+        write(
+            &root.join("crates/solo/Cargo.toml"),
+            "[package]\nname = \"solo\"\n[workspace]\n",
+        );
+        let layout = git_checkout_layout(&root.join("crates/solo")).unwrap();
+        assert_eq!(layout.subdir.as_deref(), Some("crates/solo"));
+        assert_eq!(layout.workspace_manifest, None);
+    }
+
+    #[test]
+    fn test_git_layout_without_checkout_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_path_buf()).unwrap();
+        write(
+            &root.join("crates/foo/Cargo.toml"),
+            "[package]\nname = \"foo\"\n",
+        );
+        assert_eq!(git_checkout_layout(&root.join("crates/foo")), None);
+    }
+
+    #[test]
+    fn test_vendor_ref_for_subdirectory_crate() {
+        let vendor = vendor_ref_for_layout(Some(GitLayout {
+            subdir: Some("crates/foo".to_owned()),
+            workspace_manifest: Some("Cargo.toml".to_owned()),
+        }));
+        assert_eq!(
+            vendor,
+            VendorRef {
+                label: ":vendor[crates/foo]".to_owned(),
+                root: "vendor/crates/foo".to_owned(),
+                workspace_manifest: Some(":vendor[Cargo.toml]".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn test_vendor_ref_default() {
+        assert_eq!(
+            vendor_ref_for_layout(None),
+            VendorRef {
+                label: ":vendor".to_owned(),
+                root: "vendor".to_owned(),
+                workspace_manifest: None,
+            }
+        );
+    }
 }

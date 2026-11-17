@@ -75,6 +75,10 @@ pub struct GitFetch {
     pub name: String,
     pub repo: String,
     pub rev: String,
+    /// Paths inside the fetched work tree exposed as `:name[path]` sub-targets
+    /// (the prelude `git_fetch` attribute of the same name).
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub sub_targets: Set<String>,
 }
 
 #[derive(Serialize, Default, Debug, PartialEq, Clone)]
@@ -806,7 +810,13 @@ impl GitFetch {
         let name = kwargs.get_str("name")?;
         let repo = kwargs.get_str("repo")?;
         let rev = kwargs.get_str("rev")?;
-        Ok(GitFetch { name, repo, rev })
+        let sub_targets = kwargs.get_list("sub_targets");
+        Ok(GitFetch {
+            name,
+            repo,
+            rev,
+            sub_targets,
+        })
     }
 }
 
@@ -1528,6 +1538,7 @@ mod tests {
                 name: "vendor".to_string(),
                 repo: "https://github.com/web3infra-foundation/git-internal.git".to_string(),
                 rev: "65b910d7571f36aa231958992e005a7a1c0838e9".to_string(),
+                sub_targets: Set::new(),
             }),
             Rule::CargoManifest(CargoManifest {
                 name: "manifest".to_string(),
@@ -1689,6 +1700,7 @@ mod tests {
             name: "example_repo".to_string(),
             repo: "https://example.com/repo.git".to_string(),
             rev: "abcdef1234567890".to_string(),
+            sub_targets: Set::new(),
         });
         let actual = rules
             .get(&rule_map_key(&expected))
@@ -1696,6 +1708,27 @@ mod tests {
         assert_eq!(
             actual, &expected,
             "parsed git_fetch rule should match expected"
+        );
+    }
+
+    /// Test that `git_fetch` sub-targets survive a parse and re-serialize round trip.
+    #[test]
+    fn test_parsing_git_fetch_sub_targets() {
+        let path = get_test_file("git_fetch_sub_targets.BUCK");
+        let rules = parse_buck_file(path.clone()).expect("parse should succeed");
+        let expected = Rule::GitFetch(GitFetch {
+            name: "vendor".to_string(),
+            repo: "https://github.com/emchristiansen/rig".to_string(),
+            rev: "6871da91c889479c679951aad12d5f367152b01a".to_string(),
+            sub_targets: Set::from(["Cargo.toml".to_string(), "crates/rig-core".to_string()]),
+        });
+        let actual = rules
+            .get(&rule_map_key(&expected))
+            .expect("git_fetch rule should be present");
+        assert_eq!(actual, &expected);
+        assert_eq!(
+            serde_starlark::to_string(&expected).unwrap(),
+            std::fs::read_to_string(path).unwrap()
         );
     }
 
