@@ -574,6 +574,7 @@ fn test_patch_redirects_generated_dependency_label() {
     let base_ctx = BuckalContext {
         workspace_members: None,
         host_platform_differences: None,
+        host_platform_difference_digests: None,
         root: Some(old_crate.package_id.clone()),
         resolve,
         workspace_root,
@@ -603,6 +604,7 @@ fn test_patch_redirects_generated_dependency_label() {
     let patched_ctx = BuckalContext {
         workspace_members: None,
         host_platform_differences: None,
+        host_platform_difference_digests: None,
         repo_config: RepoConfig {
             patch: RepoPatchConfig {
                 version: [(

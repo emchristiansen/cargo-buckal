@@ -649,6 +649,7 @@ mod tests {
         let ctx = BuckalContext {
             workspace_members: None,
             host_platform_differences: None,
+            host_platform_difference_digests: None,
             root: Some(package_id),
             resolve,
             workspace_root: tmp_path.clone(),

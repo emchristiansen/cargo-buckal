@@ -171,6 +171,10 @@ pub struct BuckalCache {
     /// without `feature_platforms`, and in a cache written before it was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     host_platform_differences: Option<Vec<String>>,
+    /// A digest of each recorded entry's resolution (see
+    /// `BuckalContext::host_platform_difference_digests`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_platform_difference_digests: Option<BTreeMap<String, String>>,
 }
 
 impl BuckalCache {
@@ -261,6 +265,7 @@ impl BuckalCache {
             fixup_rustc_flags,
             fixups: Some(fixups.clone()),
             host_platform_differences: None,
+            host_platform_difference_digests: None,
         }
     }
 
@@ -274,13 +279,26 @@ impl BuckalCache {
             fixup_rustc_flags: BTreeMap::new(),
             fixups: None,
             host_platform_differences: None,
+            host_platform_difference_digests: None,
         }
     }
 
     /// Record the host compilations that resolve differently per platform.
-    pub fn with_host_platform_differences(mut self, differences: Option<Vec<String>>) -> Self {
+    pub fn with_host_platform_differences(
+        mut self,
+        differences: Option<Vec<String>>,
+        digests: Option<BTreeMap<String, String>>,
+    ) -> Self {
         self.host_platform_differences = differences;
+        self.host_platform_difference_digests = digests;
         self
+    }
+
+    /// The recorded digests of the entries' resolutions, if recorded.
+    pub fn host_platform_difference_digests(&self) -> Option<&BTreeMap<String, String>> {
+        self.recorded
+            .then_some(self.host_platform_difference_digests.as_ref())
+            .flatten()
     }
 
     /// The recorded host compilations that resolve differently per platform, if

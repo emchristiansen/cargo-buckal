@@ -3238,3 +3238,52 @@ fn test_a_cargo_metadata_failure_is_an_error_not_a_panic() {
     assert!(stderr.contains("cargo metadata"), "{stderr}");
     assert!(stderr.contains("no_such_feature"), "{stderr}");
 }
+
+#[test]
+fn test_host_differences_guard_compares_resolutions() {
+    // Fable 193510c4 P3: the guard compared names only. `pm` stays on the list,
+    // but how it differs changes (wasm32 now enables `v` instead of `w`): the
+    // record keeps each entry's resolution, so the change stops generation.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"app\", \"pm\"]\n",
+    );
+    let app = |wasm_feature: &str| {
+        manifest(
+            "app",
+            &format!(
+                "[target.'cfg(not(target_arch = \"wasm32\"))'.dependencies]\npm = {{ path = \"../pm\", features = [\"f\"] }}\n\
+                 [target.'cfg(target_arch = \"wasm32\")'.dependencies]\npm = {{ path = \"../pm\", features = [\"{wasm_feature}\"] }}\n"
+            ),
+        )
+    };
+    write(&f.ws.join("app/Cargo.toml"), &app("w"));
+    write(&f.ws.join("app/src/lib.rs"), "");
+    write(
+        &f.ws.join("pm/Cargo.toml"),
+        &manifest(
+            "pm",
+            "[lib]\nproc-macro = true\n[features]\nf = []\nw = []\nv = []\n",
+        ),
+    );
+    write(&f.ws.join("pm/src/lib.rs"), "");
+    write(
+        &f.ws.join("buckal.toml"),
+        BUCKAL_TOML.split("[fixups.extra]").next().unwrap(),
+    );
+    f.migrate(&[]);
+    let snap = f.ws.join("buckal.snap");
+    let cache = std::fs::read_to_string(&snap).unwrap();
+    write(&f.ws.join("app/Cargo.toml"), &app("v"));
+    let pm_before = f.buck("pm");
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("~ pm v0.1.0 (host-only)"), "{stderr}");
+    assert_eq!(f.buck("pm"), pm_before);
+    assert_eq!(std::fs::read_to_string(&snap).unwrap(), cache);
+    f.migrate(&["--accept-host-differences"]);
+    assert!(f.buck("pm").contains("\"v\""), "{}", f.buck("pm"));
+    f.migrate(&[]);
+}

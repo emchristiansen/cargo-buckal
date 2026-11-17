@@ -8,7 +8,9 @@ use crate::{
     buckal_error, buckal_warn,
     cache::BuckalCache,
     config::RepoConfig,
-    platform_features::{host_resolutions_differing_by_platform, resolve_platform_features},
+    platform_features::{
+        EdgeRole, host_resolutions_differing_by_platform, resolve_platform_features,
+    },
     resolve::{BuckalNode, BuckalResolve, NodeKind},
     utils::{UnwrapOrExit, get_buck2_root},
 };
@@ -33,6 +35,10 @@ pub struct BuckalContext {
     /// sorted; `None` without `feature_platforms`. The emission record keeps it,
     /// and a change stops the next generation unless it is accepted.
     pub host_platform_differences: Option<Vec<String>>,
+    /// For each entry of `host_platform_differences`, a digest of its resolution
+    /// (features and normal and build dependencies, by name and version, per
+    /// platform), so that a change in how an entry differs is caught too.
+    pub host_platform_difference_digests: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl BuckalContext {
@@ -105,6 +111,7 @@ impl BuckalContext {
         .unwrap_or_exit_ctx("failed to resolve dependency graph");
 
         let mut host_platform_differences = None;
+        let mut host_platform_difference_digests = None;
         if !repo_config.feature_platforms.is_empty() {
             let per_platform = resolve_platform_features(
                 manifest_path.as_deref(),
@@ -114,25 +121,63 @@ impl BuckalContext {
             )
             .unwrap_or_exit_ctx("failed to resolve per-platform features");
             let differing = host_resolutions_differing_by_platform(&per_platform);
-            let names: Vec<String> = differing
+            let entries: Vec<(String, String)> = differing
                 .iter()
                 .map(|(id, suffix)| {
                     let name = packages_map
                         .get(id)
                         .map(|p| format!("{} v{}", p.name, p.version))
                         .unwrap_or_else(|| id.repr.clone());
-                    format!(
+                    let entry = format!(
                         "{name} ({}{suffix})",
                         if suffix.is_empty() {
                             "host-only"
                         } else {
                             "variant "
                         }
-                    )
+                    );
+                    let resolution = &per_platform[id];
+                    let (features, deps) = match *suffix {
+                        "-host" => resolution
+                            .host_variant
+                            .as_ref()
+                            .map(|h| (&h.features, &h.deps)),
+                        "-test-host" => resolution
+                            .test_host_variant
+                            .as_ref()
+                            .map(|h| (&h.features, &h.deps)),
+                        _ => Some((&resolution.features, &resolution.deps)),
+                    }
+                    .expect("a differing host compilation has a resolution");
+                    let named = |dep: &String| {
+                        packages_map
+                            .get(&PackageId { repr: dep.clone() })
+                            .map(|p| format!("{}@{}", p.name, p.version))
+                            .unwrap_or_else(|| dep.clone())
+                    };
+                    let shape: std::collections::BTreeMap<&String, _> = features
+                        .iter()
+                        .map(|(platform, on)| {
+                            let edges = |role: EdgeRole| -> std::collections::BTreeSet<String> {
+                                deps.role(role)
+                                    .get(platform)
+                                    .map(|d| d.iter().map(named).collect())
+                                    .unwrap_or_default()
+                            };
+                            (
+                                platform,
+                                (on, edges(EdgeRole::Normal), edges(EdgeRole::Build)),
+                            )
+                        })
+                        .collect();
+                    let digest =
+                        blake3::hash(&serde_json::to_vec(&shape).expect("a resolution serializes"));
+                    (entry, digest.to_hex().to_string())
                 })
                 .collect();
-            let mut names = names;
+            let mut names: Vec<String> = entries.iter().map(|(name, _)| name.clone()).collect();
             names.sort();
+            host_platform_difference_digests = Some(entries.into_iter().collect());
             if !names.is_empty() {
                 buckal_warn!(format!(
                     "{} host compilation(s) resolve differently per configured platform: {}. Buck configures host compilations in the execution platform, so their `platform` attribute selects the execution platform's resolution for every target; the other platforms' host features and dependencies are not built as Cargo plans them",
@@ -155,6 +200,7 @@ impl BuckalContext {
             resolve,
             workspace_members,
             host_platform_differences,
+            host_platform_difference_digests,
             workspace_root: cargo_metadata.workspace_root.clone(),
             workspace_inherit,
             no_merge: false,
@@ -170,7 +216,10 @@ impl BuckalContext {
             &self.workspace_root,
             &self.repo_config,
         )
-        .with_host_platform_differences(self.host_platform_differences.clone())
+        .with_host_platform_differences(
+            self.host_platform_differences.clone(),
+            self.host_platform_difference_digests.clone(),
+        )
     }
 
     /// Stop, writing nothing, when the host compilations that resolve differently
@@ -187,7 +236,19 @@ impl BuckalContext {
         let Some(previous) = recorded.host_platform_differences() else {
             return;
         };
-        if previous == current.as_slice() || accept {
+        // Entries on both lists whose resolution changed (when both record it).
+        let changed: Vec<&String> = match (
+            recorded.host_platform_difference_digests(),
+            &self.host_platform_difference_digests,
+        ) {
+            (Some(before), Some(now)) => current
+                .iter()
+                .filter(|name| previous.contains(name))
+                .filter(|name| before.get(*name) != now.get(*name))
+                .collect(),
+            _ => Vec::new(),
+        };
+        if previous == current.as_slice() && changed.is_empty() || accept {
             return;
         }
         let mut lines: Vec<String> = previous
@@ -200,6 +261,11 @@ impl BuckalContext {
                 .iter()
                 .filter(|name| !previous.contains(name))
                 .map(|name| format!("  + {name}")),
+        );
+        lines.extend(
+            changed
+                .iter()
+                .map(|name| format!("  ~ {name} (its resolution changed)")),
         );
         buckal_error!(format!(
             "the host compilations that resolve differently per configured platform changed since the recorded generation (Buck builds each in the execution platform's resolution only):\n{}\nReview them, then run `cargo buckal migrate --accept-host-differences` to accept and record the new list.",
@@ -291,6 +357,7 @@ mod tests {
         BuckalContext {
             workspace_members: None,
             host_platform_differences: None,
+            host_platform_difference_digests: None,
             root: None,
             resolve,
             workspace_root: Utf8PathBuf::from("/tmp"),
