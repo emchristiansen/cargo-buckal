@@ -304,6 +304,14 @@ fn platform_compatibility(
 /// The files of a package, relative to it (a glob does not enter nested Buck packages).
 const PACKAGE_FILES_GLOB: &str = "**/**";
 
+/// The crate name of the build script binary `name`: `-` and the `.` of a wasm
+/// variant's module key (`build-script-wasm-<package>.<variant>-build`) become `_`,
+/// as rustc accepts only an identifier. Two build scripts of a package that this
+/// gives one crate name are refused when the BUCK file is written.
+fn build_script_crate_name(name: &str) -> String {
+    name.replace(['-', '.'], "_")
+}
+
 /// Emit `buildscript_build` rule for the given build target
 pub(super) fn emit_buildscript_build(
     build_target: &BuckalTarget,
@@ -317,7 +325,7 @@ pub(super) fn emit_buildscript_build(
     let mut buildscript_build = RustBinary {
         name: build_target.name.to_owned(),
         srcs: vendor.srcs.clone(),
-        crate_name: build_target.name.to_owned().replace("-", "_"),
+        crate_name: build_script_crate_name(&build_target.name),
         edition: node.edition.to_string(),
         features,
         platform,

@@ -4787,6 +4787,100 @@ fn test_a_name_generation_emits_twice_is_refused() {
     assert!(!f.ws.join("module/BUCK").exists());
 }
 
+/// The `crate = "..."` values of the BUCK file `content`.
+fn crate_names(content: &str) -> Vec<&str> {
+    content
+        .lines()
+        .filter_map(|line| line.strip_prefix("    crate = \"")?.strip_suffix("\","))
+        .collect()
+}
+
+#[test]
+fn test_a_variant_build_script_has_a_valid_crate_name() {
+    // The variant `test-harness` of `module` names its build script rules
+    // `build-script-wasm-module.test-harness-{build,run}`; the crate name of the
+    // build script must be a Rust identifier (rustc refuses
+    // `build_script_wasm_module.test_harness_build`).
+    let f = wasm_test_env_fixture(
+        "[package.metadata.buck2.wasm-variants.test-harness]\nfeatures = [\"admission\"]\n",
+        "H = { wasm = \"module\", variant = \"test-harness\" }\n",
+    );
+    write(&f.ws.join("module/build.rs"), "fn main() {}\n");
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let module = f.buck("module");
+    let build = rule(&module, "build-script-wasm-module.test-harness-build");
+    assert!(
+        build.contains("    crate = \"build_script_wasm_module_test_harness_build\",\n"),
+        "{build}"
+    );
+    // The base module's build script keeps its name.
+    assert!(
+        rule(&module, "build-script-wasm-module-build")
+            .contains("    crate = \"build_script_wasm_module_build\",\n"),
+        "{module}"
+    );
+    let names = crate_names(&module);
+    assert!(!names.is_empty(), "{module}");
+    for name in names {
+        assert!(
+            name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                && !name.starts_with(|c: char| c.is_ascii_digit()),
+            "`{name}` is no Rust identifier: {module}"
+        );
+    }
+}
+
+#[test]
+fn test_build_scripts_sharing_a_crate_name_are_refused() {
+    // The modules `a.b-c` (package `a`, variant `b-c`) and `a-b.c` (package
+    // `a-b`, variant `c`) both build `d`, whose build scripts
+    // `build-script-wasm-a.b-c-build` and `build-script-wasm-a-b.c-build` would
+    // share the crate name `build_script_wasm_a_b_c_build`. Generation refuses
+    // that rather than emit two build scripts one crate name.
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"a\", \"a-b\", \"d\"]\n",
+    );
+    for (name, variant) in [("a", "b-c"), ("a-b", "c")] {
+        write(
+            &f.ws.join(name).join("Cargo.toml"),
+            &manifest(
+                name,
+                &format!(
+                    "[lib]\ncrate-type = [\"cdylib\", \"rlib\"]\n[features]\nv = []\n\
+                     [dependencies]\nd = {{ path = \"../d\" }}\n\
+                     [package.metadata.buck2.wasm]\nfeatures = []\nprofile = \"release\"\n\
+                     [package.metadata.buck2.wasm-variants.{variant}]\nfeatures = [\"v\"]\n"
+                ),
+            ),
+        );
+        write(&f.ws.join(name).join("src/lib.rs"), "");
+    }
+    write(&f.ws.join("d/Cargo.toml"), &manifest("d", ""));
+    write(&f.ws.join("d/src/lib.rs"), "");
+    write(&f.ws.join("d/build.rs"), "fn main() {}\n");
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!(
+            "{}\n[wasm]\npackages = [\"a\", \"a-b\"]\nplatform = \"root//buck2/platforms/wasm:wasm32_unknown_unknown\"\n",
+            BUCKAL_TOML.split("[fixups.extra]").next().unwrap()
+        ),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "generation emits two build scripts with the crate name `build_script_wasm_a_b_c_build` (`build-script-wasm-a-b.c-build` and `build-script-wasm-a.b-c-build`)"
+        ),
+        "{stderr}"
+    );
+    assert!(!f.ws.join("d/BUCK").exists());
+}
+
 #[test]
 fn test_a_variant_is_named_only_by_its_variant_key() {
     // Fable on 4b76a20a: `{ wasm = "module.harness" }` is not another spelling
