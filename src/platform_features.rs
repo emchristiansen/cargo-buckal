@@ -35,22 +35,133 @@ use anyhow::{Context, Result, bail};
 use cargo_metadata::{Package, PackageId};
 use serde::{Deserialize, Serialize};
 
-/// The prelude `platform` attribute: `{platform name: {attribute: values}}`.
-pub type PlatformAttrs = BTreeMap<String, BTreeMap<String, BTreeSet<String>>>;
+/// One value of the prelude's `platform` attribute: a list (`features`, `deps`) or a
+/// dict (`named_deps`, alias to label).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum PlatformValue {
+    List(BTreeSet<String>),
+    Dict(BTreeMap<String, String>),
+}
+
+impl PlatformValue {
+    /// The list, if this is one.
+    pub fn as_list(&self) -> Option<&BTreeSet<String>> {
+        match self {
+            PlatformValue::List(list) => Some(list),
+            PlatformValue::Dict(_) => None,
+        }
+    }
+
+    /// The dict, if this is one.
+    pub fn as_dict(&self) -> Option<&BTreeMap<String, String>> {
+        match self {
+            PlatformValue::Dict(dict) => Some(dict),
+            PlatformValue::List(_) => None,
+        }
+    }
+}
+
+/// The prelude `platform` attribute: `{platform name: {attribute: value}}`.
+pub type PlatformAttrs = BTreeMap<String, BTreeMap<String, PlatformValue>>;
+
+/// The list `attr` of `platform` in `attrs`, created if absent.
+pub fn platform_list_mut<'a>(
+    attrs: &'a mut PlatformAttrs,
+    platform: &str,
+    attr: &str,
+) -> &'a mut BTreeSet<String> {
+    let value = attrs
+        .entry(platform.to_owned())
+        .or_default()
+        .entry(attr.to_owned())
+        .or_insert_with(|| PlatformValue::List(BTreeSet::new()));
+    match value {
+        PlatformValue::List(list) => list,
+        PlatformValue::Dict(_) => panic!("platform attribute `{attr}` is a dict, not a list"),
+    }
+}
+
+/// The dict `attr` of `platform` in `attrs`, created if absent.
+pub fn platform_dict_mut<'a>(
+    attrs: &'a mut PlatformAttrs,
+    platform: &str,
+    attr: &str,
+) -> &'a mut BTreeMap<String, String> {
+    let value = attrs
+        .entry(platform.to_owned())
+        .or_default()
+        .entry(attr.to_owned())
+        .or_insert_with(|| PlatformValue::Dict(BTreeMap::new()));
+    match value {
+        PlatformValue::Dict(dict) => dict,
+        PlatformValue::List(_) => panic!("platform attribute `{attr}` is a list, not a dict"),
+    }
+}
 
 /// Platform name -> enabled features.
 pub type FeaturesByPlatform = BTreeMap<String, BTreeSet<String>>;
 /// Platform name -> package ids (`PackageId::repr`) of the dependencies there.
 pub type DepsByPlatform = BTreeMap<String, BTreeSet<String>>;
 
+/// Which of a package's compilations a dependency edge belongs to. Cargo activates
+/// each kind of edge separately: an optional normal dependency can be off where the
+/// same package is a build dependency, and the reverse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeRole {
+    /// The library and binaries.
+    Normal,
+    /// The build script.
+    Build,
+    /// Tests and examples (normal and dev-dependencies).
+    Dev,
+}
+
+/// A package's dependency edges per platform, by role.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Edges {
+    pub normal: DepsByPlatform,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub build: DepsByPlatform,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub dev: DepsByPlatform,
+}
+
+impl Edges {
+    pub fn role(&self, role: EdgeRole) -> &DepsByPlatform {
+        match role {
+            EdgeRole::Normal => &self.normal,
+            EdgeRole::Build => &self.build,
+            EdgeRole::Dev => &self.dev,
+        }
+    }
+
+    fn role_mut(&mut self, role: EdgeRole) -> &mut DepsByPlatform {
+        match role {
+            EdgeRole::Normal => &mut self.normal,
+            EdgeRole::Build => &mut self.build,
+            EdgeRole::Dev => &mut self.dev,
+        }
+    }
+
+    /// Every dependency, of any role on any platform.
+    pub fn all(&self) -> impl Iterator<Item = &String> {
+        [&self.normal, &self.build, &self.dev]
+            .into_iter()
+            .flat_map(|by_platform| by_platform.values().flatten())
+    }
+}
+
 /// What Cargo resolves for one package on each configured platform where it is built.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlatformResolution {
     /// Features of the package's rules, per platform: the target context where the
-    /// package is built for the target, else the host context.
+    /// package is built for the target, else the host context. Its keys are the
+    /// platforms the package is built on.
     pub features: FeaturesByPlatform,
-    /// Dependencies of the package's rules, per platform, in the same context.
-    pub deps: DepsByPlatform,
+    /// Dependency edges of the package's rules, per platform and role, in the same
+    /// context.
+    pub deps: Edges,
     /// The package is built for the host only (a proc-macro, a build dependency or
     /// below one), so its rules are host-context rules.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -69,22 +180,28 @@ pub struct PlatformResolution {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostVariant {
     pub features: FeaturesByPlatform,
-    pub deps: DepsByPlatform,
+    pub deps: Edges,
 }
 
 impl PlatformResolution {
     pub fn is_empty(&self) -> bool {
-        self.features.is_empty() && self.deps.is_empty()
+        self.features.is_empty()
     }
 
-    /// The configured platforms on which this package depends on `dep`, or `None`
-    /// when there is no per-platform data.
-    pub fn platforms_with_dep(&self, dep: &PackageId) -> Option<BTreeSet<&str>> {
-        if self.deps.is_empty() {
+    /// The configured platforms on which this package is built.
+    pub fn platforms(&self) -> BTreeSet<&str> {
+        self.features.keys().map(String::as_str).collect()
+    }
+
+    /// The configured platforms on which this package's `role` compilation depends on
+    /// `dep`, or `None` when there is no per-platform data.
+    pub fn platforms_with_dep(&self, dep: &PackageId, role: EdgeRole) -> Option<BTreeSet<&str>> {
+        if self.is_empty() {
             return None;
         }
         Some(
             self.deps
+                .role(role)
                 .iter()
                 .filter(|(_, deps)| deps.contains(&dep.repr))
                 .map(|(platform, _)| platform.as_str())
@@ -111,7 +228,7 @@ pub type PlatformFeatures = HashMap<PackageId, PlatformResolution>;
 #[derive(Debug, Default, Clone, PartialEq)]
 struct ContextResolution {
     features: FeaturesByPlatform,
-    deps: DepsByPlatform,
+    deps: Edges,
 }
 
 impl ContextResolution {
@@ -141,7 +258,15 @@ pub fn resolve_platform_features(
                 let deps = context.deps.get(&id).cloned().unwrap_or_default();
                 let entry = into.entry(id).or_default();
                 entry.features.insert(platform.clone(), features);
-                entry.deps.insert(platform.clone(), deps);
+                for role in [EdgeRole::Normal, EdgeRole::Build, EdgeRole::Dev] {
+                    let on = deps.role(role);
+                    if !on.is_empty() || role == EdgeRole::Normal {
+                        entry
+                            .deps
+                            .role_mut(role)
+                            .insert(platform.clone(), on.clone());
+                    }
+                }
             }
         }
     }
@@ -160,7 +285,9 @@ fn combine_contexts(
     let differs = |t: &ContextResolution, h: &ContextResolution| {
         h.features.iter().any(|(platform, features)| {
             t.features.get(platform) != Some(features)
-                || t.deps.get(platform) != h.deps.get(platform)
+                || [EdgeRole::Normal, EdgeRole::Build, EdgeRole::Dev]
+                    .into_iter()
+                    .any(|role| t.deps.role(role).get(platform) != h.deps.role(role).get(platform))
         })
     };
     let mut variants: BTreeSet<String> = target
@@ -176,7 +303,7 @@ fn combine_contexts(
             .filter(|id| !variants.contains(&id.repr))
             .filter(|id| {
                 host.get(*id)
-                    .is_some_and(|h| h.deps.values().flatten().any(|dep| variants.contains(dep)))
+                    .is_some_and(|h| h.deps.all().any(|dep| variants.contains(dep)))
             })
             .map(|id| id.repr.clone())
             .collect();
@@ -191,11 +318,10 @@ fn combine_contexts(
     for id in ids {
         let t = target.remove(&id).filter(|t| !t.is_empty());
         let h = host.remove(&id).filter(|h| !h.is_empty());
-        let all_deps = t
+        let host_variant_deps = t
             .iter()
             .chain(h.iter())
-            .flat_map(|c| c.deps.values().flatten());
-        let host_variant_deps = all_deps
+            .flat_map(|c| c.deps.all())
             .filter(|dep| variants.contains(*dep))
             .cloned()
             .collect();
@@ -255,14 +381,41 @@ fn run_unit_graph(manifest_path: Option<&str>, triple: &str) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?)
 }
 
+/// A package's dependencies in one context, by role (platform-independent: one
+/// unit graph is one platform).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct RoleDeps {
+    normal: BTreeSet<String>,
+    build: BTreeSet<String>,
+    dev: BTreeSet<String>,
+}
+
+impl RoleDeps {
+    pub(crate) fn role(&self, role: EdgeRole) -> &BTreeSet<String> {
+        match role {
+            EdgeRole::Normal => &self.normal,
+            EdgeRole::Build => &self.build,
+            EdgeRole::Dev => &self.dev,
+        }
+    }
+
+    fn role_mut(&mut self, role: EdgeRole) -> &mut BTreeSet<String> {
+        match role {
+            EdgeRole::Normal => &mut self.normal,
+            EdgeRole::Build => &mut self.build,
+            EdgeRole::Dev => &mut self.dev,
+        }
+    }
+}
+
 /// Features and dependencies of packages in one context.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct ContextTree {
     /// Union of the features of the package's units in this context.
     pub features: HashMap<PackageId, BTreeSet<String>>,
-    /// Dependencies (`PackageId::repr`) of the package's units in this context,
-    /// including its build script's (which are host-context packages).
-    pub deps: HashMap<PackageId, BTreeSet<String>>,
+    /// Dependencies (`PackageId::repr`) of the package's units in this context, by
+    /// role. Build dependencies are host-context packages.
+    pub deps: HashMap<PackageId, RoleDeps>,
 }
 
 #[derive(Debug, Default, PartialEq)]
@@ -307,10 +460,26 @@ impl Unit {
     fn is_build_script_compile(&self) -> bool {
         self.mode != "run-custom-build" && self.target.kind.iter().any(|k| k == "custom-build")
     }
+
+    /// The role of this unit's dependencies: tests and examples see dev-dependencies,
+    /// the library and binaries normal ones.
+    fn edge_role(&self) -> EdgeRole {
+        if self.mode == "test"
+            || self
+                .target
+                .kind
+                .iter()
+                .any(|k| k == "test" || k == "example" || k == "bench")
+        {
+            EdgeRole::Dev
+        } else {
+            EdgeRole::Normal
+        }
+    }
 }
 
 /// Parse `cargo --unit-graph` output into each package's features and dependencies
-/// per context. A unit is in the host context when it has no `platform`.
+/// per context and role. A unit is in the host context when it has no `platform`.
 /// Doc-test units are skipped. Units of packages that are not in `packages` (the
 /// `cargo metadata` resolve) are ignored.
 pub(crate) fn parse_unit_graph(
@@ -346,13 +515,14 @@ pub(crate) fn parse_unit_graph(
             .or_default()
             .extend(u.features.iter().cloned());
         let deps = context.deps.entry(id).or_default();
+        let role = u.edge_role();
         for dep in &u.dependencies {
             let v = unit(dep.index)?;
             if v.pkg_id != u.pkg_id {
                 // Another package's `run-custom-build` (its `links` metadata) comes
                 // with a dependency on that package's library, which is recorded.
                 if v.mode != "run-custom-build" {
-                    deps.insert(v.pkg_id.clone());
+                    deps.role_mut(role).insert(v.pkg_id.clone());
                 }
                 continue;
             }
@@ -363,7 +533,7 @@ pub(crate) fn parse_unit_graph(
                     let w = unit(compile.index)?;
                     if w.pkg_id == u.pkg_id && w.is_build_script_compile() {
                         for build_dep in &w.dependencies {
-                            deps.insert(unit(build_dep.index)?.pkg_id.clone());
+                            deps.build.insert(unit(build_dep.index)?.pkg_id.clone());
                         }
                     }
                 }
@@ -393,7 +563,7 @@ pub fn split_features(
             (!extra.is_empty()).then(|| {
                 (
                     name.clone(),
-                    BTreeMap::from([("features".to_owned(), extra)]),
+                    BTreeMap::from([("features".to_owned(), PlatformValue::List(extra))]),
                 )
             })
         })
@@ -515,13 +685,13 @@ fixtures = { path = "../fixtures", features = ["test_lib"] }
             .unwrap()
             .id
             .clone();
-        assert!(resolved[&sdk].deps["linux-x86_64"].is_empty());
+        assert!(resolved[&sdk].deps.normal["linux-x86_64"].is_empty());
         assert_eq!(
-            resolved[&sdk].deps["wasm32"],
+            resolved[&sdk].deps.normal["wasm32"],
             BTreeSet::from([extra.repr.clone()])
         );
         assert_eq!(
-            resolved[&sdk].platforms_with_dep(&extra),
+            resolved[&sdk].platforms_with_dep(&extra, EdgeRole::Normal),
             Some(BTreeSet::from(["wasm32"]))
         );
 
@@ -531,7 +701,10 @@ fixtures = { path = "../fixtures", features = ["test_lib"] }
             platform,
             BTreeMap::from([(
                 "wasm32".to_owned(),
-                BTreeMap::from([("features".to_owned(), set(&["browser"]))])
+                BTreeMap::from([(
+                    "features".to_owned(),
+                    PlatformValue::List(set(&["browser"]))
+                )])
             )])
         );
     }
@@ -578,11 +751,17 @@ fixtures = { path = "../fixtures", features = ["test_lib"] }
         let parsed = parse_unit_graph(&graph.to_string(), &packages).expect("parse");
 
         assert_eq!(parsed.target.features[&sdk], set(&["browser", "default"]));
+        // The library's edge is a normal one; the build script's dependency is a build
+        // edge of sdk (a host-context package).
         assert_eq!(
-            parsed.target.deps[&sdk],
-            BTreeSet::from([extra.repr.clone(), fixtures.repr.clone()])
+            parsed.target.deps[&sdk].role(EdgeRole::Normal),
+            &BTreeSet::from([extra.repr.clone()])
         );
-        assert!(parsed.target.deps[&extra].is_empty());
+        assert_eq!(
+            parsed.target.deps[&sdk].role(EdgeRole::Build),
+            &BTreeSet::from([fixtures.repr.clone()])
+        );
+        assert_eq!(parsed.target.deps[&extra], RoleDeps::default());
         assert_eq!(parsed.host.features[&fixtures], set(&["test_lib"]));
         assert!(!parsed.target.features.contains_key(&fixtures));
         // The build script compile unit has no platform but is not a host package.
@@ -696,10 +875,13 @@ fixtures = { path = "../fixtures", features = ["test_lib"] }
         };
         let res = |features: &[&str], deps: &[&str]| ContextResolution {
             features: BTreeMap::from([("linux".to_owned(), set(features))]),
-            deps: BTreeMap::from([(
-                "linux".to_owned(),
-                deps.iter().map(|d| pid(d).repr).collect(),
-            )]),
+            deps: Edges {
+                normal: BTreeMap::from([(
+                    "linux".to_owned(),
+                    deps.iter().map(|d| pid(d).repr).collect(),
+                )]),
+                ..Default::default()
+            },
         };
         // `mid` resolves the same in both contexts, but depends on `json`, which does not.
         let target = HashMap::from([
@@ -718,7 +900,13 @@ fixtures = { path = "../fixtures", features = ["test_lib"] }
             mid.host_variant,
             Some(HostVariant {
                 features: BTreeMap::from([("linux".to_owned(), set(&["default"]))]),
-                deps: BTreeMap::from([("linux".to_owned(), BTreeSet::from([pid("json").repr]))]),
+                deps: Edges {
+                    normal: BTreeMap::from([(
+                        "linux".to_owned(),
+                        BTreeSet::from([pid("json").repr])
+                    )]),
+                    ..Default::default()
+                },
             })
         );
         assert!(mid.host_variant_deps.contains(&pid("json").repr));
@@ -740,6 +928,9 @@ fixtures = { path = "../fixtures", features = ["test_lib"] }
         let (common, platform) = split_features(&per_platform);
         assert_eq!(common, set(&["default", "std"]));
         assert_eq!(platform.len(), 1);
-        assert_eq!(platform["wasm32"]["features"], set(&["browser"]));
+        assert_eq!(
+            platform["wasm32"]["features"].as_list(),
+            Some(&set(&["browser"]))
+        );
     }
 }

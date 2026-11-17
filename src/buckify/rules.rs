@@ -929,8 +929,8 @@ mod tests {
             .expect("rust_library");
         assert_eq!(lib_rule.features, Set::from(["default".to_owned()]));
         assert_eq!(
-            lib_rule.platform["wasm32"]["features"],
-            Set::from(["browser".to_owned()])
+            lib_rule.platform["wasm32"]["features"].as_list(),
+            Some(&Set::from(["browser".to_owned()]))
         );
         assert!(!lib_rule.platform.contains_key("linux-x86_64"));
 
@@ -1136,10 +1136,16 @@ mod tests {
         };
         node.platform_features = crate::platform_features::PlatformResolution {
             features: linux(&["std"]),
-            deps: linux(&[]),
+            deps: crate::platform_features::Edges {
+                normal: linux(&[]),
+                ..Default::default()
+            },
             host_variant: Some(crate::platform_features::HostVariant {
                 features: linux(&["preserve_order", "std"]),
-                deps: linux(&[]),
+                deps: crate::platform_features::Edges {
+                    normal: linux(&[]),
+                    ..Default::default()
+                },
             }),
             ..Default::default()
         };

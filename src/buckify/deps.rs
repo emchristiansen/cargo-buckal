@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeSet, BTreeSet as Set},
-    path::PathBuf,
-};
+use std::{collections::BTreeSet as Set, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 
@@ -11,6 +8,7 @@ use crate::{
     buckify::actions::is_third_party,
     context::BuckalContext,
     platform::{Os, oses_from_platform, platform_is_target_only},
+    platform_features::{EdgeRole, platform_dict_mut, platform_list_mut},
     resolve::{BuckalDep, BuckalNode, BuckalTarget, is_lib_like},
     utils::{get_buck2_root, get_vendor_path_relative},
 };
@@ -226,13 +224,64 @@ pub(super) fn host_variant_name(name: &str) -> String {
     format!("{name}-host")
 }
 
+/// The role of `kind`'s dependency edges in Cargo's resolution.
+fn edge_role(kind: CargoTargetKind) -> EdgeRole {
+    match kind {
+        CargoTargetKind::CustomBuild => EdgeRole::Build,
+        CargoTargetKind::Test => EdgeRole::Dev,
+        CargoTargetKind::Lib | CargoTargetKind::Bin => EdgeRole::Normal,
+    }
+}
+
 pub(super) fn set_deps(
     rust_rule: &mut dyn RustRule,
     node: &BuckalNode,
     kind: CargoTargetKind,
     ctx: &BuckalContext,
 ) -> Result<()> {
+    let node_platforms = node.platform_features.platforms();
     for (dep, dep_node) in ctx.resolve.deps_of(&node.package_id) {
+        if !dep
+            .dep_kinds
+            .iter()
+            .any(|dk| dep_kind_matches(kind, dk.kind))
+        {
+            continue;
+        }
+
+        // With per-platform resolution, Cargo's own activated edges of this kind decide
+        // where the dependency exists, on exactly the configured platforms: an optional
+        // dependency enabled by a feature that is on for no configured platform is not
+        // built at all, one enabled on some platforms only is a dependency there only
+        // (renamed or not), and a dependency declared for a target the OS mapping below
+        // does not know (e.g. `cfg(target_arch = "wasm32")`) is kept where Cargo builds it.
+        if let Some(on) = node
+            .platform_features
+            .platforms_with_dep(&dep_node.package_id, edge_role(kind))
+        {
+            if on.is_empty() {
+                continue;
+            }
+            let (target_label, alias) = dep_label(node, kind, dep, dep_node, ctx)?;
+            if on == node_platforms {
+                insert_dep(rust_rule, &target_label, alias.as_deref(), None)?;
+            } else {
+                for platform in on {
+                    match &alias {
+                        Some(alias) => {
+                            platform_dict_mut(rust_rule.platform_mut(), platform, "named_deps")
+                                .insert(alias.clone(), target_label.clone());
+                        }
+                        None => {
+                            platform_list_mut(rust_rule.platform_mut(), platform, "deps")
+                                .insert(target_label.clone());
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
         let mut unconditional = false;
         let mut platforms = Set::<Os>::new();
         let mut has_unsupported_platform = false;
@@ -270,48 +319,35 @@ pub(super) fn set_deps(
             continue;
         }
 
-        // With per-platform resolution, Cargo's own edges decide where the dependency
-        // exists: an optional dependency enabled by a feature that is on for no
-        // configured platform is not built at all, and one enabled on some platforms
-        // only is a dependency there only.
-        let edge_platforms = node
-            .platform_features
-            .platforms_with_dep(&dep_node.package_id);
-        if edge_platforms.as_ref().is_some_and(BTreeSet::is_empty) {
-            continue;
-        }
-
-        let (mut target_label, alias) =
-            resolve_dep_label(dep, dep_node, ctx).with_context(|| {
-                format!(
-                    "failed to resolve dependency label for '{}' (package '{}')",
-                    dep.name, dep_node.name
-                )
-            })?;
-        if is_host_context(node, kind) && uses_host_variant(node, dep_node) {
-            target_label = host_variant_name(&target_label);
-        }
-
-        if let Some(on) = edge_platforms
-            && on.len() < node.platform_features.deps.len()
-            && alias.is_none()
-        {
-            for platform in on {
-                rust_rule
-                    .platform_mut()
-                    .entry(platform.to_owned())
-                    .or_default()
-                    .entry("deps".to_owned())
-                    .or_default()
-                    .insert(target_label.clone());
-            }
-        } else if unconditional {
+        let (target_label, alias) = dep_label(node, kind, dep, dep_node, ctx)?;
+        if unconditional {
             insert_dep(rust_rule, &target_label, alias.as_deref(), None)?;
         } else {
             insert_dep(rust_rule, &target_label, alias.as_deref(), Some(&platforms))?;
         }
     }
     Ok(())
+}
+
+/// The label (and alias, for a renamed dependency) that `kind` of `node` uses for
+/// `dep_node`: its host variant in a host-context rule, where it has one.
+fn dep_label(
+    node: &BuckalNode,
+    kind: CargoTargetKind,
+    dep: &BuckalDep,
+    dep_node: &BuckalNode,
+    ctx: &BuckalContext,
+) -> Result<(String, Option<String>)> {
+    let (mut target_label, alias) = resolve_dep_label(dep, dep_node, ctx).with_context(|| {
+        format!(
+            "failed to resolve dependency label for '{}' (package '{}')",
+            dep.name, dep_node.name
+        )
+    })?;
+    if is_host_context(node, kind) && uses_host_variant(node, dep_node) {
+        target_label = host_variant_name(&target_label);
+    }
+    Ok((target_label, alias))
 }
 
 #[cfg(test)]
@@ -513,7 +549,7 @@ mod tests {
         // platform enables) on neither.
         let everywhere = id("everywhere").repr;
         let wasm_only = id("wasm_only").repr;
-        parent.platform_features.deps = [
+        parent.platform_features.deps.normal = [
             ("linux-x86_64".to_owned(), Set::from([everywhere.clone()])),
             (
                 "wasm32".to_owned(),
@@ -562,14 +598,20 @@ mod tests {
             Set::from(["//third-party/rust/crates/everywhere/1.0.0:everywhere".to_owned()])
         );
         assert_eq!(
-            rule.platform["wasm32"]["deps"],
-            Set::from(["//third-party/rust/crates/wasm_only/1.0.0:wasm_only".to_owned()])
+            rule.platform["wasm32"]["deps"].as_list(),
+            Some(&Set::from([
+                "//third-party/rust/crates/wasm_only/1.0.0:wasm_only".to_owned()
+            ]))
         );
         assert!(!rule.platform.contains_key("linux-x86_64"));
         let all: Vec<_> = rule
             .deps
             .iter()
-            .chain(rule.platform.values().flat_map(|a| a.values().flatten()))
+            .chain(
+                rule.platform
+                    .values()
+                    .flat_map(|a| a.values().filter_map(|v| v.as_list()).flatten()),
+            )
             .collect();
         assert!(!all.iter().any(|label| label.contains("nowhere")));
     }
