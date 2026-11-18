@@ -4,6 +4,7 @@ mod deps;
 mod emit;
 mod includes;
 mod rules;
+pub mod tables;
 mod windows;
 
 pub use rules::{

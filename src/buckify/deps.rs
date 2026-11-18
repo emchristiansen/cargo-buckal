@@ -554,6 +554,7 @@ mod tests {
         index_map.insert(new_id, new_idx);
 
         let ctx = BuckalContext {
+            buck2_root: None,
             workspace_members: None,
             host_platform_differences: None,
             host_platform_difference_digests: None,
@@ -664,6 +665,7 @@ mod tests {
             .unwrap();
         }
         let ctx = BuckalContext {
+            buck2_root: None,
             workspace_members: None,
             host_platform_differences: None,
             host_platform_difference_digests: None,
@@ -755,6 +757,7 @@ mod tests {
         )
         .unwrap();
         let ctx = BuckalContext {
+            buck2_root: None,
             workspace_members: None,
             host_platform_differences: None,
             host_platform_difference_digests: None,

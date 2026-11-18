@@ -142,10 +142,13 @@ pub fn execute(args: &MigrateArgs) {
     changes.previous_fixups = recorded
         .as_ref()
         .and_then(BuckalCache::previous_fixups_record);
+    changes.previous_package_tables = recorded
+        .as_ref()
+        .and_then(BuckalCache::previous_package_tables_record);
 
     // Apply changes to BUCK files
-    changes.apply(&ctx);
+    let tables = changes.apply(&ctx);
 
     // Flush the new cache
-    new_cache.save();
+    new_cache.with_package_tables(tables).save();
 }
