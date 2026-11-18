@@ -3,8 +3,9 @@ use regex::Regex;
 
 use crate::{
     buck::{
-        FixupFlags, FixupSets, NamedFileGroup, PARTLY_GENERATED_HEADER, Rule, TopLevelKind,
-        is_generated_header_line, parse_buck_file, patch_buck_rules, top_level_statements,
+        FixupFlags, FixupSets, NamedFileGroup, PACKAGE_MACRO_MARKER, PARTLY_GENERATED_HEADER, Rule,
+        TopLevelKind, is_generated_header_line, parse_buck_file, patch_buck_rules,
+        top_level_statements,
     },
     buckal_error, buckal_log,
     buckify::emit::emit_export_file,
@@ -127,6 +128,14 @@ impl BuckalChange {
                                 self.previous_fixups.as_ref(),
                             );
                             let hand = hand_written(&buck_path, &owned);
+                            // A kept hand-written load already binds the macro.
+                            if hand.binds_macro {
+                                for rule in &mut buck_rules {
+                                    if let Rule::PackageMacro(m) = rule {
+                                        m.load = false;
+                                    }
+                                }
+                            }
                             // The workspace-root rules spliced into this file later.
                             let reserved = if vendor_dir == ctx.workspace_root {
                                 root_owned_names(ctx)
@@ -349,6 +358,8 @@ struct OwnedNames {
     filegroups: std::collections::BTreeSet<String>,
     exports: std::collections::BTreeSet<String>,
     emitted: std::collections::BTreeSet<String>,
+    /// The `[package_macro]` (`bzl`, `function`) generation calls in this file.
+    package_macro: Option<(String, String)>,
 }
 
 impl OwnedNames {
@@ -378,6 +389,10 @@ impl OwnedNames {
                 .filter_map(Rule::name)
                 .map(str::to_owned)
                 .collect(),
+            package_macro: rules.iter().find_map(|rule| match rule {
+                Rule::PackageMacro(m) => Some((m.bzl.clone(), m.function.clone())),
+                _ => None,
+            }),
         }
     }
 
@@ -387,6 +402,13 @@ impl OwnedNames {
     /// test-mode modules' `configured_alias`es.
     /// An owned call generation does not emit is removed, with a warning.
     fn owns(&self, function: &str, name: Option<&str>) -> bool {
+        if self
+            .package_macro
+            .as_ref()
+            .is_some_and(|(_, macro_function)| macro_function == function)
+        {
+            return true;
+        }
         match (function, name) {
             ("filegroup", Some(name)) => self.filegroups.contains(name),
             ("export_file", Some(name)) => self.exports.contains(name),
@@ -411,9 +433,42 @@ fn hand_written(buck_path: &Utf8Path, owned: &OwnedNames) -> HandWritten {
     let mut hand = HandWritten::default();
     for statement in statements {
         let text = content[statement.with_comments.clone()].to_owned();
+        let marked = is_package_macro_marked(&text);
         match &statement.kind {
-            TopLevelKind::Load(bzl) if bzl.starts_with("@buckal//") => {}
-            TopLevelKind::Load(_) => hand.loads.push(text),
+            TopLevelKind::Load(bzl, _) if bzl.starts_with("@buckal//") => {}
+            // The `[package_macro]` load an earlier generation wrote.
+            TopLevelKind::Load(..) if marked => {}
+            TopLevelKind::Load(bzl, bindings) => match &owned.package_macro {
+                Some((macro_bzl, function))
+                    if bindings.iter().any(|(local, _)| local == function) =>
+                {
+                    let only = bindings.len() == 1;
+                    let same = bzl == macro_bzl
+                        && bindings
+                            .iter()
+                            .any(|(local, their)| local == function && their == function);
+                    if !same {
+                        buckal_error!(format!(
+                            "{buck_path}: a hand-written load binds `{function}`, the `[package_macro]` function generation calls here, to something other than `{function}` of `{macro_bzl}`; rename the binding. The file is left unchanged"
+                        ));
+                        std::process::exit(1);
+                    }
+                    if !only {
+                        // It binds other names of the file too: keep it, and
+                        // generation does not load the macro again.
+                        hand.binds_macro = true;
+                        hand.loads.push(text);
+                    }
+                }
+                _ => hand.loads.push(text),
+            },
+            // The `[package_macro]` call an earlier generation wrote, which this one
+            // no longer configures.
+            TopLevelKind::Call { function, .. } if marked && !owned.owns(function, None) => {
+                crate::buckal_warn!(format!(
+                    "{buck_path}: removing the `{function}()` call an earlier generation wrote from `[package_macro]`, which no longer configures it here"
+                ));
+            }
             TopLevelKind::Call { function, name }
                 if owned.owns(function, name.as_deref())
                     // An `export_files` rule generation wrote, recognised by its
@@ -453,9 +508,20 @@ fn hand_written(buck_path: &Utf8Path, owned: &OwnedNames) -> HandWritten {
     hand
 }
 
+/// Whether the statement `text`, with the comments leading up to it, is one
+/// generation wrote from `[package_macro]`.
+fn is_package_macro_marked(text: &str) -> bool {
+    text.lines()
+        .take_while(|line| line.trim_start().starts_with('#'))
+        .any(|line| line.trim() == PACKAGE_MACRO_MARKER)
+}
+
 /// What [`hand_written`] keeps of a BUCK file.
 #[derive(Debug, Default)]
 struct HandWritten {
+    /// A kept load binds the `[package_macro]` function, so generation does not
+    /// load it again.
+    binds_macro: bool,
     loads: Vec<String>,
     statements: Vec<String>,
     /// The kept top-level calls with a literal `name`, as `(function, name)`:
@@ -732,6 +798,168 @@ mod tests {
         assert!(
             content.contains("load("),
             "BUCK file should contain load statements, got:\n{content}"
+        );
+    }
+
+    /// The BUCK file `apply` writes for a library package at the workspace root of
+    /// a fresh directory, whose BUCK file is `existing` before, under `config`.
+    fn apply_to_root_package(existing: Option<&str>, config: RepoConfig) -> String {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let tmp_path =
+            Utf8PathBuf::try_from(tmp.path().to_path_buf()).expect("temp dir is not valid UTF-8");
+        let manifest_path = tmp_path.join("Cargo.toml");
+        std::fs::write(
+            &manifest_path,
+            "[package]\nname = \"myroot\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write Cargo.toml");
+        std::fs::create_dir_all(tmp_path.join("src")).expect("create src dir");
+        std::fs::write(tmp_path.join("src/lib.rs"), "").expect("write lib.rs");
+        if let Some(existing) = existing {
+            std::fs::write(tmp_path.join("BUCK"), existing).expect("write BUCK");
+        }
+
+        let lib_target = mock_target("myroot", TargetKind::Lib, tmp_path.join("src/lib.rs"));
+        let node = mock_first_party_node("myroot", manifest_path, vec![lib_target]);
+        let package_id = node.package_id.clone();
+        let mut dag = Dag::new();
+        let idx = dag.add_node(node);
+        let mut index_map = HashMap::new();
+        index_map.insert(package_id.clone(), idx);
+        let resolve = BuckalResolve {
+            dag,
+            index_map,
+            test_only_edges: Default::default(),
+        };
+        let mut changes = BTreeMap::new();
+        changes.insert(package_id.clone(), ChangeType::Changed);
+        let change = BuckalChange {
+            changes,
+            ..Default::default()
+        };
+        let ctx = BuckalContext {
+            workspace_members: None,
+            host_platform_differences: None,
+            host_platform_difference_digests: None,
+            buildscript_inputs: Default::default(),
+            wasm_modules: Default::default(),
+            declared_test_env: Default::default(),
+            root: Some(package_id),
+            resolve,
+            workspace_root: tmp_path.clone(),
+            workspace_inherit: false,
+            no_merge: false,
+            repo_config: config,
+        };
+        change.apply(&ctx);
+        std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK file")
+    }
+
+    fn package_macro_config() -> RepoConfig {
+        RepoConfig {
+            package_macro: crate::config::PackageMacroConfig {
+                bzl: "//buck2:source_tree_inputs.bzl".to_owned(),
+                function: "declare_source_tree_inputs".to_owned(),
+                first_party: true,
+                first_party_kwargs: Default::default(),
+            },
+            ..RepoConfig::default()
+        }
+    }
+
+    const MACRO_LOAD: &str =
+        "load(\"//buck2:source_tree_inputs.bzl\", \"declare_source_tree_inputs\")";
+
+    #[test]
+    fn test_package_macro_takes_over_a_hand_written_call_and_load() {
+        let existing = format!(
+            "{MACRO_LOAD}\nload(\"//other:defs.bzl\", \"kept_rule\")\n\n# The package's exports, by hand.\ndeclare_source_tree_inputs()\n\nkept_rule(name = \"kept\")\n"
+        );
+        let content = apply_to_root_package(Some(&existing), package_macro_config());
+        assert_eq!(
+            content.matches("declare_source_tree_inputs()").count(),
+            1,
+            "{content}"
+        );
+        assert_eq!(content.matches(MACRO_LOAD).count(), 1, "{content}");
+        assert_eq!(
+            content.matches(crate::buck::PACKAGE_MACRO_MARKER).count(),
+            2,
+            "{content}"
+        );
+        assert!(
+            content.contains(&format!(
+                "{}\ndeclare_source_tree_inputs()\n",
+                crate::buck::PACKAGE_MACRO_MARKER
+            )),
+            "{content}"
+        );
+        assert!(!content.contains("by hand"), "{content}");
+        assert!(
+            content.contains("load(\"//other:defs.bzl\", \"kept_rule\")"),
+            "{content}"
+        );
+        assert!(content.contains("kept_rule(name = \"kept\")"), "{content}");
+
+        // Regenerating its own output changes nothing.
+        let again = apply_to_root_package(Some(&content), package_macro_config());
+        assert_eq!(again, content);
+    }
+
+    #[test]
+    fn test_package_macro_keeps_a_hand_written_load_that_binds_more() {
+        let load = "load(\"//buck2:source_tree_inputs.bzl\", \"SOURCE_TREES\", \"declare_source_tree_inputs\")";
+        let existing = format!("{load}\n\ndeclare_source_tree_inputs()\n\nprint(SOURCE_TREES)\n");
+        let content = apply_to_root_package(Some(&existing), package_macro_config());
+        assert!(content.contains(load), "{content}");
+        assert!(!content.contains(MACRO_LOAD), "{content}");
+        assert_eq!(
+            content
+                .matches("load(\"//buck2:source_tree_inputs.bzl\"")
+                .count(),
+            1
+        );
+        assert_eq!(
+            content.matches("declare_source_tree_inputs()").count(),
+            1,
+            "{content}"
+        );
+        assert!(content.contains("print(SOURCE_TREES)"), "{content}");
+    }
+
+    #[test]
+    fn test_package_macro_call_is_removed_once_unconfigured() {
+        let hand = "load(\"//other:defs.bzl\", \"kept_rule\")\n\nkept_rule(name = \"kept\")\n";
+        let generated = apply_to_root_package(Some(hand), package_macro_config());
+        assert!(
+            generated.contains("declare_source_tree_inputs()"),
+            "{generated}"
+        );
+        let content = apply_to_root_package(Some(&generated), RepoConfig::default());
+        assert!(!content.contains("declare_source_tree_inputs"), "{content}");
+        assert!(
+            !content.contains(crate::buck::PACKAGE_MACRO_MARKER),
+            "{content}"
+        );
+        assert!(content.contains("kept_rule(name = \"kept\")"), "{content}");
+        assert_eq!(
+            content,
+            apply_to_root_package(Some(hand), RepoConfig::default())
+        );
+    }
+
+    #[test]
+    fn test_unconfigured_generation_keeps_a_hand_written_call() {
+        let existing = format!("{MACRO_LOAD}\n\ndeclare_source_tree_inputs()\n");
+        let content = apply_to_root_package(Some(&existing), RepoConfig::default());
+        assert!(content.contains(MACRO_LOAD), "{content}");
+        assert!(
+            content.contains("declare_source_tree_inputs()"),
+            "{content}"
+        );
+        assert!(
+            !content.contains(crate::buck::PACKAGE_MACRO_MARKER),
+            "{content}"
         );
     }
 }
