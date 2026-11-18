@@ -1061,6 +1061,20 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
             );
             std::process::exit(1);
         }
+        for label in &t.unset_labels {
+            let why = if !fixup.test_labels.contains(label) {
+                "the package's `test_labels` does not have it"
+            } else if t.labels.contains(label) {
+                "this test's `labels` adds it"
+            } else {
+                continue;
+            };
+            buckal_error!(
+                "`[fixups.{}.tests.{test}] unset_labels`: `{label}`: {why}",
+                node.name
+            );
+            std::process::exit(1);
+        }
     }
     if let Err(error) = check_lifted_args(&node.name, fixup) {
         buckal_error!("{:#}", error);
@@ -1097,6 +1111,7 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
                 (&mut r.env, &mut r.rustc_flags, &mut r.mapped_srcs)
             }
             Rule::RustTest(r) => {
+                let unset_labels = fixup.tests.get(&r.name).map(|test| &test.unset_labels);
                 r.extra_resources
                     .extend(fixup.test_resources.iter().cloned());
                 r.run_env.extend(fixup.test_run_env.clone());
@@ -1106,7 +1121,13 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
                 if let Some(runtime_tools) = &fixup.test_runtime_tools {
                     r.runtime_tools = Some(runtime_tools.clone());
                 }
-                r.labels.extend(fixup.test_labels.iter().cloned());
+                r.labels.extend(
+                    fixup
+                        .test_labels
+                        .iter()
+                        .filter(|label| unset_labels.is_none_or(|unset| !unset.contains(*label)))
+                        .cloned(),
+                );
                 r.target_compatible_with.extend(sets.target_compatible_with);
                 r.args.extend(fixup.test_args.iter().cloned());
                 if !fixup.test_compatible_with.is_empty() {
@@ -1119,6 +1140,9 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
                     r.supports_test_execution_caching = Some(caching);
                 }
                 if let Some(test) = fixup.tests.get(&r.name) {
+                    if let Some(remote_execution) = &test.remote_execution {
+                        r.remote_execution = Some(remote_execution.clone());
+                    }
                     if let Some(caching) = test.supports_test_execution_caching {
                         r.supports_test_execution_caching = Some(caching);
                     }

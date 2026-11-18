@@ -4525,6 +4525,102 @@ fn test_wasm_feature_variant_and_sha256_witness_through_test_env() {
 }
 
 #[test]
+fn test_per_test_remote_execution_and_unset_labels_through_generation() {
+    // A single test overrides the package's `test_remote_execution` and drops a
+    // label of its `test_labels`; the package's other tests keep both (Muninn R3:
+    // pure tests of a package whose live-effect tests stay disabled).
+    let f = fixture();
+    write(&f.ws.join("app/tests/it.rs"), "");
+    let with = |test: &str| {
+        format!(
+            "{BUCKAL_TOML}\n[fixups.app]\ntest_remote_execution = \"disabled\"\ntest_labels = [\"unqualified-live-effect\", \"slow\"]\n\n[fixups.app.tests.it]\n{test}\n"
+        )
+    };
+    write(&f.ws.join("buckal.toml"), &with(""));
+    f.migrate(&[]);
+    let app_before = f.buck("app");
+    let labels_before =
+        "    labels = [\n        \"slow\",\n        \"unqualified-live-effect\",\n    ],\n";
+    for test in ["it", "unittest"] {
+        let r = rule(&app_before, test);
+        assert!(r.contains("    remote_execution = \"disabled\",\n"), "{r}");
+        assert!(r.contains(labels_before), "{r}");
+    }
+
+    write(
+        &f.ws.join("buckal.toml"),
+        &with(
+            "remote_execution = \"nativelink_test_result_reuse\"\nunset_labels = [\"unqualified-live-effect\"]",
+        ),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let app = f.buck("app");
+    let it = rule(&app, "it");
+    assert!(
+        it.contains("    remote_execution = \"nativelink_test_result_reuse\",\n"),
+        "{it}"
+    );
+    assert!(it.contains("    labels = [\"slow\"],\n"), "{it}");
+    assert!(!it.contains("unqualified-live-effect"), "{it}");
+    // The sibling is unchanged, and so is everything else.
+    assert_eq!(rule(&app, "unittest"), rule(&app_before, "unittest"));
+    assert_eq!(
+        app.replace(it, ""),
+        app_before.replace(rule(&app_before, "it"), "")
+    );
+    // Read back and re-emitted unchanged.
+    f.migrate(&["--no-cache"]);
+    assert_eq!(f.buck("app"), app);
+
+    // Without a package-wide setting, the test's own applies to it alone.
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!("{BUCKAL_TOML}\n[fixups.app.tests.it]\nremote_execution = \"disabled\"\n"),
+    );
+    f.migrate(&[]);
+    let app = f.buck("app");
+    assert!(
+        rule(&app, "it").contains("    remote_execution = \"disabled\",\n"),
+        "{app}"
+    );
+    assert!(
+        !rule(&app, "unittest").contains("remote_execution"),
+        "{app}"
+    );
+
+    // Dropping a label the package does not have, or one the test adds, and
+    // naming a test the package does not have, are refused.
+    write(&f.ws.join("buckal.toml"), &with(""));
+    f.migrate(&[]);
+    for (config, why) in [
+        (
+            with("unset_labels = [\"absent\"]"),
+            "`[fixups.app.tests.it] unset_labels`: `absent`: the package's `test_labels` does not have it",
+        ),
+        (
+            with("unset_labels = [\"slow\"]\nlabels = [\"slow\"]"),
+            "`[fixups.app.tests.it] unset_labels`: `slow`: this test's `labels` adds it",
+        ),
+        (
+            format!(
+                "{}\n[fixups.app.tests.no_such_test]\nremote_execution = \"nativelink_test_result_reuse\"\n",
+                with("")
+            ),
+            "`[fixups.app.tests.no_such_test]` names no test of the package (its tests: it, unittest)",
+        ),
+    ] {
+        write(&f.ws.join("buckal.toml"), &config);
+        let output = f.output(&["migrate"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{config}:\n{stderr}");
+        assert!(stderr.contains(why), "{config}:\n{stderr}");
+        assert_eq!(f.buck("app"), app_before, "{config}");
+    }
+}
+
+#[test]
 fn test_per_test_unset_run_env_through_generation() {
     // N14: a single test can drop a key of the package's `test_run_env` (an empty
     // string stays a value).
