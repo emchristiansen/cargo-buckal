@@ -78,6 +78,28 @@ fn resolve_first_party_label(dep_node: &BuckalNode) -> Result<String> {
     Ok(format!("//{relative_path}:{buckal_name}"))
 }
 
+/// The library label of first-party `dep_node`, generated into `dir` (relative to
+/// the Buck2 root) by a standalone universe.
+fn vendored_first_party_label(dir: &str, dep_node: &BuckalNode) -> Result<String> {
+    let dep_bin_targets: Vec<_> = dep_node
+        .targets
+        .iter()
+        .filter(|t| t.kind.contains(&TargetKind::Bin))
+        .collect();
+    let dep_lib_targets = get_lib_targets(dep_node);
+    if dep_lib_targets.len() != 1 {
+        bail!(
+            "Expected exactly one library target for dependency {}, but found {}",
+            dep_node.name,
+            dep_lib_targets.len()
+        );
+    }
+    Ok(format!(
+        "//{dir}:{}",
+        resolve_buckal_name(&dep_bin_targets, &dep_lib_targets)
+    ))
+}
+
 fn resolve_buckal_name(
     dep_bin_targets: &[&BuckalTarget],
     dep_lib_targets: &[&BuckalTarget],
@@ -107,7 +129,15 @@ fn resolve_dep_label(
     };
 
     if !is_third_party(dep_node) {
-        let label = resolve_first_party_label(dep_node).with_context(|| {
+        let label = match crate::buckify::actions::vendored_path_package_dir(
+            &dep_node.package_id,
+            &ctx.workspace_root,
+        ) {
+            // A path package the standalone universe generates into its own tree.
+            Some(dir) => vendored_first_party_label(&dir, dep_node),
+            None => resolve_first_party_label(dep_node),
+        }
+        .with_context(|| {
             format!(
                 "failed to resolve first-party label for `{}`",
                 dep_node.name
@@ -561,6 +591,7 @@ mod tests {
             buildscript_inputs: Default::default(),
             wasm_modules: Default::default(),
             declared_test_env: Default::default(),
+            standalone_source_requests: Default::default(),
             root: Some(root_id.clone()),
             resolve: BuckalResolve {
                 dag,
@@ -672,6 +703,7 @@ mod tests {
             buildscript_inputs: Default::default(),
             wasm_modules: Default::default(),
             declared_test_env: Default::default(),
+            standalone_source_requests: Default::default(),
             root: None,
             resolve: BuckalResolve {
                 dag,
@@ -764,6 +796,7 @@ mod tests {
             buildscript_inputs: Default::default(),
             wasm_modules: Default::default(),
             declared_test_env: Default::default(),
+            standalone_source_requests: Default::default(),
             root: None,
             resolve: BuckalResolve {
                 dag,

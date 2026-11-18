@@ -584,6 +584,7 @@ fn test_patch_redirects_generated_dependency_label() {
         buildscript_inputs: Default::default(),
         wasm_modules: Default::default(),
         declared_test_env: Default::default(),
+        standalone_source_requests: Default::default(),
         root: Some(old_crate.package_id.clone()),
         resolve,
         workspace_root,

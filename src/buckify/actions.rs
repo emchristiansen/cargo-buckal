@@ -1,3 +1,4 @@
+use cargo_metadata::PackageId;
 use cargo_metadata::camino::{Utf8Path, Utf8PathBuf};
 use regex::Regex;
 
@@ -52,9 +53,18 @@ impl BuckalChange {
                         );
 
                         let is_third_party_pkg = is_third_party(node);
+                        // A path package a standalone universe generates into its
+                        // own tree, whose BUCK file it writes whole.
+                        let path_package =
+                            vendored_path_package_dir(&node.package_id, &ctx.workspace_root);
+                        let whole = is_third_party_pkg || path_package.is_some();
 
                         // Vendor package sources
-                        let vendor_dir = if !is_third_party_pkg {
+                        let vendor_dir = if let Some(dir) = &path_package {
+                            get_buck2_root()
+                                .map(|root| root.join(dir))
+                                .unwrap_or_exit_ctx("failed to get vendor directory")
+                        } else if !is_third_party_pkg {
                             node.manifest_path.parent().unwrap().to_owned()
                         } else {
                             get_buck2_root()
@@ -63,7 +73,13 @@ impl BuckalChange {
                         };
 
                         // Generate BUCK rules
-                        let mut buck_rules = if !is_third_party_pkg {
+                        let mut buck_rules = if path_package.is_some() {
+                            super::rules::vendored_path_package_rules(
+                                buckify_root_node(node, ctx),
+                                node,
+                                ctx,
+                            )
+                        } else if !is_third_party_pkg {
                             buckify_root_node(node, ctx)
                         } else {
                             buckify_dep_node(node, ctx)
@@ -118,7 +134,7 @@ impl BuckalChange {
 
                         // Generate the BUCK file, keeping what a first-party package's
                         // BUCK file has beyond the rules generation owns.
-                        let mut buck_content = if is_third_party_pkg {
+                        let mut buck_content = if whole {
                             if let Err(error) = check_namespace(&buck_rules, &[], &[]) {
                                 buckal_error!(format!(
                                     "{buck_path}: {error}; it is left unchanged"
@@ -172,6 +188,15 @@ impl BuckalChange {
                     }
                 }
                 ChangeType::Removed => {
+                    if let Some(dir) = vendored_path_package_dir(id, &ctx.workspace_root) {
+                        buckal_log!("Removing", dir.clone());
+                        removals.push(
+                            get_buck2_root()
+                                .map(|root| root.join(dir))
+                                .unwrap_or_exit_ctx("failed to get vendor directory"),
+                        );
+                        continue;
+                    }
                     // Path-source packages (the workspace root, its members, and any
                     // local `path = "..."` dep) live in the user's source tree, not in
                     // a vendor directory, so there is nothing for us to remove. Skip
@@ -312,7 +337,8 @@ impl BuckalChange {
 
         // After the BUCK files are written, so that the walk sees them.
         let plan = tables?;
-        let executed = generated_package_dirs(&ctx.resolve).and_then(|dirs| plan.execute(&dirs));
+        let executed = generated_package_dirs(&ctx.resolve, &ctx.workspace_root)
+            .and_then(|dirs| plan.execute(&dirs));
         match executed {
             Ok(record) => record,
             Err(error) => {
@@ -338,19 +364,36 @@ fn generated_package_dir(node: &BuckalNode) -> anyhow::Result<String> {
 /// packages live.
 pub(crate) fn generated_package_dirs(
     resolve: &crate::resolve::BuckalResolve,
+    workspace_root: &Utf8PathBuf,
 ) -> Result<std::collections::BTreeSet<String>, String> {
     resolve
         .nodes()
-        .filter(|node| is_third_party(node))
-        .map(|node| {
-            generated_package_dir(node).map_err(|error| {
-                format!(
-                    "cannot place third-party package `{}`: {error}",
-                    node.package_id.repr
-                )
+        .filter_map(|node| {
+            if let Some(dir) = vendored_path_package_dir(&node.package_id, workspace_root) {
+                return Some(Ok(dir));
+            }
+            is_third_party(node).then(|| {
+                generated_package_dir(node).map_err(|error| {
+                    format!(
+                        "cannot place third-party package `{}`: {error}",
+                        node.package_id.repr
+                    )
+                })
             })
         })
         .collect()
+}
+
+/// Where the selected standalone universe generates the path package `id` of the
+/// project outside its workspace, relative to the Buck2 root
+/// ([`crate::universe::Universe::path_package_dir`]); `None` for every package
+/// generated elsewhere.
+pub(crate) fn vendored_path_package_dir(
+    id: &PackageId,
+    workspace_root: &Utf8PathBuf,
+) -> Option<String> {
+    use crate::cache::PackageIdExt;
+    crate::universe::selected().path_package_dir(&id.canonicalize(workspace_root).repr)
 }
 
 /// `content` of the workspace-root BUCK file, whose header claims only
@@ -500,6 +543,8 @@ impl OwnedNames {
         match (function, name) {
             ("filegroup", Some(name)) => self.filegroups.contains(name),
             ("export_file", Some(name)) => self.exports.contains(name),
+            ("rust_filegroup", Some(name)) => name == crate::universe::STANDALONE_SRCS,
+            ("alias", Some(name)) => name == crate::universe::STANDALONE_MANIFEST,
             ("configured_alias", Some(name)) => {
                 [crate::wasm::MODULE_ALIAS, crate::wasm::TEST_MODULE_ALIAS]
                     .iter()
@@ -1236,6 +1281,7 @@ mod tests {
             buildscript_inputs: Default::default(),
             wasm_modules: Default::default(),
             declared_test_env: Default::default(),
+            standalone_source_requests: Default::default(),
             root: Some(package_id),
             resolve,
             workspace_root: tmp_path.clone(),
@@ -1307,6 +1353,7 @@ mod tests {
             buildscript_inputs: Default::default(),
             wasm_modules: Default::default(),
             declared_test_env: Default::default(),
+            standalone_source_requests: Default::default(),
             root: Some(package_id),
             resolve,
             workspace_root: tmp_path.clone(),

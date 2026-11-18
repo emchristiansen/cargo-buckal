@@ -57,6 +57,41 @@ pub struct BuckalContext {
     /// (`{variable: wasm package}`), where it declares one.
     pub declared_test_env:
         HashMap<PackageId, std::collections::BTreeMap<String, crate::wasm::TestEnvValue>>,
+    /// The root generation's packages whose sources standalone universes compile:
+    /// each owner directory (relative to the Buck2 root) to the visibility of the
+    /// `standalone-srcs` and `standalone-manifest` it writes there
+    /// ([`crate::buckify::tables::standalone_source_requests`]). Empty in a
+    /// standalone universe.
+    pub standalone_source_requests:
+        std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+}
+
+/// The root generation's [`BuckalContext::standalone_source_requests`], refusing a
+/// request for a directory that is no first-party package of the root workspace
+/// (nothing could expose its sources). Empty in a standalone universe.
+fn standalone_source_requests(
+    resolve: &BuckalResolve,
+    buck2_root: &Utf8PathBuf,
+) -> Result<std::collections::BTreeMap<String, std::collections::BTreeSet<String>>, String> {
+    if *crate::universe::selected() != crate::universe::Universe::Root {
+        return Ok(Default::default());
+    }
+    let layout = crate::buckify::tables::CellLayout::of_project(buck2_root)?;
+    let requests = crate::buckify::tables::standalone_source_requests(buck2_root, &layout)?;
+    let packages: std::collections::BTreeSet<String> = resolve
+        .nodes()
+        .filter(|node| matches!(node.kind, crate::resolve::NodeKind::FirstParty { .. }))
+        .filter_map(|node| {
+            let dir = node.manifest_path.parent()?.strip_prefix(buck2_root).ok()?;
+            Some(dir.as_str().to_owned())
+        })
+        .collect();
+    if let Some(owner) = requests.keys().find(|owner| !packages.contains(*owner)) {
+        return Err(format!(
+            "a standalone universe compiles sources of `{owner}`, which is no package of the Buck2 project's own workspace, so nothing exposes them; generate the standalone universes again"
+        ));
+    }
+    Ok(requests)
 }
 
 impl BuckalContext {
@@ -434,7 +469,14 @@ impl BuckalContext {
             buckal_warn!(note.clone());
         }
 
+        let standalone_source_requests = standalone_source_requests(&resolve, &buck2_root)
+            .unwrap_or_else(|error| {
+                buckal_error!(error);
+                std::process::exit(1);
+            });
+
         Self {
+            standalone_source_requests,
             buck2_root: Some(buck2_root),
             root,
             resolve,
@@ -464,6 +506,32 @@ impl BuckalContext {
             self.host_platform_differences.clone(),
             self.host_platform_difference_digests.clone(),
         )
+        .with_source_owners(crate::buckify::standalone_source_owners(self))
+        .with_salts(
+            self.resolve.nodes().filter_map(|node| {
+                let visibility = self.standalone_source_request(node)?;
+                Some((
+                    &node.package_id,
+                    serde_json::to_vec(visibility).expect("a set of strings serializes"),
+                ))
+            }),
+            &self.workspace_root,
+        )
+    }
+
+    /// The visibility of the `standalone-srcs` and `standalone-manifest` the root
+    /// generation writes in first-party `node`'s BUCK file, if standalone
+    /// universes compile its sources.
+    pub fn standalone_source_request(
+        &self,
+        node: &BuckalNode,
+    ) -> Option<&std::collections::BTreeSet<String>> {
+        if !matches!(node.kind, crate::resolve::NodeKind::FirstParty { .. }) {
+            return None;
+        }
+        let buck2_root = self.buck2_root.as_ref()?;
+        let dir = node.manifest_path.parent()?.strip_prefix(buck2_root).ok()?;
+        self.standalone_source_requests.get(dir.as_str())
     }
 
     /// The declared test environments, by package name, serialized (empty when
@@ -630,6 +698,7 @@ mod tests {
             buildscript_inputs: Default::default(),
             wasm_modules: Default::default(),
             declared_test_env: Default::default(),
+            standalone_source_requests: Default::default(),
             root: None,
             resolve,
             workspace_root: Utf8PathBuf::from("/tmp"),

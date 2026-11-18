@@ -37,6 +37,17 @@ pub const CONFIG_FILE: &str = "buckal.toml";
 /// The generation record of a universe.
 pub const CACHE_FILE: &str = "buckal.snap";
 
+/// The `rust_filegroup` the root generation writes in a package of the project's
+/// own workspace whose sources a standalone universe compiles.
+pub const STANDALONE_SRCS: &str = "standalone-srcs";
+
+/// The `alias` of that package's `cargo_manifest` the root generation writes
+/// beside it, through which a universe's copy of the package reads its manifest.
+pub const STANDALONE_MANIFEST: &str = "standalone-manifest";
+
+/// The prelude file defining `rust_filegroup`.
+pub const RUST_FILEGROUP_BZL: &str = "@prelude//rust:sources.bzl";
+
 /// The universe a command generates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Universe {
@@ -81,11 +92,11 @@ impl Universe {
     /// `<git root>/<name>/<version>` for a git package, and `None` for any other
     /// source (a path package is first-party, not vendored).
     pub fn vendor_path_relative(&self, repr: &str) -> Result<Option<String>> {
-        // A path package is never vendored. Its package-id may also not parse as a
-        // spec: Cargo writes a package named after its directory without the name
+        // A path package's package-id may not parse as a spec: Cargo writes a
+        // package named after its directory without the name
         // (`path+file:///…/guest#0.1.0`).
         if repr.starts_with("path+") {
-            return Ok(None);
+            return Ok(self.path_package_dir(repr));
         }
         let spec =
             PackageIdSpec::parse(repr).with_context(|| format!("`{repr}` is not a package-id"))?;
@@ -98,6 +109,27 @@ impl Universe {
             .version()
             .with_context(|| format!("package-id `{repr}` names no version"))?;
         Ok(Some(format!("{root}/{}/{version}", spec.name())))
+    }
+
+    /// Where the universe generates the path package whose canonical package-id
+    /// is `repr`: a standalone universe generates a path package of the project
+    /// outside its own workspace (`path+file://($PROJECT)/<dir>#…`, see
+    /// [`crate::cache::PROJECT_ID_PLACEHOLDER`]) into
+    /// `<vendor root>/path/<name>/<version>`, so that it never writes the owning
+    /// package's BUCK file. Every other path package is generated in place:
+    /// `None`.
+    pub fn path_package_dir(&self, repr: &str) -> Option<String> {
+        let Universe::Standalone { .. } = self else {
+            return None;
+        };
+        let rest = repr.strip_prefix(crate::cache::PROJECT_ID_PLACEHOLDER)?;
+        let (dir, fragment) = rest.split_once('#')?;
+        let (name, version) = match fragment.split_once('@') {
+            Some((name, version)) => (name, version),
+            // Named after its directory: Cargo leaves the name out.
+            None => (dir.rsplit('/').next()?, fragment),
+        };
+        Some(format!("{}/path/{name}/{version}", self.vendor_root()))
     }
 
     /// The universe `manifest_path` selects, `buck2_root` being the Buck2 project
@@ -172,6 +204,14 @@ fn enclosing_standalone(cwd: &Utf8Path, buck2_root: &Utf8Path) -> Result<Option<
 
 static SELECTED: OnceLock<Universe> = OnceLock::new();
 
+static PROJECT_ROOT: OnceLock<Utf8PathBuf> = OnceLock::new();
+
+/// The Buck2 project root, once [`select`] has run: generation records a path
+/// package outside its workspace but inside the project relative to it.
+pub fn project_root() -> Option<&'static Utf8PathBuf> {
+    PROJECT_ROOT.get()
+}
+
 /// Select the universe `manifest_path` names for the rest of the process. A command
 /// taking `--manifest-path` calls this before it reads a configuration, a
 /// generation record or a vendor path; selecting a second, different universe is an
@@ -197,6 +237,7 @@ pub fn select(manifest_path: Option<&str>) -> Result<&'static Universe> {
         }
     }
     let universe = Universe::of_manifest(manifest_path, &buck2_root)?;
+    let _ = PROJECT_ROOT.set(buck2_root.clone());
     if matches!(universe, Universe::Standalone { .. }) {
         use crate::buckify::tables::{CellLayout, check_universe_names, standalone_universes};
         let layout = CellLayout::of_project(&buck2_root).map_err(anyhow::Error::msg)?;
@@ -320,6 +361,36 @@ mod tests {
                 .unwrap()
                 .as_deref(),
             Some("third-party/rust/standalone/guest/crates/sdep/2.0.0")
+        );
+    }
+
+    #[test]
+    fn test_a_project_path_package_is_generated_into_the_universe_tree() {
+        let universe = Universe::Standalone {
+            dir: "standalone_workspaces/guest".into(),
+            name: "guest".to_owned(),
+        };
+        assert_eq!(
+            universe
+                .vendor_path_relative("path+file://($PROJECT)/libs/shared_lib#shared-lib@0.2.0")
+                .unwrap()
+                .as_deref(),
+            Some("third-party/rust/standalone/guest/path/shared-lib/0.2.0")
+        );
+        // Named after its directory: the name is the directory's.
+        assert_eq!(
+            universe
+                .vendor_path_relative("path+file://($PROJECT)/libs/prelude#0.1.0")
+                .unwrap()
+                .as_deref(),
+            Some("third-party/rust/standalone/guest/path/prelude/0.1.0")
+        );
+        // The root universe generates its path packages in place.
+        assert_eq!(
+            Universe::Root
+                .vendor_path_relative("path+file://($PROJECT)/libs/prelude#0.1.0")
+                .unwrap(),
+            None
         );
     }
 

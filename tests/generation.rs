@@ -5947,3 +5947,105 @@ fn test_a_standalone_universe_generates_beside_the_root() {
     assert!(!f.ws.join("other/guest/BUCK").exists());
     assert!(!f.ws.join("other/guest/buckal.snap").exists());
 }
+
+#[test]
+fn test_a_standalone_universe_compiles_project_packages_from_their_owners() {
+    let f = fixture();
+    // The universe depends on the root workspace's `shared` by path, and its own
+    // library's crate root is `extra`'s, as a native test harness names another
+    // package's crate root.
+    write(
+        &f.ws.join("guests/guest/Cargo.toml"),
+        "[package]\nname = \"guest\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [lib]\nname = \"extra\"\npath = \"../../extra/src/lib.rs\"\n\
+         [dependencies]\nshared = { path = \"../../shared\" }\n[workspace]\n",
+    );
+    write(
+        &f.ws.join("guests/guest/buckal.toml"),
+        "ignore_tests = false\n",
+    );
+    f.migrate(&[]);
+    let shared_before = f.buck("shared");
+
+    f.migrate(&["--manifest-path", "guests/guest/Cargo.toml"]);
+    // The owner's BUCK file is the root universe's: the universe never writes it.
+    assert_eq!(f.buck("shared"), shared_before);
+    // `shared` is generated into the universe's own tree, from its owner's sources.
+    let vendored = f.buck("third-party/rust/standalone/guest/path/shared/0.1.0");
+    let lib = rule(&vendored, "shared");
+    assert!(
+        lib.contains("srcs_filegroup = \"//shared:standalone-srcs\""),
+        "{lib}"
+    );
+    assert!(lib.contains("crate_root = \"shared/src/lib.rs\""), "{lib}");
+    assert!(
+        lib.contains("//shared:standalone-manifest[env_flags]"),
+        "{lib}"
+    );
+    assert!(!lib.contains("srcs = "), "{lib}");
+    assert!(!vendored.contains("cargo_manifest("), "{vendored}");
+    // The universe's own library compiles `extra`'s crate root through `extra`.
+    let guest = f.buck("guests/guest");
+    let guest_lib = rule(&guest, "extra");
+    assert!(
+        guest_lib.contains("srcs_filegroup = \"//extra:standalone-srcs\""),
+        "{guest_lib}"
+    );
+    assert!(
+        guest_lib.contains("crate_root = \"extra/src/lib.rs\""),
+        "{guest_lib}"
+    );
+    assert!(
+        guest_lib.contains("\"//third-party/rust/standalone/guest/path/shared/0.1.0:shared\""),
+        "{guest_lib}"
+    );
+    // Its record keeps the owners, and the project path package portably.
+    let record = std::fs::read_to_string(f.ws.join("guests/guest/buckal.snap")).unwrap();
+    assert!(
+        record.contains("path+file://($PROJECT)/shared#0.1.0"),
+        "{record}"
+    );
+    assert!(record.contains("source_owners = ["), "{record}");
+
+    // The root generation exposes the owners' sources and manifests to the universe.
+    f.migrate(&[]);
+    let shared = f.buck("shared");
+    let srcs = rule(&shared, "standalone-srcs");
+    assert!(
+        shared.contains("rust_filegroup(\n    name = \"standalone-srcs\""),
+        "{shared}"
+    );
+    assert!(srcs.contains("\"//guests/guest/...\""), "{srcs}");
+    assert!(
+        srcs.contains("\"//third-party/rust/standalone/guest/...\""),
+        "{srcs}"
+    );
+    assert!(
+        shared.contains("load(\"@prelude//rust:sources.bzl\", \"rust_filegroup\")"),
+        "{shared}"
+    );
+    let manifest = rule(&shared, "standalone-manifest");
+    assert!(manifest.contains("actual = \":manifest\""), "{manifest}");
+    assert!(
+        shared.contains("alias(\n    name = \"standalone-manifest\""),
+        "{shared}"
+    );
+    assert!(rule(&f.buck("extra"), "standalone-srcs").contains("\"//guests/guest/...\""));
+
+    // Without the dependency, the universe removes its copy, and the root
+    // generation the owner's exposure.
+    write(
+        &f.ws.join("guests/guest/Cargo.toml"),
+        "[package]\nname = \"guest\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+         [lib]\nname = \"extra\"\npath = \"../../extra/src/lib.rs\"\n[workspace]\n",
+    );
+    f.migrate(&["--manifest-path", "guests/guest/Cargo.toml"]);
+    assert!(
+        !f.ws
+            .join("third-party/rust/standalone/guest/path/shared/0.1.0")
+            .exists()
+    );
+    f.migrate(&[]);
+    assert!(!f.buck("shared").contains("standalone-srcs"));
+    assert!(f.buck("extra").contains("standalone-srcs"));
+}

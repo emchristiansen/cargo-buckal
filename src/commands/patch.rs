@@ -323,6 +323,7 @@ mod tests {
             buildscript_inputs: Default::default(),
             wasm_modules: Default::default(),
             declared_test_env: Default::default(),
+            standalone_source_requests: Default::default(),
             root: None,
             resolve: BuckalResolve {
                 dag,

@@ -355,6 +355,34 @@ pub fn standalone_package_dirs(
     Ok(dirs)
 }
 
+/// What the standalone universes of the Buck2 project at `root` compile from the
+/// project's own packages, read from their records (`source_owners`): each owner
+/// directory (relative to the root) to the visibility its `standalone-srcs` and
+/// `standalone-manifest` need, the requesting universes' vendor trees and
+/// directories. A universe without a record requests nothing.
+pub fn standalone_source_requests(
+    root: &Utf8Path,
+    layout: &CellLayout,
+) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+    use crate::universe::CACHE_FILE;
+
+    let mut requests: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for FoundUniverse { universe, recorded } in standalone_universes(root, layout)? {
+        if !recorded {
+            continue;
+        }
+        let record = root.join(universe.config_dir()).join(CACHE_FILE);
+        let cache = crate::cache::BuckalCache::load_from(&record)
+            .map_err(|error| format!("{record}: {error}"))?;
+        for owner in cache.source_owners() {
+            let visibility = requests.entry(owner.clone()).or_default();
+            visibility.insert(format!("//{}/...", universe.vendor_root()));
+            visibility.insert(format!("//{}/...", universe.config_dir()));
+        }
+    }
+    Ok(requests)
+}
+
 /// The `[project] ignore` patterns as Buck2 matches them: globs relative to the
 /// project root, in which `*` does not cross a `/`.
 fn ignore_set(patterns: &[String]) -> Result<GlobSet, String> {
@@ -731,7 +759,9 @@ mod tests {
             index_map,
             test_only_edges: Default::default(),
         };
-        let generated = crate::buckify::actions::generated_package_dirs(&resolve).unwrap();
+        let generated =
+            crate::buckify::actions::generated_package_dirs(&resolve, &"/work/proj".into())
+                .unwrap();
         let packages = whole_repository_packages(&generated, "root");
         assert_eq!(
             packages.into_iter().collect::<Vec<_>>(),
@@ -920,6 +950,69 @@ mod tests {
     }
 
     #[test]
+    fn test_universes_share_one_exposure_of_an_owner_and_list_their_path_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(dir.path()).unwrap();
+        for path in [
+            "a/one/Cargo.toml",
+            "a/one/buckal.toml",
+            "b/two/Cargo.toml",
+            "b/two/buckal.toml",
+        ] {
+            touch(root, path);
+        }
+        let record = |ids: &[&str], owners: &[&str]| {
+            let mut record = standalone_record(ids);
+            record.insert_str(
+                0,
+                &format!(
+                    "source_owners = [{}]\n",
+                    owners
+                        .iter()
+                        .map(|owner| format!("\"{owner}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+            record
+        };
+        std::fs::write(
+            root.join("a/one/buckal.snap"),
+            record(
+                &["path+file://($PROJECT)/libs/shared#0.1.0"],
+                &["libs/shared"],
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("b/two/buckal.snap"),
+            record(&[], &["libs/shared", "callosum"]),
+        )
+        .unwrap();
+        let layout = CellLayout::parse("").unwrap();
+        let requests = standalone_source_requests(root, &layout).unwrap();
+        assert_eq!(
+            requests.get("libs/shared").unwrap(),
+            &[
+                "//a/one/...",
+                "//b/two/...",
+                "//third-party/rust/standalone/one/...",
+                "//third-party/rust/standalone/two/...",
+            ]
+            .map(str::to_owned)
+            .into()
+        );
+        assert_eq!(requests.len(), 2);
+        // The universes' path packages are whole-repository packages of the root.
+        assert_eq!(
+            standalone_package_dirs(root, &layout).unwrap(),
+            ["third-party/rust/standalone/one/path/shared/0.1.0"]
+                .map(str::to_owned)
+                .into()
+        );
+    }
+
+    #[test]
     fn test_an_unrecorded_namesake_of_a_recorded_universe_is_skipped() {
         let dir = tempfile::tempdir().unwrap();
         let root = Utf8Path::from_path(dir.path()).unwrap();
@@ -934,7 +1027,9 @@ mod tests {
         }
         std::fs::write(
             root.join("guests/ws/buckal.snap"),
-            standalone_record(&["registry+https://github.com/rust-lang/crates.io-index#sdep@2.0.0"]),
+            standalone_record(&[
+                "registry+https://github.com/rust-lang/crates.io-index#sdep@2.0.0",
+            ]),
         )
         .unwrap();
         let layout = CellLayout::parse("").unwrap();

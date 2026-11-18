@@ -28,8 +28,9 @@ use super::deps::{
 use super::emit::{
     emit_buildscript_build, emit_buildscript_run, emit_cargo_manifest, emit_filegroup,
     emit_git_fetch, emit_http_archive, emit_rust_binary, emit_rust_library, emit_rust_test,
-    emit_test_module, host_variant_build_target, patch_with_buildscript,
-    test_host_variant_build_target, test_variant_build_target, wasm_variant_build_target,
+    emit_test_module, get_vendor_name, host_variant_build_target, normalize_path_for_buck,
+    patch_with_buildscript, test_host_variant_build_target, test_variant_build_target,
+    wasm_variant_build_target,
 };
 
 /// Buckifies a third-party dependency into a list of BUCK rules.
@@ -56,6 +57,55 @@ pub fn buckify_dep_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
     let mut rules = buckify_dep_node_targets(node, ctx);
     rules.extend(third_party_package_macro(ctx));
     rules
+}
+
+/// The rules of a path package of the project that a standalone universe
+/// generates into its own tree ([`crate::universe::Universe::path_package_dir`]),
+/// from `rules`, the package's first-party rules: its sources are its owner's
+/// `standalone-srcs` (each Rust rule's `srcs_filegroup`), so the package's own
+/// `vendor` filegroup and `cargo_manifest` go, and its rules read the owner's
+/// manifest through `standalone-manifest`. The file is written whole, so it takes
+/// the third-party `[package_macro]` call. A build script, which runs in its
+/// package directory, is refused.
+pub(crate) fn vendored_path_package_rules(
+    rules: Vec<Rule>,
+    node: &BuckalNode,
+    ctx: &BuckalContext,
+) -> Vec<Rule> {
+    let buck2_root = get_buck2_root().unwrap_or_exit_ctx("failed to get Buck2 root");
+    let owner = node
+        .manifest_path
+        .parent()
+        .and_then(|dir| dir.strip_prefix(&buck2_root).ok())
+        .map(|dir| normalize_path_for_buck(dir.as_str()))
+        .expect("a path package of the project lies below the Buck2 root");
+    let manifest = format!("//{owner}:{}[", crate::universe::STANDALONE_MANIFEST);
+    let mut vendored = Vec::new();
+    for mut rule in rules {
+        match &rule {
+            Rule::FileGroup(group) if group.name == get_vendor_name() => continue,
+            Rule::CargoManifest(_) => continue,
+            Rule::BuildscriptRun(_) => {
+                buckal_error!(format!(
+                    "package `{}` (`{owner}`) has a build script; a standalone universe does not generate a path package with one",
+                    node.name
+                ));
+                std::process::exit(1);
+            }
+            Rule::PackageMacro(_) => {
+                vendored.extend(third_party_package_macro(ctx));
+                continue;
+            }
+            _ => {}
+        }
+        if let Some(rust_rule) = rule.as_rust_rule_mut() {
+            for flag in rust_rule.rustc_flags_mut() {
+                *flag = flag.replace(":manifest[", &manifest);
+            }
+        }
+        vendored.push(rule);
+    }
+    vendored
 }
 
 /// The `[package_macro]` call of a third-party package's BUCK file, when the
@@ -205,8 +255,44 @@ fn buckify_dep_node_targets(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule>
 /// Buckifies workspace package into a list of BUCK rules, including rules for all targets (bin, lib, test) and handling build scripts if present.
 pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
     let mut rules = buckify_root_node_targets(node, ctx);
+    rules.extend(standalone_owner_rules(node, ctx));
     rules.extend(first_party_package_macro(ctx));
     rules
+}
+
+/// The rules through which standalone universes compile first-party `node`'s
+/// sources, when they do ([`BuckalContext::standalone_source_request`]): its
+/// sources and its `mapped_srcs` fixup as one repository-shaped `rust_filegroup`
+/// (`standalone-srcs`), the package's own layout kept so that `include_*!` and
+/// `file!()` resolve as in the checkout, and an `alias` of its `cargo_manifest`
+/// (`standalone-manifest`), visible to the requesting universes only.
+fn standalone_owner_rules(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
+    let Some(visibility) = ctx.standalone_source_request(node) else {
+        return Vec::new();
+    };
+    let mapped_srcs = match ctx.repo_config.fixups.get(&node.name) {
+        Some(fixup) => fixup_mapped_srcs(node, fixup).unwrap_or_else(|error| {
+            buckal_error!(format!("{error:#}"));
+            std::process::exit(1);
+        }),
+        None => Default::default(),
+    };
+    vec![
+        Rule::RustFileGroup(crate::buck::RustFileGroup {
+            name: crate::universe::STANDALONE_SRCS.to_owned(),
+            srcs: crate::buck::Glob {
+                include: std::collections::BTreeSet::from(["**/**".to_owned()]),
+                ..Default::default()
+            },
+            mapped_srcs,
+            visibility: visibility.clone(),
+        }),
+        Rule::Alias(crate::buck::Alias {
+            name: crate::universe::STANDALONE_MANIFEST.to_owned(),
+            actual: ":manifest".to_owned(),
+            visibility: visibility.clone(),
+        }),
+    ]
 }
 
 /// The `[package_macro]` call of a first-party package's BUCK file, when the
@@ -1679,11 +1765,13 @@ fn render_buck_content(
     let mut has_buildscript_run = false;
     let mut has_wasm_sha256 = false;
     let mut has_wasm_browser_test = false;
+    let mut has_rust_filegroup = false;
 
     for rule in rules {
         match rule {
             Rule::WasmSha256(_) => has_wasm_sha256 = true,
             Rule::WasmBrowserTest(_) => has_wasm_browser_test = true,
+            Rule::RustFileGroup(_) => has_rust_filegroup = true,
             Rule::CargoManifest(_) => has_cargo_manifest = true,
             Rule::RustLibrary(_) => has_rust_library = true,
             Rule::RustBinary(_) => has_rust_binary = true,
@@ -1730,6 +1818,13 @@ fn render_buck_content(
         loads.push(Rule::Load(Load {
             bzl: "@buckal//:wasm_digest.bzl".to_owned(),
             items: Set::from(["wasm_sha256".to_owned()]),
+        }));
+    }
+
+    if has_rust_filegroup {
+        loads.push(Rule::Load(Load {
+            bzl: crate::universe::RUST_FILEGROUP_BZL.to_owned(),
+            items: Set::from(["rust_filegroup".to_owned()]),
         }));
     }
 
@@ -1860,6 +1955,7 @@ mod tests {
             buildscript_inputs: Default::default(),
             wasm_modules: Default::default(),
             declared_test_env: Default::default(),
+            standalone_source_requests: Default::default(),
             root: None,
             resolve: empty_resolve(),
             repo_config: RepoConfig {
@@ -1901,6 +1997,7 @@ mod tests {
             buildscript_inputs: Default::default(),
             wasm_modules: Default::default(),
             declared_test_env: Default::default(),
+            standalone_source_requests: Default::default(),
             root: None,
             resolve: empty_resolve(),
             repo_config: RepoConfig {
@@ -1940,6 +2037,7 @@ mod tests {
             buildscript_inputs: Default::default(),
             wasm_modules: Default::default(),
             declared_test_env: Default::default(),
+            standalone_source_requests: Default::default(),
             root: None,
             resolve: empty_resolve(),
             repo_config: RepoConfig {
