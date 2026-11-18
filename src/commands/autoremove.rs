@@ -77,10 +77,12 @@ pub fn execute(args: &AutoremoveArgs) {
 }
 
 /// The source-kind directories of a universe's vendor tree: registry crates
-/// (`crates/`) and git crates (`git/`). Generation writes only these, so autoremove
-/// walks only these. The root universe's vendor tree also holds `standalone/`, the
-/// standalone universes' trees, which a root autoremove must never touch.
-const VENDOR_KINDS: [&str; 2] = ["crates", "git"];
+/// (`crates/`), git crates (`git/`) and, in a standalone universe, the project's
+/// path packages it generates into its own tree (`path/`). Generation writes only
+/// these, so autoremove walks only these. The root universe's vendor tree also
+/// holds `standalone/`, the standalone universes' trees, which a root autoremove
+/// must never touch.
+const VENDOR_KINDS: [&str; 3] = ["crates", "git", "path"];
 
 /// The `<kind>/<name>/<version>` directories of the vendor tree at `vendor_root`
 /// whose label is not in `used`, walking only [`VENDOR_KINDS`].
@@ -141,6 +143,7 @@ fn extract_kind_str(string: &str) -> Result<&str> {
         .ok_or_else(|| anyhow::format_err!("invalid source `{}`", string))?;
     match kind {
         "registry" => Ok("crates"),
+        // `path+file://…`: a standalone universe's `path/<name>/<version>`.
         _ => Ok(kind),
     }
 }
@@ -164,6 +167,7 @@ mod tests {
             "git/gdep/0.1.0",
             "standalone/guest/crates/sdep/2.0.0",
             "standalone/guest/git/gsdep/0.2.0",
+            "standalone/guest/path/shared/0.1.0",
         ] {
             mkdir(vendor, path);
         }
@@ -187,13 +191,23 @@ mod tests {
     fn test_standalone_autoremove_walks_its_own_tree() {
         let dir = tempfile::tempdir().unwrap();
         let vendor = dir.path().join("standalone/guest");
-        for path in ["crates/sdep/2.0.0", "crates/stale/0.1.0"] {
+        for path in [
+            "crates/sdep/2.0.0",
+            "crates/stale/0.1.0",
+            "path/shared/0.1.0",
+            "path/gone/0.1.0",
+        ] {
             mkdir(&vendor, path);
         }
-        let used: BTreeSet<String> = ["crates/sdep/2.0.0"].map(str::to_owned).into();
+        let used: BTreeSet<String> = ["crates/sdep/2.0.0", "path/shared/0.1.0"]
+            .map(str::to_owned)
+            .into();
         assert_eq!(
             unused_package_dirs(&vendor, &used).unwrap(),
-            [vendor.join("crates/stale/0.1.0")]
+            [
+                vendor.join("crates/stale/0.1.0"),
+                vendor.join("path/gone/0.1.0")
+            ]
         );
     }
 }

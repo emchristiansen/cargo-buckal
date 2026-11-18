@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Error, Result, anyhow};
 use cargo_metadata::{
@@ -117,6 +117,17 @@ pub trait BuckalHash {
 /// root, so the cache file is portable across checkouts at different paths.
 const WORKSPACE_ID_PLACEHOLDER: &str = "path+file://($WORKSPACE)";
 
+/// Placeholder written into `buckal.snap` in place of the absolute Buck2 project
+/// root, for a path package outside the workspace root but inside the project
+/// (a standalone universe's path dependencies on the project's own packages).
+pub const PROJECT_ID_PLACEHOLDER: &str = "path+file://($PROJECT)";
+
+/// The Buck2 project root, once a command has selected its universe
+/// ([`crate::universe::select`]): [`PROJECT_ID_PLACEHOLDER`] stands for it.
+fn project_root() -> Option<Utf8PathBuf> {
+    crate::universe::project_root().cloned()
+}
+
 /// The `path+file://…` package-id prefix Cargo emits for crates under
 /// `workspace_root`.
 ///
@@ -140,6 +151,61 @@ fn is_id_boundary(rest: &str) -> bool {
     rest.starts_with('/') || rest.starts_with('#')
 }
 
+/// `id` with `($WORKSPACE)` replaced by `workspace_root`, and `($PROJECT)` by
+/// `project_root` when given.
+fn resolve_with(
+    id: &PackageId,
+    workspace_root: &Utf8PathBuf,
+    project_root: Option<&Utf8PathBuf>,
+) -> PackageId {
+    if let Some(rest) = id.repr.strip_prefix(WORKSPACE_ID_PLACEHOLDER)
+        && is_id_boundary(rest)
+    {
+        return PackageId {
+            repr: format!("{}{rest}", workspace_id_prefix(workspace_root)),
+        };
+    }
+    if let (Some(project_root), Some(rest)) =
+        (project_root, id.repr.strip_prefix(PROJECT_ID_PLACEHOLDER))
+        && is_id_boundary(rest)
+    {
+        return PackageId {
+            repr: format!("{}{rest}", workspace_id_prefix(project_root)),
+        };
+    }
+    id.clone()
+}
+
+/// `id` with `workspace_root` replaced by `($WORKSPACE)`, else, for a path
+/// package elsewhere inside `project_root` (when given), the project root by
+/// `($PROJECT)`.
+fn canonicalize_with(
+    id: &PackageId,
+    workspace_root: &Utf8PathBuf,
+    project_root: Option<&Utf8PathBuf>,
+) -> PackageId {
+    if let Some(rest) = id
+        .repr
+        .strip_prefix(workspace_id_prefix(workspace_root).as_str())
+        && is_id_boundary(rest)
+    {
+        return PackageId {
+            repr: format!("{WORKSPACE_ID_PLACEHOLDER}{rest}"),
+        };
+    }
+    if let Some(project_root) = project_root
+        && let Some(rest) = id
+            .repr
+            .strip_prefix(workspace_id_prefix(project_root).as_str())
+        && is_id_boundary(rest)
+    {
+        return PackageId {
+            repr: format!("{PROJECT_ID_PLACEHOLDER}{rest}"),
+        };
+    }
+    id.clone()
+}
+
 pub trait PackageIdExt {
     /// ($WORKSPACE) → workspace_root
     fn resolve(&self, workspace_root: &Utf8PathBuf) -> Self;
@@ -150,22 +216,11 @@ pub trait PackageIdExt {
 
 impl PackageIdExt for PackageId {
     fn resolve(&self, workspace_root: &Utf8PathBuf) -> Self {
-        match self.repr.strip_prefix(WORKSPACE_ID_PLACEHOLDER) {
-            Some(rest) if is_id_boundary(rest) => PackageId {
-                repr: format!("{}{rest}", workspace_id_prefix(workspace_root)),
-            },
-            _ => self.clone(),
-        }
+        resolve_with(self, workspace_root, project_root().as_ref())
     }
 
     fn canonicalize(&self, workspace_root: &Utf8PathBuf) -> Self {
-        let prefix = workspace_id_prefix(workspace_root);
-        match self.repr.strip_prefix(prefix.as_str()) {
-            Some(rest) if is_id_boundary(rest) => PackageId {
-                repr: format!("{WORKSPACE_ID_PLACEHOLDER}{rest}"),
-            },
-            _ => self.clone(),
-        }
+        canonicalize_with(self, workspace_root, project_root().as_ref())
     }
 }
 
@@ -214,6 +269,12 @@ pub struct BuckalCache {
     /// was written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     package_tables: Option<PackageTablesRecord>,
+    /// A standalone universe's record: the packages of the project's own workspace
+    /// (their directories, relative to the Buck2 root) whose sources it compiles,
+    /// which the root generation exposes to it (see `crate::universe`). Empty, and
+    /// not written, when it compiles none.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    source_owners: BTreeSet<String>,
 }
 
 /// What `buckal.snap` records of the `[package_macro] tables` file a generation
@@ -335,6 +396,7 @@ impl BuckalCache {
             host_platform_differences: None,
             host_platform_difference_digests: None,
             package_tables: None,
+            source_owners: BTreeSet::new(),
         }
     }
 
@@ -350,6 +412,7 @@ impl BuckalCache {
             host_platform_differences: None,
             host_platform_difference_digests: None,
             package_tables: None,
+            source_owners: BTreeSet::new(),
         }
     }
 
@@ -362,6 +425,39 @@ impl BuckalCache {
         self.host_platform_differences = differences;
         self.host_platform_difference_digests = digests;
         self
+    }
+
+    /// Mix each `(package, bytes)` of `salts` into the package's fingerprint, so
+    /// that a change of the bytes regenerates it: what reaches a package's rules
+    /// from outside its resolution and configuration.
+    pub fn with_salts<'a>(
+        mut self,
+        salts: impl Iterator<Item = (&'a PackageId, Vec<u8>)>,
+        workspace_root: &Utf8PathBuf,
+    ) -> Self {
+        for (id, bytes) in salts {
+            if let Some(fingerprint) = self.fingerprints.get_mut(&id.canonicalize(workspace_root)) {
+                let mut hasher = blake3::Hasher::new();
+                hasher.update(&fingerprint.0);
+                hasher.update(b"salt");
+                hasher.update(&bytes);
+                *fingerprint = Fingerprint(*hasher.finalize().as_bytes());
+            }
+        }
+        self
+    }
+
+    /// Record the packages of the project's own workspace whose sources this
+    /// (standalone) generation compiles.
+    pub fn with_source_owners(mut self, owners: BTreeSet<String>) -> Self {
+        self.source_owners = owners;
+        self
+    }
+
+    /// The packages of the project's own workspace whose sources the generation
+    /// this cache records compiles.
+    pub fn source_owners(&self) -> &BTreeSet<String> {
+        &self.source_owners
     }
 
     /// Record the `[package_macro] tables` file this generation wrote, if any.
@@ -541,6 +637,7 @@ pub enum ChangeType {
 #[cfg(test)]
 mod tests {
     use super::PackageIdExt;
+    use super::{canonicalize_with, resolve_with};
     use cargo_metadata::{PackageId, camino::Utf8PathBuf};
 
     // `cargo metadata` reports `workspace_root` as a *native* filesystem path,
@@ -599,6 +696,34 @@ mod tests {
             id.canonicalize(&ws()).repr,
             "path+file://($WORKSPACE)/crates/foo#0.1.0",
             "a path crate under the workspace root must be rewritten to ($WORKSPACE)"
+        );
+    }
+
+    #[test]
+    fn canonicalize_writes_a_project_path_package_relative_to_the_project() {
+        let project = ws();
+        let workspace = project.join("standalone_workspaces").join("guest");
+        let outside = PackageId {
+            repr: format!("{}/libs/prelude#0.1.0", ws_prefix()),
+        };
+        let canonical = canonicalize_with(&outside, &workspace, Some(&project));
+        assert_eq!(canonical.repr, "path+file://($PROJECT)/libs/prelude#0.1.0");
+        assert_eq!(
+            resolve_with(&canonical, &workspace, Some(&project)).repr,
+            outside.repr
+        );
+        // The workspace's own packages keep `($WORKSPACE)`.
+        let own = PackageId {
+            repr: format!("{}/standalone_workspaces/guest#0.1.0", ws_prefix()),
+        };
+        assert_eq!(
+            canonicalize_with(&own, &workspace, Some(&project)).repr,
+            "path+file://($WORKSPACE)#0.1.0"
+        );
+        // Without a project root, nothing else changes.
+        assert_eq!(
+            canonicalize_with(&outside, &workspace, None).repr,
+            outside.repr
         );
     }
 

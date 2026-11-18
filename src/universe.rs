@@ -37,6 +37,17 @@ pub const CONFIG_FILE: &str = "buckal.toml";
 /// The generation record of a universe.
 pub const CACHE_FILE: &str = "buckal.snap";
 
+/// The `rust_filegroup` the root generation writes in a package of the project's
+/// own workspace whose sources a standalone universe compiles.
+pub const STANDALONE_SRCS: &str = "standalone-srcs";
+
+/// The `alias` of that package's `cargo_manifest` the root generation writes
+/// beside it, through which a universe's copy of the package reads its manifest.
+pub const STANDALONE_MANIFEST: &str = "standalone-manifest";
+
+/// The prelude file defining `rust_filegroup`.
+pub const RUST_FILEGROUP_BZL: &str = "@prelude//rust:sources.bzl";
+
 /// The universe a command generates.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Universe {
@@ -81,11 +92,11 @@ impl Universe {
     /// `<git root>/<name>/<version>` for a git package, and `None` for any other
     /// source (a path package is first-party, not vendored).
     pub fn vendor_path_relative(&self, repr: &str) -> Result<Option<String>> {
-        // A path package is never vendored. Its package-id may also not parse as a
-        // spec: Cargo writes a package named after its directory without the name
+        // A path package's package-id may not parse as a spec: Cargo writes a
+        // package named after its directory without the name
         // (`path+file:///…/guest#0.1.0`).
         if repr.starts_with("path+") {
-            return Ok(None);
+            return Ok(self.path_package_dir(repr));
         }
         let spec =
             PackageIdSpec::parse(repr).with_context(|| format!("`{repr}` is not a package-id"))?;
@@ -98,6 +109,27 @@ impl Universe {
             .version()
             .with_context(|| format!("package-id `{repr}` names no version"))?;
         Ok(Some(format!("{root}/{}/{version}", spec.name())))
+    }
+
+    /// Where the universe generates the path package whose canonical package-id
+    /// is `repr`: a standalone universe generates a path package of the project
+    /// outside its own workspace (`path+file://($PROJECT)/<dir>#…`, see
+    /// [`crate::cache::PROJECT_ID_PLACEHOLDER`]) into
+    /// `<vendor root>/path/<name>/<version>`, so that it never writes the owning
+    /// package's BUCK file. Every other path package is generated in place:
+    /// `None`.
+    pub fn path_package_dir(&self, repr: &str) -> Option<String> {
+        let Universe::Standalone { .. } = self else {
+            return None;
+        };
+        let rest = repr.strip_prefix(crate::cache::PROJECT_ID_PLACEHOLDER)?;
+        let (dir, fragment) = rest.split_once('#')?;
+        let (name, version) = match fragment.split_once('@') {
+            Some((name, version)) => (name, version),
+            // Named after its directory: Cargo leaves the name out.
+            None => (dir.rsplit('/').next()?, fragment),
+        };
+        Some(format!("{}/path/{name}/{version}", self.vendor_root()))
     }
 
     /// The universe `manifest_path` selects, `buck2_root` being the Buck2 project
@@ -127,7 +159,7 @@ impl Universe {
         let root = buck2_root
             .canonicalize_utf8()
             .with_context(|| format!("failed to resolve the Buck2 root {buck2_root}"))?;
-        if dir == root || !dir.join(CONFIG_FILE).is_file() {
+        if dir == root || !holds_file(&dir, CONFIG_FILE)? {
             return Ok(Universe::Root);
         }
         let Ok(relative) = dir.strip_prefix(&root) else {
@@ -163,7 +195,7 @@ fn enclosing_standalone(cwd: &Utf8Path, buck2_root: &Utf8Path) -> Result<Option<
         if relative.as_str().is_empty() {
             return Ok(None);
         }
-        if dir.join(CONFIG_FILE).is_file() && dir.join("Cargo.toml").is_file() {
+        if holds_file(dir, CONFIG_FILE)? && holds_file(dir, "Cargo.toml")? {
             return Ok(Some(relative.to_owned()));
         }
     }
@@ -171,6 +203,14 @@ fn enclosing_standalone(cwd: &Utf8Path, buck2_root: &Utf8Path) -> Result<Option<
 }
 
 static SELECTED: OnceLock<Universe> = OnceLock::new();
+
+static PROJECT_ROOT: OnceLock<Utf8PathBuf> = OnceLock::new();
+
+/// The Buck2 project root, once [`select`] has run: generation records a path
+/// package outside its workspace but inside the project relative to it.
+pub fn project_root() -> Option<&'static Utf8PathBuf> {
+    PROJECT_ROOT.get()
+}
 
 /// Select the universe `manifest_path` names for the rest of the process. A command
 /// taking `--manifest-path` calls this before it reads a configuration, a
@@ -197,6 +237,7 @@ pub fn select(manifest_path: Option<&str>) -> Result<&'static Universe> {
         }
     }
     let universe = Universe::of_manifest(manifest_path, &buck2_root)?;
+    let _ = PROJECT_ROOT.set(buck2_root.clone());
     if matches!(universe, Universe::Standalone { .. }) {
         use crate::buckify::tables::{CellLayout, check_universe_names, standalone_universes};
         let layout = CellLayout::of_project(&buck2_root).map_err(anyhow::Error::msg)?;
@@ -211,6 +252,27 @@ pub fn select(manifest_path: Option<&str>) -> Result<&'static Universe> {
 }
 
 /// The selected universe: the root universe unless [`select`] chose another.
+/// Whether `dir` holds the file `name`, deciding for selection, the walk of the
+/// project and configuration loading alike whether a directory is a universe. A
+/// symlink counts as the file it resolves to. A dangling symlink, or an entry that
+/// is not a file, is refused: the walk sees the entry while a check that follows
+/// it sees nothing, so counting it either way would let the two disagree.
+pub fn holds_file(dir: &Utf8Path, name: &str) -> Result<bool> {
+    let path = dir.join(name);
+    match path.symlink_metadata() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("failed to inspect {path}")),
+        Ok(_) => {}
+    }
+    let metadata = path
+        .metadata()
+        .with_context(|| format!("{path} is a symlink that resolves to no file"))?;
+    if !metadata.is_file() {
+        bail!("{path} is not a file");
+    }
+    Ok(true)
+}
+
 pub fn selected() -> &'static Universe {
     SELECTED.get_or_init(|| Universe::Root)
 }
@@ -324,6 +386,36 @@ mod tests {
     }
 
     #[test]
+    fn test_a_project_path_package_is_generated_into_the_universe_tree() {
+        let universe = Universe::Standalone {
+            dir: "standalone_workspaces/guest".into(),
+            name: "guest".to_owned(),
+        };
+        assert_eq!(
+            universe
+                .vendor_path_relative("path+file://($PROJECT)/libs/shared_lib#shared-lib@0.2.0")
+                .unwrap()
+                .as_deref(),
+            Some("third-party/rust/standalone/guest/path/shared-lib/0.2.0")
+        );
+        // Named after its directory: the name is the directory's.
+        assert_eq!(
+            universe
+                .vendor_path_relative("path+file://($PROJECT)/libs/prelude#0.1.0")
+                .unwrap()
+                .as_deref(),
+            Some("third-party/rust/standalone/guest/path/prelude/0.1.0")
+        );
+        // The root universe generates its path packages in place.
+        assert_eq!(
+            Universe::Root
+                .vendor_path_relative("path+file://($PROJECT)/libs/prelude#0.1.0")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn test_inside_a_standalone_workspace_is_found() {
         let dir = project();
         let root = root_of(&dir);
@@ -345,6 +437,34 @@ mod tests {
         );
         // The root itself, with its own buckal.toml, is not standalone.
         assert_eq!(enclosing_standalone(&root, &root).unwrap(), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_selection_follows_a_symlinked_configuration_and_refuses_a_dangling_one() {
+        let dir = project();
+        let root = root_of(&dir);
+        let guest = root.join("standalone_workspaces/guest");
+        let manifest = guest.join("Cargo.toml");
+        std::os::unix::fs::symlink("missing.toml", guest.join(CONFIG_FILE)).unwrap();
+        let error = Universe::of_manifest(Some(manifest.as_str()), &root).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("is a symlink that resolves to no file"),
+            "{error:#}"
+        );
+        assert!(enclosing_standalone(&guest, &root).is_err());
+        std::fs::write(guest.join("missing.toml"), "").unwrap();
+        assert_eq!(
+            Universe::of_manifest(Some(manifest.as_str()), &root).unwrap(),
+            Universe::Standalone {
+                dir: "standalone_workspaces/guest".into(),
+                name: "guest".to_owned()
+            }
+        );
+        assert_eq!(
+            enclosing_standalone(&guest, &root).unwrap(),
+            Some("standalone_workspaces/guest".into())
+        );
     }
 
     #[test]

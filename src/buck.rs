@@ -29,6 +29,8 @@ pub enum Rule {
     WasmSha256(WasmSha256),
     WasmBrowserTest(WasmBrowserTest),
     PackageMacro(PackageMacro),
+    RustFileGroup(RustFileGroup),
+    Alias(Alias),
 }
 
 /// The comment line generation writes directly above the `load` and the call of
@@ -64,6 +66,31 @@ pub struct ConfiguredAlias {
     pub name: String,
     pub actual: String,
     pub platform: String,
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub visibility: Set<String>,
+}
+
+/// The prelude's `rust_filegroup` (`@prelude//rust:sources.bzl`): the package's
+/// sources (`srcs`, at `<package>/<path>`) and `mapped_srcs` (at their repository
+/// paths) as one repository-shaped tree, which a Rust rule in another package
+/// compiles through `srcs_filegroup`.
+#[derive(Serialize, Debug, PartialEq, Clone)]
+#[serde(rename = "rust_filegroup")]
+pub struct RustFileGroup {
+    pub name: String,
+    pub srcs: Glob,
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub mapped_srcs: Map<String, String>,
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub visibility: Set<String>,
+}
+
+/// Buck2's native `alias`: `actual` under another name and visibility.
+#[derive(Serialize, Debug, PartialEq, Clone)]
+#[serde(rename = "alias")]
+pub struct Alias {
+    pub name: String,
+    pub actual: String,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub visibility: Set<String>,
 }
@@ -111,6 +138,8 @@ impl Rule {
             Rule::WasmSha256(_) => "wasm_sha256",
             Rule::WasmBrowserTest(_) => "wasm_browser_test",
             Rule::PackageMacro(m) => &m.function,
+            Rule::RustFileGroup(_) => "rust_filegroup",
+            Rule::Alias(_) => "alias",
         }
     }
 
@@ -131,6 +160,8 @@ impl Rule {
             Rule::WasmSha256(r) => Some(&r.name),
             Rule::WasmBrowserTest(r) => Some(&r.name),
             Rule::PackageMacro(_) => None,
+            Rule::RustFileGroup(r) => Some(&r.name),
+            Rule::Alias(r) => Some(&r.name),
         }
     }
 
@@ -223,7 +254,13 @@ pub const EXPORT_FILES_LABEL: &str = "buckal-export-files";
 #[serde(rename = "rust_library")]
 pub struct RustLibrary {
     pub name: String,
+    #[serde(skip_serializing_if = "Srcs::is_empty")]
     pub srcs: Srcs,
+    /// A `rust_filegroup` in another package holding the crate's sources as a
+    /// repository-shaped tree, in place of `srcs` and `mapped_srcs`; `crate_root`
+    /// is then a path inside that tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub srcs_filegroup: Option<String>,
     /// Extra sources: label -> path inside the crate's sources.
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub mapped_srcs: Map<String, String>,
@@ -266,7 +303,13 @@ pub struct RustLibrary {
 #[serde(rename = "rust_binary")]
 pub struct RustBinary {
     pub name: String,
+    #[serde(skip_serializing_if = "Srcs::is_empty")]
     pub srcs: Srcs,
+    /// A `rust_filegroup` in another package holding the crate's sources as a
+    /// repository-shaped tree, in place of `srcs` and `mapped_srcs`; `crate_root`
+    /// is then a path inside that tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub srcs_filegroup: Option<String>,
     /// Extra sources: label -> path inside the crate's sources.
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub mapped_srcs: Map<String, String>,
@@ -307,7 +350,13 @@ pub struct RustBinary {
 #[serde(rename = "rust_test")]
 pub struct RustTest {
     pub name: String,
+    #[serde(skip_serializing_if = "Srcs::is_empty")]
     pub srcs: Srcs,
+    /// A `rust_filegroup` in another package holding the crate's sources as a
+    /// repository-shaped tree, in place of `srcs` and `mapped_srcs`; `crate_root`
+    /// is then a path inside that tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub srcs_filegroup: Option<String>,
     /// Extra sources: label -> path inside the crate's sources.
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub mapped_srcs: Map<String, String>,
@@ -616,6 +665,13 @@ pub struct Glob {
 pub enum Srcs {
     Labels(Set<String>),
     Glob(Glob),
+}
+
+impl Srcs {
+    /// Whether there are no sources (with a `srcs_filegroup` in their place).
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Srcs::Labels(labels) if labels.is_empty())
+    }
 }
 
 impl Default for Srcs {
@@ -1202,6 +1258,7 @@ impl RustLibrary {
     fn from_kwargs(kwargs: &RuleKwargs) -> anyhow::Result<Self> {
         let name = kwargs.get_str("name")?;
         let srcs = kwargs.get_srcs("srcs");
+        let srcs_filegroup = kwargs.get_str_opt("srcs_filegroup");
         let mapped_srcs = kwargs.get_dict("mapped_srcs");
         let crate_name = kwargs.get_str("crate")?;
         let crate_root = kwargs.get_str("crate_root")?;
@@ -1221,6 +1278,7 @@ impl RustLibrary {
         Ok(RustLibrary {
             name,
             srcs,
+            srcs_filegroup,
             mapped_srcs,
             crate_name,
             crate_root,
@@ -1246,6 +1304,7 @@ impl RustBinary {
     fn from_kwargs(kwargs: &RuleKwargs) -> anyhow::Result<Self> {
         let name = kwargs.get_str("name")?;
         let srcs = kwargs.get_srcs("srcs");
+        let srcs_filegroup = kwargs.get_str_opt("srcs_filegroup");
         let mapped_srcs = kwargs.get_dict("mapped_srcs");
         let crate_name = kwargs.get_str("crate")?;
         let crate_root = kwargs.get_str("crate_root")?;
@@ -1264,6 +1323,7 @@ impl RustBinary {
         Ok(RustBinary {
             name,
             srcs,
+            srcs_filegroup,
             mapped_srcs,
             crate_name,
             crate_root,
@@ -1288,6 +1348,7 @@ impl RustTest {
     fn from_kwargs(kwargs: &RuleKwargs) -> anyhow::Result<Self> {
         let name = kwargs.get_str("name")?;
         let srcs = kwargs.get_srcs("srcs");
+        let srcs_filegroup = kwargs.get_str_opt("srcs_filegroup");
         let mapped_srcs = kwargs.get_dict("mapped_srcs");
         let crate_name = kwargs.get_str("crate")?;
         let crate_root = kwargs.get_str("crate_root")?;
@@ -1316,6 +1377,7 @@ impl RustTest {
         Ok(RustTest {
             name,
             srcs,
+            srcs_filegroup,
             mapped_srcs,
             crate_name,
             crate_root,
@@ -2586,6 +2648,7 @@ mod tests {
         let expected = Rule::RustLibrary(RustLibrary {
             name: "example_lib".to_string(),
             srcs: Set::from(["src/lib.rs".to_string()]).into(),
+            srcs_filegroup: None,
             mapped_srcs: Map::new(),
             crate_name: "example_lib".to_string(),
             crate_root: "src/lib.rs".to_string(),
@@ -2625,6 +2688,7 @@ mod tests {
         let expected = Rule::RustBinary(RustBinary {
             name: "example_bin".to_string(),
             srcs: Set::from(["src/main.rs".to_string()]).into(),
+            srcs_filegroup: None,
             mapped_srcs: Map::new(),
             crate_name: "example_bin".to_string(),
             crate_root: "src/main.rs".to_string(),
@@ -2663,6 +2727,7 @@ mod tests {
         let expected = Rule::RustTest(RustTest {
             name: "example_test".to_string(),
             srcs: Set::from(["src/lib.rs".to_string()]).into(),
+            srcs_filegroup: None,
             mapped_srcs: Map::new(),
             crate_name: "example_test".to_string(),
             crate_root: "src/lib.rs".to_string(),

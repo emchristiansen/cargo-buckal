@@ -4,6 +4,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::Result;
+use cargo_metadata::camino::Utf8Path;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -883,7 +884,22 @@ impl RepoConfig {
     pub fn load() -> Self {
         let repo_config_path = Self::repo_config_path();
 
-        if !repo_config_path.exists() {
+        // A dangling symlink is refused, not read as no configuration.
+        let directory = Utf8Path::from_path(&repo_config_path)
+            .and_then(Utf8Path::parent)
+            .unwrap_or_else(|| {
+                buckal_error!(format!(
+                    "the repository configuration path {} is not a UTF-8 file path",
+                    repo_config_path.display()
+                ));
+                std::process::exit(1);
+            });
+        let present = crate::universe::holds_file(directory, crate::universe::CONFIG_FILE)
+            .unwrap_or_else(|error| {
+                buckal_error!(format!("{error:#}"));
+                std::process::exit(1);
+            });
+        if !present {
             return Self::default();
         }
 

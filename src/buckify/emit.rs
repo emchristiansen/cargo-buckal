@@ -14,6 +14,7 @@ use crate::{
         BuildscriptRun, CargoManifest, CargoTargetKind, ExportFile, FileGroup, GitFetch, Glob,
         HttpArchive, RustBinary, RustLibrary, RustRule, RustTest, Srcs,
     },
+    buckal_error,
     buckify::actions::is_third_party,
     context::BuckalContext,
     platform::{buck_labels, lookup_platforms},
@@ -54,14 +55,11 @@ pub(super) fn emit_rust_library(
     }
 
     // Set the crate root path
-    rust_library.crate_root = vendor.crate_path(&normalize_path_for_buck(
-        lib_target
-            .src_path
-            .to_owned()
-            .strip_prefix(manifest_dir)
-            .expect("Failed to get library source path")
-            .as_str(),
-    ));
+    let (srcs, srcs_filegroup, crate_root) =
+        target_sources(node, lib_target, manifest_dir, &vendor, ctx);
+    rust_library.srcs = srcs;
+    rust_library.srcs_filegroup = srcs_filegroup;
+    rust_library.crate_root = crate_root;
 
     // look up platform compatibility
     if let Some(platforms) = static_platforms(node, ctx) {
@@ -106,14 +104,11 @@ pub(super) fn emit_rust_binary(
     };
 
     // Set the crate root path
-    rust_binary.crate_root = vendor.crate_path(&normalize_path_for_buck(
-        bin_target
-            .src_path
-            .to_owned()
-            .strip_prefix(manifest_dir)
-            .expect("Failed to get binary source path")
-            .as_str(),
-    ));
+    let (srcs, srcs_filegroup, crate_root) =
+        target_sources(node, bin_target, manifest_dir, &vendor, ctx);
+    rust_binary.srcs = srcs;
+    rust_binary.srcs_filegroup = srcs_filegroup;
+    rust_binary.crate_root = crate_root;
 
     // Set dependencies
     set_deps(&mut rust_binary, node, CargoTargetKind::Bin, ctx)
@@ -157,14 +152,11 @@ pub(super) fn emit_test_module(
         visibility: Set::from(["PUBLIC".to_owned()]),
         ..Default::default()
     };
-    rust_binary.crate_root = vendor.crate_path(&normalize_path_for_buck(
-        lib_target
-            .src_path
-            .to_owned()
-            .strip_prefix(manifest_dir)
-            .expect("Failed to get library source path")
-            .as_str(),
-    ));
+    let (srcs, srcs_filegroup, crate_root) =
+        target_sources(node, lib_target, manifest_dir, &vendor, ctx);
+    rust_binary.srcs = srcs;
+    rust_binary.srcs_filegroup = srcs_filegroup;
+    rust_binary.crate_root = crate_root;
     set_deps(&mut rust_binary, node, CargoTargetKind::Test, ctx)
         .unwrap_or_exit_ctx(format!("failed to set dependencies for '{}'", buckal_name));
     platform_compatibility(
@@ -200,14 +192,11 @@ pub(super) fn emit_rust_test(
     };
 
     // Set the crate root path
-    rust_test.crate_root = vendor.crate_path(&normalize_path_for_buck(
-        test_target
-            .src_path
-            .to_owned()
-            .strip_prefix(manifest_dir)
-            .expect("Failed to get test source path")
-            .as_str(),
-    ));
+    let (srcs, srcs_filegroup, crate_root) =
+        target_sources(node, test_target, manifest_dir, &vendor, ctx);
+    rust_test.srcs = srcs;
+    rust_test.srcs_filegroup = srcs_filegroup;
+    rust_test.crate_root = crate_root;
 
     // Set dependencies
     set_deps(&mut rust_test, node, CargoTargetKind::Test, ctx)
@@ -334,14 +323,11 @@ pub(super) fn emit_buildscript_build(
     };
 
     // Set the crate root path for the build script
-    buildscript_build.crate_root = vendor.crate_path(&normalize_path_for_buck(
-        build_target
-            .src_path
-            .to_owned()
-            .strip_prefix(manifest_dir)
-            .expect("Failed to get build script source path")
-            .as_str(),
-    ));
+    let (srcs, srcs_filegroup, crate_root) =
+        target_sources(node, build_target, manifest_dir, &vendor, ctx);
+    buildscript_build.srcs = srcs;
+    buildscript_build.srcs_filegroup = srcs_filegroup;
+    buildscript_build.crate_root = crate_root;
 
     // Set dependencies for the build script
     set_deps(
@@ -623,12 +609,12 @@ fn get_build_name(s: &str) -> Cow<'_, str> {
 }
 
 /// Get the name of the vendor target
-fn get_vendor_name() -> Cow<'static, str> {
+pub(super) fn get_vendor_name() -> Cow<'static, str> {
     Cow::Borrowed("vendor")
 }
 
 /// Get the label of the vendor target
-fn get_vendor_target() -> String {
+pub(super) fn get_vendor_target() -> String {
     format!(":{}", get_vendor_name())
 }
 
@@ -642,6 +628,154 @@ pub(super) fn node_features(node: &BuckalNode) -> (Set<String>, PlatformAttrs) {
     } else {
         split_features(&node.platform_features.features)
     }
+}
+
+/// The `srcs`, `srcs_filegroup` and `crate_root` of `target`'s rule: the
+/// package's own sources ([`VendorRef`]), or, for a target a standalone universe
+/// compiles from another package's directory ([`standalone_sources`]), that
+/// package's `standalone-srcs` filegroup with the crate root at its repository
+/// path.
+fn target_sources(
+    node: &BuckalNode,
+    target: &BuckalTarget,
+    manifest_dir: &Utf8Path,
+    vendor: &VendorRef,
+    ctx: &BuckalContext,
+) -> (Srcs, Option<String>, String) {
+    if let Some(sources) = standalone_sources(node, &target.src_path, manifest_dir, ctx) {
+        return (Srcs::default(), Some(sources.filegroup), sources.crate_root);
+    }
+    let relative = target.src_path.strip_prefix(manifest_dir).unwrap_or_else(|_| {
+        buckal_error!(format!(
+            "the source `{}` of target `{}` of package `{}` lies outside the package directory `{manifest_dir}`; only a standalone universe compiles a target from another package's directory",
+            target.src_path, target.name, node.name
+        ));
+        std::process::exit(1);
+    });
+    (
+        vendor.srcs.clone(),
+        None,
+        vendor.crate_path(&normalize_path_for_buck(relative.as_str())),
+    )
+}
+
+/// The sources of a target a standalone universe compiles from a package
+/// directory of the project's own workspace (see [`crate::universe`]).
+pub(crate) struct StandaloneSources {
+    /// The owning package's directory, relative to the Buck2 root.
+    pub owner: String,
+    /// `//<owner>:standalone-srcs`, the owner's `rust_filegroup`.
+    pub filegroup: String,
+    /// The target's source root, relative to the Buck2 root: its path inside the
+    /// filegroup's repository-shaped tree.
+    pub crate_root: String,
+}
+
+/// Where a standalone universe finds the sources of the target of first-party
+/// `node` whose source root is `src_path`: `None` when they are the package's own
+/// (it is the universe's, and the source lies in its directory). Otherwise the
+/// owner is the package of the project's own workspace whose directory holds
+/// them: for a path package of the project outside the universe
+/// ([`crate::universe::Universe::path_package_dir`]), its own directory; for a
+/// target whose source lies outside its package's directory (a crate root named
+/// by `path = "../.."`), the nearest directory above the source with a
+/// `Cargo.toml`. The root universe compiles every first-party package in place.
+pub(crate) fn standalone_sources(
+    node: &BuckalNode,
+    src_path: &Utf8Path,
+    manifest_dir: &Utf8Path,
+    ctx: &BuckalContext,
+) -> Option<StandaloneSources> {
+    use crate::cache::PackageIdExt;
+
+    let universe = crate::universe::selected();
+    if *universe == crate::universe::Universe::Root
+        || !matches!(node.kind, NodeKind::FirstParty { .. })
+    {
+        return None;
+    }
+    // Cargo joins a crate root named by `path = "../.."` without resolving it.
+    let src_path = &lexically_normal(src_path);
+    let canonical = node.package_id.canonicalize(&ctx.workspace_root);
+    let path_package = universe.path_package_dir(&canonical.repr).is_some();
+    if !path_package && src_path.starts_with(manifest_dir) {
+        return None;
+    }
+    let buck2_root = get_buck2_root().unwrap_or_exit_ctx("failed to get Buck2 root");
+    let owner = if path_package {
+        Some(manifest_dir.to_owned())
+    } else {
+        src_path
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| dir.starts_with(&buck2_root) && *dir != buck2_root)
+            .find(|dir| dir.join("Cargo.toml").is_file())
+            .map(Utf8Path::to_owned)
+    };
+    let universe_dir = buck2_root.join(universe.config_dir());
+    let owner = match owner {
+        Some(owner) if !owner.starts_with(&universe_dir) => owner,
+        _ => {
+            buckal_error!(format!(
+                "`{}` of package `{}` lies in no package of the Buck2 project's own workspace outside the standalone workspace `{}`, so no package can expose it to the universe",
+                src_path,
+                node.name,
+                universe.config_dir()
+            ));
+            std::process::exit(1);
+        }
+    };
+    let relative = |path: &Utf8Path| {
+        normalize_path_for_buck(
+            path.strip_prefix(&buck2_root)
+                .expect("below the Buck2 root")
+                .as_str(),
+        )
+    };
+    let owner = relative(&owner);
+    Some(StandaloneSources {
+        filegroup: format!("//{owner}:{}", crate::universe::STANDALONE_SRCS),
+        crate_root: relative(src_path),
+        owner,
+    })
+}
+
+/// The packages of the project's own workspace (their directories, relative to the
+/// Buck2 root) whose sources the selected standalone universe compiles: what its
+/// record keeps, so that the root generation writes their `standalone-srcs` and
+/// `standalone-manifest` (empty for the root universe).
+pub(crate) fn standalone_source_owners(ctx: &BuckalContext) -> Set<String> {
+    ctx.resolve
+        .nodes()
+        .filter(|node| matches!(node.kind, NodeKind::FirstParty { .. }))
+        .flat_map(|node| {
+            let manifest_dir = manifest_dir_of(node);
+            node.targets
+                .iter()
+                .filter_map(move |target| {
+                    standalone_sources(node, &target.src_path, manifest_dir, ctx)
+                })
+                .map(|sources| sources.owner)
+        })
+        .collect()
+}
+
+/// `path` with its `.` components dropped and each `..` applied to the component
+/// before it, without consulting the file system.
+fn lexically_normal(path: &Utf8Path) -> Utf8PathBuf {
+    use cargo_metadata::camino::Utf8Component;
+
+    let mut normal = Utf8PathBuf::new();
+    for component in path.components() {
+        match component {
+            Utf8Component::CurDir => {}
+            Utf8Component::ParentDir => {
+                normal.pop();
+            }
+            other => normal.push(other.as_str()),
+        }
+    }
+    normal
 }
 
 /// Where a package's sources are found relative to its BUCK file.
@@ -796,7 +930,7 @@ fn is_workspace_root(manifest: &Utf8Path) -> bool {
 /// Normalize a path for Buck by converting backslashes to forward slashes.
 /// This normalization is critical on Windows, where paths use backslashes,
 /// as Buck2 requires forward slashes in all generated BUCK files regardless of the host platform.
-fn normalize_path_for_buck(path: &str) -> String {
+pub(super) fn normalize_path_for_buck(path: &str) -> String {
     path.replace('\\', "/")
 }
 

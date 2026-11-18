@@ -231,19 +231,25 @@ pub fn standalone_universes(
     root: &Utf8Path,
     layout: &CellLayout,
 ) -> Result<Vec<FoundUniverse>, String> {
-    use crate::universe::{CACHE_FILE, CONFIG_FILE, Universe};
+    use crate::universe::{CACHE_FILE, CONFIG_FILE, Universe, holds_file};
 
     let files = root_cell_files(root, layout)?;
     let present: BTreeSet<(&str, &str)> = files
         .iter()
         .map(|(dir, name)| (dir.as_str(), name.as_str()))
         .collect();
-    Ok(files
-        .iter()
-        .filter(|(dir, name)| {
-            dir != "." && name == CONFIG_FILE && present.contains(&(dir.as_str(), "Cargo.toml"))
-        })
-        .map(|(dir, _)| FoundUniverse {
+    let mut universes = Vec::new();
+    for (dir, name) in &files {
+        if dir == "." || name != CONFIG_FILE || !present.contains(&(dir.as_str(), "Cargo.toml")) {
+            continue;
+        }
+        // The walk does not follow symlinks; refuse one that resolves to no file,
+        // as selection does.
+        let path = root.join(dir);
+        for name in [CONFIG_FILE, "Cargo.toml"] {
+            holds_file(&path, name).map_err(|error| format!("{error:#}"))?;
+        }
+        universes.push(FoundUniverse {
             universe: Universe::Standalone {
                 dir: dir.into(),
                 name: dir
@@ -252,8 +258,9 @@ pub fn standalone_universes(
                     .to_owned(),
             },
             recorded: present.contains(&(dir.as_str(), CACHE_FILE)),
-        })
-        .collect())
+        });
+    }
+    Ok(universes)
 }
 
 /// Refuse two standalone universes that would share a vendor tree
@@ -301,8 +308,9 @@ pub fn check_universe_names(
 ///
 /// Refused: universes sharing a vendor tree ([`check_universe_names`]), and a
 /// universe whose vendor tree exists but whose record does not (its BUCK files
-/// could not be told from hand-written ones). A universe never generated, with
-/// neither, contributes nothing.
+/// could not be told from hand-written ones), unless a recorded universe of the
+/// same name owns that tree. A universe never generated, with neither,
+/// contributes nothing.
 pub fn standalone_package_dirs(
     root: &Utf8Path,
     layout: &CellLayout,
@@ -311,10 +319,26 @@ pub fn standalone_package_dirs(
 
     let found = standalone_universes(root, layout)?;
     check_universe_names(&found, None)?;
+    // The names whose vendor tree a recorded universe owns.
+    let recorded_names: BTreeSet<&str> = found
+        .iter()
+        .filter(|found| found.recorded)
+        .filter_map(|found| match &found.universe {
+            crate::universe::Universe::Standalone { name, .. } => Some(name.as_str()),
+            crate::universe::Universe::Root => None,
+        })
+        .collect();
     let mut dirs = BTreeSet::new();
     for FoundUniverse { universe, recorded } in &found {
         let dir = universe.config_dir();
         if !recorded {
+            // An unrecorded directory sharing a recorded universe's name (a fixture,
+            // or a copy) does not own that universe's vendor tree.
+            if let crate::universe::Universe::Standalone { name, .. } = universe
+                && recorded_names.contains(name.as_str())
+            {
+                continue;
+            }
             let vendor = root.join(universe.vendor_root());
             if vendor.exists() {
                 return Err(format!(
@@ -336,6 +360,34 @@ pub fn standalone_package_dirs(
         }
     }
     Ok(dirs)
+}
+
+/// What the standalone universes of the Buck2 project at `root` compile from the
+/// project's own packages, read from their records (`source_owners`): each owner
+/// directory (relative to the root) to the visibility its `standalone-srcs` and
+/// `standalone-manifest` need, the requesting universes' vendor trees and
+/// directories. A universe without a record requests nothing.
+pub fn standalone_source_requests(
+    root: &Utf8Path,
+    layout: &CellLayout,
+) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+    use crate::universe::CACHE_FILE;
+
+    let mut requests: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for FoundUniverse { universe, recorded } in standalone_universes(root, layout)? {
+        if !recorded {
+            continue;
+        }
+        let record = root.join(universe.config_dir()).join(CACHE_FILE);
+        let cache = crate::cache::BuckalCache::load_from(&record)
+            .map_err(|error| format!("{record}: {error}"))?;
+        for owner in cache.source_owners() {
+            let visibility = requests.entry(owner.clone()).or_default();
+            visibility.insert(format!("//{}/...", universe.vendor_root()));
+            visibility.insert(format!("//{}/...", universe.config_dir()));
+        }
+    }
+    Ok(requests)
 }
 
 /// The `[project] ignore` patterns as Buck2 matches them: globs relative to the
@@ -714,7 +766,9 @@ mod tests {
             index_map,
             test_only_edges: Default::default(),
         };
-        let generated = crate::buckify::actions::generated_package_dirs(&resolve).unwrap();
+        let generated =
+            crate::buckify::actions::generated_package_dirs(&resolve, &"/work/proj".into())
+                .unwrap();
         let packages = whole_repository_packages(&generated, "root");
         assert_eq!(
             packages.into_iter().collect::<Vec<_>>(),
@@ -900,6 +954,129 @@ mod tests {
         }
         let error = standalone_package_dirs(root, &layout).unwrap_err();
         assert!(error.contains("has no buckal.snap"), "{error}");
+    }
+
+    #[test]
+    fn test_universes_share_one_exposure_of_an_owner_and_list_their_path_packages() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(dir.path()).unwrap();
+        for path in [
+            "a/one/Cargo.toml",
+            "a/one/buckal.toml",
+            "b/two/Cargo.toml",
+            "b/two/buckal.toml",
+        ] {
+            touch(root, path);
+        }
+        let record = |ids: &[&str], owners: &[&str]| {
+            let mut record = standalone_record(ids);
+            record.insert_str(
+                0,
+                &format!(
+                    "source_owners = [{}]\n",
+                    owners
+                        .iter()
+                        .map(|owner| format!("\"{owner}\""))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+            record
+        };
+        std::fs::write(
+            root.join("a/one/buckal.snap"),
+            record(
+                &["path+file://($PROJECT)/libs/shared#0.1.0"],
+                &["libs/shared"],
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("b/two/buckal.snap"),
+            record(&[], &["libs/shared", "callosum"]),
+        )
+        .unwrap();
+        let layout = CellLayout::parse("").unwrap();
+        let requests = standalone_source_requests(root, &layout).unwrap();
+        assert_eq!(
+            requests.get("libs/shared").unwrap(),
+            &[
+                "//a/one/...",
+                "//b/two/...",
+                "//third-party/rust/standalone/one/...",
+                "//third-party/rust/standalone/two/...",
+            ]
+            .map(str::to_owned)
+            .into()
+        );
+        assert_eq!(requests.len(), 2);
+        // The universes' path packages are whole-repository packages of the root.
+        assert_eq!(
+            standalone_package_dirs(root, &layout).unwrap(),
+            ["third-party/rust/standalone/one/path/shared/0.1.0"]
+                .map(str::to_owned)
+                .into()
+        );
+    }
+
+    #[test]
+    fn test_an_unrecorded_namesake_of_a_recorded_universe_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(dir.path()).unwrap();
+        for path in [
+            "guests/ws/Cargo.toml",
+            "guests/ws/buckal.toml",
+            "fixtures/ws/Cargo.toml",
+            "fixtures/ws/buckal.toml",
+            "third-party/rust/standalone/ws/crates/sdep/2.0.0/BUCK",
+        ] {
+            touch(root, path);
+        }
+        std::fs::write(
+            root.join("guests/ws/buckal.snap"),
+            standalone_record(&[
+                "registry+https://github.com/rust-lang/crates.io-index#sdep@2.0.0",
+            ]),
+        )
+        .unwrap();
+        let layout = CellLayout::parse("").unwrap();
+        assert_eq!(
+            standalone_package_dirs(root, &layout).unwrap(),
+            ["third-party/rust/standalone/ws/crates/sdep/2.0.0"]
+                .map(str::to_owned)
+                .into()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_a_symlinked_universe_configuration_counts_and_a_dangling_one_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(dir.path()).unwrap();
+        for path in ["shared/buckal.toml", "guest/Cargo.toml", "other/Cargo.toml"] {
+            touch(root, path);
+        }
+        std::os::unix::fs::symlink("../shared/buckal.toml", root.join("guest/buckal.toml"))
+            .unwrap();
+        let layout = CellLayout::parse("").unwrap();
+        let found = standalone_universes(root, &layout).unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|found| found.universe.clone())
+                .collect::<Vec<_>>(),
+            [crate::universe::Universe::Standalone {
+                dir: "guest".into(),
+                name: "guest".to_owned()
+            }]
+        );
+        std::os::unix::fs::symlink("../missing/buckal.toml", root.join("other/buckal.toml"))
+            .unwrap();
+        let error = standalone_universes(root, &layout).unwrap_err();
+        assert!(
+            error.contains("other/buckal.toml is a symlink that resolves to no file"),
+            "{error}"
+        );
     }
 
     #[test]
