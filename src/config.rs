@@ -233,8 +233,9 @@ pub struct RepoConfig {
 /// `[package.metadata.buck2.wasm-test]` (and optionally
 /// `[package.metadata.buck2.wasm-test-variants.<name>]`): each with exactly its
 /// declared `features`, from Cargo's own `cargo test -p <package> --lib --features
-/// <features> --target wasm32-unknown-unknown` graph. See `crate::wasm` for what
-/// is emitted.
+/// <features> --target wasm32-unknown-unknown` graph. `--lib` names the library
+/// explicitly, so a listed package with `[lib] test = false` still gets its browser
+/// test (and no native `unittest`). See `crate::wasm` for what is emitted.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WasmConfig {
