@@ -607,6 +607,13 @@ pub struct PackageFixup {
     /// their project paths.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub test_resources: Vec<String>,
+    /// Sets of source files the package's tests read at run time, as labels of
+    /// targets whose default outputs are all source artifacts (e.g. an aggregate of
+    /// `mode = "reference"` exports). Emitted as the tests' `source_resource_sets`,
+    /// whose files the prelude adds to the test's inputs at their project paths; one
+    /// label brings many files, such as a Cargo workspace's read set.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub test_source_resource_sets: Vec<String>,
     /// How the package's tests execute: the name of a profile on the remote test
     /// execution toolchain, or `"disabled"`. Emitted as the `remote_execution` of
     /// every test target of the package. For tests that need a worker capability
