@@ -224,7 +224,7 @@ impl BuckalCache {
         patch_config: &RepoPatchConfig,
         fixups: &BTreeMap<String, PackageFixup>,
     ) -> Self {
-        Self::from_resolve_with_options(resolve, workspace_root, patch_config, fixups, &[])
+        Self::from_resolve_with_options(resolve, workspace_root, patch_config, fixups, &[], &[])
     }
 
     /// Fingerprints for the repository configuration `config`: its fixups (see
@@ -249,6 +249,7 @@ impl BuckalCache {
             &config.patch,
             &config.fixups,
             &key,
+            &config.third_party_generation_key(),
         )
     }
 
@@ -258,6 +259,7 @@ impl BuckalCache {
         patch_config: &RepoPatchConfig,
         fixups: &BTreeMap<String, PackageFixup>,
         first_party_key: &[u8],
+        third_party_key: &[u8],
     ) -> Self {
         let fingerprints = resolve
             .nodes()
@@ -271,6 +273,15 @@ impl BuckalCache {
                     hasher.update(&base.0);
                     hasher.update(b"workspace");
                     hasher.update(first_party_key);
+                    base = Fingerprint(*hasher.finalize().as_bytes());
+                }
+                if !third_party_key.is_empty()
+                    && matches!(node.kind, crate::resolve::NodeKind::ThirdParty)
+                {
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(&base.0);
+                    hasher.update(b"third_party");
+                    hasher.update(third_party_key);
                     base = Fingerprint(*hasher.finalize().as_bytes());
                 }
                 let fingerprint = match fixups.get(&node.name) {
@@ -612,5 +623,121 @@ mod tests {
             repr: format!("{}_sidecar/lib/bar#0.1.0", ws_prefix()),
         };
         assert_eq!(id.canonicalize(&ws()).repr, id.repr);
+    }
+}
+
+#[cfg(test)]
+mod package_macro_tests {
+    use std::collections::HashMap;
+
+    use cargo_metadata::{Edition, PackageId, camino::Utf8PathBuf};
+    use daggy::Dag;
+
+    use super::BuckalCache;
+    use crate::config::{MacroArg, PackageMacroConfig, RepoConfig};
+    use crate::resolve::{BuckalNode, BuckalResolve, NodeKind};
+
+    fn node(repr: &str, name: &str, kind: NodeKind) -> BuckalNode {
+        BuckalNode {
+            package_id: PackageId {
+                repr: repr.to_owned(),
+            },
+            name: name.to_owned(),
+            version: "1.0.0".to_owned(),
+            features: vec![],
+            platform_features: Default::default(),
+            kind,
+            edition: Edition::E2021,
+            manifest_path: Utf8PathBuf::from(format!("/work/proj/{name}/Cargo.toml")),
+            targets: vec![],
+            source: None,
+            links: None,
+            checksum: None,
+        }
+    }
+
+    /// The fingerprints of a first-party and a third-party package under `config`.
+    fn fingerprints(config: &RepoConfig) -> (super::Fingerprint, super::Fingerprint) {
+        let first = node(
+            "path+file:///work/proj/app#1.0.0",
+            "app",
+            NodeKind::FirstParty {
+                relative_path: "app".to_owned(),
+            },
+        );
+        let third = node(
+            "registry+https://github.com/rust-lang/crates.io-index#dep@1.0.0",
+            "dep",
+            NodeKind::ThirdParty,
+        );
+        let ids = (first.package_id.clone(), third.package_id.clone());
+        let mut dag = Dag::new();
+        let mut index_map = HashMap::new();
+        index_map.insert(ids.0.clone(), dag.add_node(first));
+        index_map.insert(ids.1.clone(), dag.add_node(third));
+        let resolve = BuckalResolve {
+            dag,
+            index_map,
+            test_only_edges: Default::default(),
+        };
+        let root = Utf8PathBuf::from("/work/proj");
+        let cache = BuckalCache::from_resolve_with_config(&resolve, &root, config, &[]);
+        let of = |id: &PackageId| {
+            cache
+                .fingerprints
+                .iter()
+                .find(|(key, _)| key.repr.ends_with(id.repr.rsplit('#').next().unwrap()))
+                .map(|(_, fingerprint)| *fingerprint)
+                .expect("fingerprint")
+        };
+        (of(&ids.0), of(&ids.1))
+    }
+
+    #[test]
+    fn test_package_macro_reaches_exactly_the_fingerprints_it_changes() {
+        let base = fingerprints(&RepoConfig::default());
+        let table = PackageMacroConfig {
+            bzl: "//buck2:inputs.bzl".to_owned(),
+            function: "declare_inputs".to_owned(),
+            ..PackageMacroConfig::default()
+        };
+        // Named but called nowhere: nothing changes.
+        let named = fingerprints(&RepoConfig {
+            package_macro: table.clone(),
+            ..RepoConfig::default()
+        });
+        assert_eq!(named, base);
+
+        let first = fingerprints(&RepoConfig {
+            package_macro: PackageMacroConfig {
+                first_party: true,
+                ..table.clone()
+            },
+            ..RepoConfig::default()
+        });
+        assert_ne!(first.0, base.0);
+        assert_eq!(first.1, base.1);
+
+        let third_config = PackageMacroConfig {
+            third_party: true,
+            ..table.clone()
+        };
+        let third = fingerprints(&RepoConfig {
+            package_macro: third_config.clone(),
+            ..RepoConfig::default()
+        });
+        assert_eq!(third.0, base.0);
+        assert_ne!(third.1, base.1);
+
+        let mut with_kwargs = third_config;
+        with_kwargs
+            .third_party_kwargs
+            .insert("whole_repository_only".to_owned(), MacroArg::Bool(true));
+        let third_kwargs = fingerprints(&RepoConfig {
+            package_macro: with_kwargs,
+            ..RepoConfig::default()
+        });
+        assert_eq!(third_kwargs.0, base.0);
+        assert_ne!(third_kwargs.1, third.1);
     }
 }
