@@ -335,7 +335,9 @@ pub struct PackageFixup {
     /// How the package's tests execute: the name of a profile on the remote test
     /// execution toolchain, or `"disabled"`. Emitted as the `remote_execution` of
     /// every test target of the package. For tests that need a worker capability
-    /// that other tests do not, such as a particular fixture filesystem.
+    /// that other tests do not, such as a particular fixture filesystem. A single
+    /// test's `[fixups.<pkg>.tests.<name>] remote_execution` replaces it for that
+    /// test.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_remote_execution: Option<String>,
     /// Environment for running the package's tests, not for compiling them. Added to
@@ -359,7 +361,8 @@ pub struct PackageFixup {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub export_files: Vec<ExportFileEntry>,
     /// Labels of every test of the package (its `rust_test` rules), e.g. a label
-    /// that keeps a test out of default runs.
+    /// that keeps a test out of default runs. A single test drops one with
+    /// `[fixups.<pkg>.tests.<name>] unset_labels`.
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub test_labels: Set<String>,
     /// `target_compatible_with` constraints (or config settings) of every test of
@@ -489,8 +492,20 @@ pub struct BuildscriptRunFixup {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct TestFixup {
+    /// Labels of this test, after the package's `test_labels`.
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub labels: Set<String>,
+    /// Labels of the package's `test_labels` this test does not get, e.g. a
+    /// live-effect label on a package whose other tests keep it. A label the
+    /// package's `test_labels` does not have, or that this test's `labels` adds, is
+    /// refused.
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub unset_labels: Set<String>,
+    /// How this test executes, instead of the package's `test_remote_execution`:
+    /// the name of a profile on the remote test execution toolchain, or
+    /// `"disabled"`. Emitted as the test target's `remote_execution`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_execution: Option<String>,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub target_compatible_with: Set<String>,
     /// Arguments after the package's `test_args`.
@@ -797,6 +812,48 @@ mod tests {
         assert_eq!(
             serde_json::to_string(other).unwrap(),
             r#"{"env":{"A":"1"}}"#
+        );
+    }
+
+    #[test]
+    fn test_repo_config_deserializes_per_test_execution_and_unset_labels() {
+        let config: RepoConfig = toml::from_str(
+            r#"
+                [fixups.client]
+                test_remote_execution = "disabled"
+                test_labels = ["unqualified-live-effect"]
+
+                [fixups.client.tests.pure]
+                remote_execution = "nativelink_test_result_reuse"
+                unset_labels = ["unqualified-live-effect"]
+            "#,
+        )
+        .expect("failed to deserialize repo config");
+        let fixup = config.fixups.get("client").expect("missing fixup");
+        let test = fixup.tests.get("pure").expect("missing test fixup");
+        assert_eq!(
+            test.remote_execution.as_deref(),
+            Some("nativelink_test_result_reuse")
+        );
+        assert_eq!(
+            test.unset_labels,
+            Set::from(["unqualified-live-effect".to_owned()])
+        );
+        // The package-wide setting is untouched by the per-test one.
+        assert_eq!(fixup.test_remote_execution.as_deref(), Some("disabled"));
+
+        // Unset, they are absent from the serialization (which the cache
+        // fingerprints), so existing per-test fixups keep their fingerprints.
+        let other: RepoConfig =
+            toml::from_str("[fixups.other.tests.it]\nlabels = [\"x\"]\n").expect("deserialize");
+        let it = other.fixups.get("other").unwrap().tests.get("it").unwrap();
+        assert_eq!(it.remote_execution, None);
+        assert!(it.unset_labels.is_empty());
+        assert_eq!(serde_json::to_string(it).unwrap(), r#"{"labels":["x"]}"#);
+
+        // A misspelt key is refused, not ignored.
+        assert!(
+            toml::from_str::<RepoConfig>("[fixups.c.tests.it]\nremote_executon = \"p\"\n").is_err()
         );
     }
 
