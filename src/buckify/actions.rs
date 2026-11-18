@@ -601,8 +601,9 @@ fn hand_written(buck_path: &Utf8Path, owned: &OwnedNames) -> Result<HandWritten,
     let mut hand = HandWritten::default();
     for (statement, &marked) in statements.iter().zip(&marks) {
         let text = content[statement.with_comments.clone()].to_owned();
-        if let TopLevelKind::Load(bzl, _) = &statement.kind
-            && bzl.starts_with("@buckal//")
+        if let TopLevelKind::Load(bzl, bindings) = &statement.kind
+            && (bzl.starts_with("@buckal//")
+                || is_generated_rust_filegroup_load(bzl, bindings, owned, &kept_calls))
         {
             continue;
         }
@@ -658,6 +659,29 @@ fn hand_written(buck_path: &Utf8Path, owned: &OwnedNames) -> Result<HandWritten,
     hand.statements
         .extend(trailing.map(|range| content[range].to_owned()));
     Ok(hand)
+}
+
+/// Whether a load of `bzl` binding `bindings` is the `rust_filegroup` load
+/// generation writes beside a standalone universe's source exposure
+/// ([`crate::universe::STANDALONE_SRCS`]), so it is generation's to replace or
+/// remove: it loads exactly `rust_filegroup` from
+/// [`crate::universe::RUST_FILEGROUP_BZL`], and either generation emits the
+/// exposure again (and with it its own load), or no kept call still uses
+/// `rust_filegroup`. A hand-written `rust_filegroup` call that outlives the
+/// exposure keeps the load it needs.
+fn is_generated_rust_filegroup_load(
+    bzl: &str,
+    bindings: &[(String, String)],
+    owned: &OwnedNames,
+    kept_calls: &[(&str, &str)],
+) -> bool {
+    const RUST_FILEGROUP: &str = "rust_filegroup";
+    bzl == crate::universe::RUST_FILEGROUP_BZL
+        && matches!(bindings, [(local, their)] if local == RUST_FILEGROUP && their == RUST_FILEGROUP)
+        && (owned.emitted.contains(crate::universe::STANDALONE_SRCS)
+            || !kept_calls
+                .iter()
+                .any(|(function, _)| *function == RUST_FILEGROUP))
 }
 
 /// What the `[package_macro]` rules make of one top-level statement of a BUCK
@@ -1705,6 +1729,57 @@ mod tests {
             !content.contains("declare_source_tree_inputs()"),
             "{content}"
         );
+    }
+
+    // Fable, review 56: generation owns the `rust_filegroup` load it writes beside
+    // a source exposure, so a rewrite replaces it rather than adding another; a
+    // hand-written `rust_filegroup` call that outlives the exposure keeps it.
+    #[test]
+    fn test_the_generated_rust_filegroup_load_is_generations() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let dir =
+            Utf8PathBuf::try_from(tmp.path().to_path_buf()).expect("temp dir is not valid UTF-8");
+        let path = dir.join("BUCK");
+        let load = format!(
+            "load(\"{}\", \"rust_filegroup\")",
+            crate::universe::RUST_FILEGROUP_BZL
+        );
+        let exposure = format!(
+            "rust_filegroup(\n    name = \"{}\",\n)\n",
+            crate::universe::STANDALONE_SRCS
+        );
+        let hand_call = "rust_filegroup(\n    name = \"mine\",\n)";
+        let emitting = super::OwnedNames {
+            emitted: [crate::universe::STANDALONE_SRCS.to_owned()].into(),
+            ..Default::default()
+        };
+        let not_emitting = super::OwnedNames::default();
+
+        // Generation's own load and exposure: both go, emitted again or not.
+        std::fs::write(&path, format!("{load}\n\n{exposure}")).expect("write BUCK");
+        for owned in [&emitting, &not_emitting] {
+            let hand = super::hand_written(&path, owned).expect("kept");
+            assert!(hand.loads.is_empty(), "{:?}", hand.loads);
+            assert!(hand.statements.is_empty(), "{:?}", hand.statements);
+        }
+
+        // A hand-written call keeps the load unless generation writes it again.
+        std::fs::write(&path, format!("{load}\n\n{exposure}\n{hand_call}\n")).expect("write BUCK");
+        let hand = super::hand_written(&path, &not_emitting).expect("kept");
+        assert_eq!(hand.loads, vec![load.clone()]);
+        assert_eq!(hand.statements, vec![hand_call.to_owned()]);
+        let hand = super::hand_written(&path, &emitting).expect("kept");
+        assert!(hand.loads.is_empty(), "{:?}", hand.loads);
+        assert_eq!(hand.statements, vec![hand_call.to_owned()]);
+
+        // A load binding more than `rust_filegroup` is the file's own.
+        let wider = format!(
+            "load(\"{}\", \"rust_filegroup\", \"other\")",
+            crate::universe::RUST_FILEGROUP_BZL
+        );
+        std::fs::write(&path, format!("{wider}\n\n{exposure}")).expect("write BUCK");
+        let hand = super::hand_written(&path, &emitting).expect("kept");
+        assert_eq!(hand.loads, vec![wider]);
     }
 
     // PM-4 (Fable, review 36, probe 8): a load that binds the macro under another

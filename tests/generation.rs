@@ -6046,10 +6046,7 @@ fn test_a_standalone_universe_compiles_project_packages_from_their_owners() {
         srcs.contains("\"//third-party/rust/standalone/guest/...\""),
         "{srcs}"
     );
-    assert!(
-        shared.contains("load(\"@prelude//rust:sources.bzl\", \"rust_filegroup\")"),
-        "{shared}"
-    );
+    assert!(shared.contains(RUST_FILEGROUP_LOAD), "{shared}");
     let manifest = rule(&shared, "standalone-manifest");
     assert!(manifest.contains("actual = \":manifest\""), "{manifest}");
     assert!(
@@ -6057,6 +6054,14 @@ fn test_a_standalone_universe_compiles_project_packages_from_their_owners() {
         "{shared}"
     );
     assert!(rule(&f.buck("extra"), "standalone-srcs").contains("\"//guests/guest/...\""));
+    // Generation owns the load it writes: successive uncached root runs rewrite
+    // the owners' BUCK files to the same bytes, with one load.
+    let extra = f.buck("extra");
+    f.migrate(&["--no-cache"]);
+    f.migrate(&["--no-cache"]);
+    assert_eq!(f.buck("shared"), shared);
+    assert_eq!(f.buck("extra"), extra);
+    assert_eq!(shared.matches(RUST_FILEGROUP_LOAD).count(), 1, "{shared}");
 
     // Without the dependency, the universe removes its copy, and the root
     // generation the owner's exposure.
@@ -6072,6 +6077,12 @@ fn test_a_standalone_universe_compiles_project_packages_from_their_owners() {
             .exists()
     );
     f.migrate(&[]);
-    assert!(!f.buck("shared").contains("standalone-srcs"));
-    assert!(f.buck("extra").contains("standalone-srcs"));
+    let shared = f.buck("shared");
+    assert!(!shared.contains("standalone-srcs"), "{shared}");
+    assert!(!shared.contains("standalone-manifest"), "{shared}");
+    assert!(!shared.contains(RUST_FILEGROUP_LOAD), "{shared}");
+    assert_eq!(f.buck("extra").matches(RUST_FILEGROUP_LOAD).count(), 1);
 }
+
+/// The load generation writes beside a standalone universe's source exposure.
+const RUST_FILEGROUP_LOAD: &str = "load(\"@prelude//rust:sources.bzl\", \"rust_filegroup\")";
