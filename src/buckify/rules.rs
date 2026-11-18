@@ -28,9 +28,9 @@ use super::deps::{
 use super::emit::{
     emit_buildscript_build, emit_buildscript_run, emit_cargo_manifest, emit_filegroup,
     emit_git_fetch, emit_http_archive, emit_rust_binary, emit_rust_library, emit_rust_test,
-    emit_test_module, get_vendor_name, host_variant_build_target, normalize_path_for_buck,
-    patch_with_buildscript, test_host_variant_build_target, test_variant_build_target,
-    wasm_variant_build_target,
+    emit_test_module, get_vendor_name, get_vendor_target, host_variant_build_target,
+    normalize_path_for_buck, patch_with_buildscript, test_host_variant_build_target,
+    test_variant_build_target, wasm_variant_build_target,
 };
 
 /// Buckifies a third-party dependency into a list of BUCK rules.
@@ -102,6 +102,17 @@ pub(crate) fn vendored_path_package_rules(
             for flag in rust_rule.rustc_flags_mut() {
                 *flag = flag.replace(":manifest[", &manifest);
             }
+            // The manifest is the owner's, at its path in the owner's
+            // repository-shaped sources. `CARGO_MANIFEST_DIR` keeps the plain
+            // relative default, which the prelude resolves to the sources'
+            // owning package: the owner's directory, as Cargo gives it.
+            rust_rule.env_mut().insert(
+                "CARGO_MANIFEST_PATH".to_owned(),
+                format!(
+                    "$(location //{owner}:{})/{owner}/Cargo.toml",
+                    crate::universe::STANDALONE_SRCS
+                ),
+            );
         }
         vendored.push(rule);
     }
@@ -255,6 +266,27 @@ fn buckify_dep_node_targets(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule>
 /// Buckifies workspace package into a list of BUCK rules, including rules for all targets (bin, lib, test) and handling build scripts if present.
 pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
     let mut rules = buckify_root_node_targets(node, ctx);
+    if crate::buckify::actions::vendored_path_package_dir(&node.package_id, &ctx.workspace_root)
+        .is_none()
+    {
+        // A universe target compiling another package's crate root: the prelude
+        // would resolve a relative `CARGO_MANIFEST_DIR` inside that package's
+        // sources, but Cargo gives this package's own directory.
+        for rule in &mut rules {
+            let has_filegroup = match &rule {
+                Rule::RustLibrary(r) => r.srcs_filegroup.is_some(),
+                Rule::RustBinary(r) => r.srcs_filegroup.is_some(),
+                Rule::RustTest(r) => r.srcs_filegroup.is_some(),
+                _ => false,
+            };
+            if has_filegroup && let Some(rust_rule) = rule.as_rust_rule_mut() {
+                rust_rule.env_mut().insert(
+                    "CARGO_MANIFEST_DIR".to_owned(),
+                    format!("$(location {})", get_vendor_target()),
+                );
+            }
+        }
+    }
     rules.extend(standalone_owner_rules(node, ctx));
     rules.extend(first_party_package_macro(ctx));
     rules

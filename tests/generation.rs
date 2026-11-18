@@ -5983,6 +5983,12 @@ fn test_a_standalone_universe_compiles_project_packages_from_their_owners() {
         "{lib}"
     );
     assert!(!lib.contains("srcs = "), "{lib}");
+    assert!(
+        lib.contains(
+            "\"CARGO_MANIFEST_PATH\": \"$(location //shared:standalone-srcs)/shared/Cargo.toml\""
+        ),
+        "{lib}"
+    );
     assert!(!vendored.contains("cargo_manifest("), "{vendored}");
     // The universe's own library compiles `extra`'s crate root through `extra`.
     let guest = f.buck("guests/guest");
@@ -5993,6 +5999,10 @@ fn test_a_standalone_universe_compiles_project_packages_from_their_owners() {
     );
     assert!(
         guest_lib.contains("crate_root = \"extra/src/lib.rs\""),
+        "{guest_lib}"
+    );
+    assert!(
+        guest_lib.contains("\"CARGO_MANIFEST_DIR\": \"$(location :vendor)\""),
         "{guest_lib}"
     );
     assert!(

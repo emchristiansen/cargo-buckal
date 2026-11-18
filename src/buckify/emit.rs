@@ -614,7 +614,7 @@ pub(super) fn get_vendor_name() -> Cow<'static, str> {
 }
 
 /// Get the label of the vendor target
-fn get_vendor_target() -> String {
+pub(super) fn get_vendor_target() -> String {
     format!(":{}", get_vendor_name())
 }
 
