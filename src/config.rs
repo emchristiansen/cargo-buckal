@@ -236,8 +236,9 @@ pub struct RepoConfig {
 /// keeps the rest of that file byte for byte: the load goes directly below its
 /// last `load`, the call at its end. A hand-written statement it takes over
 /// goes with its comments, as in a first-party BUCK file, except that the
-/// comments above the file's first statement (its header) stay. A `platforms/BUCK` without the `@generated`
-/// first line is the repository's own and is left alone.
+/// comments above the file's first statement (its header) stay. A
+/// `platforms/BUCK` without the `@generated` first line is the repository's own
+/// and is left alone.
 ///
 /// In a first-party BUCK file generation emits the macro's `load` and the call
 /// and owns both:
@@ -324,7 +325,7 @@ struct RawPackageMacroConfig {
 
 /// Why `path` cannot be the `[package_macro] tables` file: it must be a
 /// root-relative path to a `.bzl` file, written with `/`, with no empty, `.` or
-/// `..` component, outside the generated third-party package directories.
+/// `..` component.
 fn tables_path_error(path: &str) -> Option<String> {
     let components: Vec<&str> = path.split('/').collect();
     let bad_component = components
@@ -333,16 +334,6 @@ fn tables_path_error(path: &str) -> Option<String> {
     if bad_component || path.contains(['\\', '"', '\n']) || !path.ends_with(".bzl") {
         return Some(format!(
             "[package_macro] tables must be a root-relative path to a .bzl file (e.g. \"buckal_packages.bzl\"), written with `/` and without `.` or `..` components, not {path:?}"
-        ));
-    }
-    let generated = [crate::RUST_CRATES_ROOT, crate::RUST_GIT_ROOT];
-    if generated
-        .iter()
-        .any(|dir| path.starts_with(&format!("{dir}/")))
-    {
-        return Some(format!(
-            "[package_macro] tables must not be inside the generated third-party package directories ({}), not {path:?}",
-            generated.join(", ")
         ));
     }
     None
@@ -1097,8 +1088,6 @@ mod tests {
             "a//packages.bzl",
             "packages.txt",
             "a\\\\packages.bzl",
-            "third-party/rust/crates/packages.bzl",
-            "third-party/rust/git/x/packages.bzl",
         ] {
             let error = RepoConfig::parse(&format!("[package_macro]\ntables = {path:?}\n"))
                 .expect_err(path)

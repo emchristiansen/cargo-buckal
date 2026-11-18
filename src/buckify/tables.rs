@@ -2,15 +2,16 @@
 //! package tables, for a repository macro that needs every package by name (for
 //! example a tree staged from every package's exports).
 //!
-//! - `GENERATED_WHOLE_REPOSITORY_PACKAGES` maps the directory of each third-party
-//!   package generation writes a BUCK file for (`third-party/rust/crates/<name>/<version>`
-//!   or `third-party/rust/git/<name>/<version>`) to its package,
-//!   `"<root cell>//<dir>:"`. It comes from the resolve generation writes the
-//!   files from.
+//! - `GENERATED_WHOLE_REPOSITORY_PACKAGES` maps the directory of each BUCK file
+//!   generation writes whole (each third-party package's, today
+//!   `third-party/rust/crates/<name>/<version>` or
+//!   `third-party/rust/git/<name>/<version>`) to its package,
+//!   `"<root cell>//<dir>:"`. It is the generator's own inventory
+//!   (`super::actions::generated_package_dirs`), not a test of where a path lies.
 //! - `GENERATED_SOURCE_TREE_PACKAGES` lists every other directory of the root cell
 //!   that holds a BUCK file, `"."` for the root, whoever wrote it. It comes from a
-//!   walk of the Buck2 project after generation has written its BUCK files: see
-//!   [`source_tree_packages`].
+//!   walk of the Buck2 project after generation has written its BUCK files, less
+//!   the inventory: see [`source_tree_packages`].
 //!
 //! Both are sorted by their directories' text.
 
@@ -20,13 +21,7 @@ use cargo_metadata::camino::{Utf8Path, Utf8PathBuf};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
 use crate::{
-    RUST_CRATES_ROOT, RUST_GIT_ROOT,
-    buck::GENERATED_HEADER,
-    buckal_warn,
-    cache::PackageTablesRecord,
-    context::BuckalContext,
-    resolve::{BuckalResolve, NodeKind},
-    utils::get_vendor_path_relative,
+    buck::GENERATED_HEADER, buckal_warn, cache::PackageTablesRecord, context::BuckalContext,
 };
 
 /// The second line of the tables file, after [`GENERATED_HEADER`], by which
@@ -137,33 +132,23 @@ fn normalize_cell_path(path: &str) -> Option<String> {
     Some(parts.join("/"))
 }
 
-/// The third-party packages of `resolve`, by the directory generation writes
-/// each one's BUCK file in, in the root cell `root_cell`.
+/// The packages of the BUCK files generation writes whole, `generated` (their
+/// directories), in the root cell `root_cell`.
 pub fn whole_repository_packages(
-    resolve: &BuckalResolve,
+    generated: &BTreeSet<String>,
     root_cell: &str,
-) -> Result<BTreeMap<String, String>, String> {
-    let mut packages = BTreeMap::new();
-    for node in resolve.nodes() {
-        if !matches!(node.kind, NodeKind::ThirdParty) {
-            continue;
-        }
-        let dir = get_vendor_path_relative(&node.package_id).map_err(|error| {
-            format!(
-                "cannot place third-party package `{}`: {error}",
-                node.package_id.repr
-            )
-        })?;
-        let package = format!("{root_cell}//{dir}:");
-        packages.insert(dir, package);
-    }
-    Ok(packages)
+) -> BTreeMap<String, String> {
+    generated
+        .iter()
+        .map(|dir| (dir.clone(), format!("{root_cell}//{dir}:")))
+        .collect()
 }
 
 /// Every directory of the root cell of the Buck2 project at `root` that holds a
 /// file (or symlink) named `BUCK`, as a project-relative path (`"."` for the
-/// root), except the generated third-party package directories below
-/// `third-party/rust/crates` and `third-party/rust/git`.
+/// root), except the directories of the BUCK files generation writes whole,
+/// `generated` (its inventory). Wherever those lie, they are left out by name,
+/// and nothing else is.
 ///
 /// The walk is of the file system, after generation has written its BUCK files,
 /// so it sees hand-written BUCK files and generated ones alike. It does not
@@ -177,14 +162,13 @@ pub fn whole_repository_packages(
 pub fn source_tree_packages(
     root: &Utf8Path,
     layout: &CellLayout,
+    generated: &BTreeSet<String>,
 ) -> Result<BTreeSet<String>, String> {
     let ignore = ignore_set(&layout.ignore)?;
-    let generated = [RUST_CRATES_ROOT, RUST_GIT_ROOT];
     let skipped = |relative: &str, name: &str| -> bool {
         VCS_DIRECTORIES.contains(&name)
             || BUCKAL_IGNORED_AT_ROOT.contains(&relative)
             || layout.other_cells.contains(relative)
-            || generated.contains(&relative)
             || ignore.is_match(relative)
     };
     let mut packages = BTreeSet::new();
@@ -211,7 +195,9 @@ pub fn source_tree_packages(
         if entry.file_name() == "BUCK" && !entry.file_type().is_dir() && !ignore.is_match(&relative)
         {
             let dir = relative.rsplit_once('/').map_or(".", |(dir, _)| dir);
-            packages.insert(dir.to_owned());
+            if !generated.contains(dir) {
+                packages.insert(dir.to_owned());
+            }
         }
     }
     Ok(packages)
@@ -356,8 +342,13 @@ impl TablesPlan {
     }
 
     /// Remove the stale file, if generation wrote it, with a warning; then write
-    /// the tables file, if configured, and return its record for `buckal.snap`.
-    pub fn execute(self, resolve: &BuckalResolve) -> Result<Option<PackageTablesRecord>, String> {
+    /// the tables file, if configured, from `generated`, the generator's
+    /// inventory of the BUCK files it writes whole, and return its record for
+    /// `buckal.snap`.
+    pub fn execute(
+        self,
+        generated: &BTreeSet<String>,
+    ) -> Result<Option<PackageTablesRecord>, String> {
         if let Some(path) = &self.stale {
             let full = self.root.join(path);
             match std::fs::read_to_string(&full) {
@@ -380,8 +371,8 @@ impl TablesPlan {
         };
         let layout = CellLayout::of_project(&self.root)?;
         let tables = PackageTables {
-            whole_repository: whole_repository_packages(resolve, &layout.root_cell)?,
-            source_tree: source_tree_packages(&self.root, &layout)?,
+            whole_repository: whole_repository_packages(generated, &layout.root_cell),
+            source_tree: source_tree_packages(&self.root, &layout, generated)?,
         };
         let text = tables.render();
         let full = self.root.join(&path);
@@ -403,6 +394,7 @@ impl TablesPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resolve::{BuckalResolve, NodeKind};
 
     #[test]
     fn test_cell_layout_reads_cells_and_project_ignore() {
@@ -445,6 +437,8 @@ mod tests {
             "third-party/rust/BUCK",
             "third-party/rust/crates/dep/1.0.0/BUCK",
             "third-party/rust/git/gdep/0.1.0/BUCK",
+            "third-party/rust/standalone/ws/crates/sdep/2.0.0/BUCK",
+            "third-party/rust/crates/stale/0.1.0/BUCK",
             "toolchains/BUCK",
             "toolchains/wasm/BUCK",
             "buckal_cell/tool/BUCK",
@@ -466,7 +460,15 @@ mod tests {
             "[cells]\nroot = .\nprelude = .buck2/prelude-source\ntoolchains = toolchains\nbuckal = buckal_cell\n[project]\nignore = node_modules, web/*/dist\n",
         )
         .unwrap();
-        let packages = source_tree_packages(root, &layout).unwrap();
+        // The generator's inventory, wherever it places its packages.
+        let generated: BTreeSet<String> = [
+            "third-party/rust/crates/dep/1.0.0",
+            "third-party/rust/git/gdep/0.1.0",
+            "third-party/rust/standalone/ws/crates/sdep/2.0.0",
+        ]
+        .map(str::to_owned)
+        .into();
+        let packages = source_tree_packages(root, &layout, &generated).unwrap();
         assert_eq!(
             packages.into_iter().collect::<Vec<_>>(),
             [
@@ -477,6 +479,8 @@ mod tests {
                 "observatory/commands/target",
                 "platforms",
                 "third-party/rust",
+                // Not in the inventory: a package like any other.
+                "third-party/rust/crates/stale/0.1.0",
                 "web/a/src",
             ]
         );
@@ -491,7 +495,8 @@ mod tests {
         std::fs::create_dir_all(root.join("linked")).unwrap();
         std::os::unix::fs::symlink("../real/BUCK", root.join("linked/BUCK")).unwrap();
         std::os::unix::fs::symlink("real", root.join("alias")).unwrap();
-        let packages = source_tree_packages(root, &CellLayout::parse("").unwrap()).unwrap();
+        let packages =
+            source_tree_packages(root, &CellLayout::parse("").unwrap(), &BTreeSet::new()).unwrap();
         assert_eq!(packages.into_iter().collect::<Vec<_>>(), ["linked", "real"]);
     }
 
@@ -548,7 +553,8 @@ mod tests {
             index_map,
             test_only_edges: Default::default(),
         };
-        let packages = whole_repository_packages(&resolve, "root").unwrap();
+        let generated = crate::buckify::actions::generated_package_dirs(&resolve).unwrap();
+        let packages = whole_repository_packages(&generated, "root");
         assert_eq!(
             packages.into_iter().collect::<Vec<_>>(),
             [

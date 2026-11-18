@@ -57,7 +57,8 @@ impl BuckalChange {
                         let vendor_dir = if !is_third_party_pkg {
                             node.manifest_path.parent().unwrap().to_owned()
                         } else {
-                            get_vendor_dir(&node.package_id)
+                            get_buck2_root()
+                                .and_then(|root| Ok(root.join(generated_package_dir(node)?)))
                                 .unwrap_or_exit_ctx("failed to get vendor directory")
                         };
 
@@ -311,7 +312,8 @@ impl BuckalChange {
 
         // After the BUCK files are written, so that the walk sees them.
         let plan = tables?;
-        match plan.execute(&ctx.resolve) {
+        let executed = generated_package_dirs(&ctx.resolve).and_then(|dirs| plan.execute(&dirs));
+        match executed {
             Ok(record) => record,
             Err(error) => {
                 buckal_error!(format!(
@@ -321,6 +323,34 @@ impl BuckalChange {
             }
         }
     }
+}
+
+/// The project-relative directory in which [`BuckalChange::apply`] writes the
+/// BUCK file of third-party package `node`, which generation writes whole.
+fn generated_package_dir(node: &BuckalNode) -> anyhow::Result<String> {
+    crate::utils::get_vendor_path_relative(&node.package_id)
+}
+
+/// The generator's inventory of the BUCK files it writes whole: the directory of
+/// every third-party package of `resolve`, placed as [`BuckalChange::apply`]
+/// places it ([`generated_package_dir`]). The `[package_macro] tables` classify
+/// packages by this inventory alone, with no assumption about where generated
+/// packages live.
+pub(crate) fn generated_package_dirs(
+    resolve: &crate::resolve::BuckalResolve,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    resolve
+        .nodes()
+        .filter(|node| is_third_party(node))
+        .map(|node| {
+            generated_package_dir(node).map_err(|error| {
+                format!(
+                    "cannot place third-party package `{}`: {error}",
+                    node.package_id.repr
+                )
+            })
+        })
+        .collect()
 }
 
 /// `content` of the workspace-root BUCK file, whose header claims only
