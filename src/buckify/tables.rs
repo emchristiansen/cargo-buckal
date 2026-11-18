@@ -239,15 +239,18 @@ pub fn standalone_universes(
         .map(|(dir, name)| (dir.as_str(), name.as_str()))
         .collect();
     let mut universes = Vec::new();
+    // Every directory below the root with a manifest is asked, through
+    // `holds_file`, whether it holds a configuration, as selection asks: the walk
+    // does not follow symlinks and lists no directories, so a symlinked
+    // configuration counts as the file it resolves to, and a dangling one, or a
+    // directory named like the configuration, is refused rather than missed.
     for (dir, name) in &files {
-        if dir == "." || name != CONFIG_FILE || !present.contains(&(dir.as_str(), "Cargo.toml")) {
+        if dir == "." || name != "Cargo.toml" {
             continue;
         }
-        // The walk does not follow symlinks; refuse one that resolves to no file,
-        // as selection does.
         let path = root.join(dir);
-        for name in [CONFIG_FILE, "Cargo.toml"] {
-            holds_file(&path, name).map_err(|error| format!("{error:#}"))?;
+        if !holds_file(&path, CONFIG_FILE).map_err(|error| format!("{error:#}"))? {
+            continue;
         }
         universes.push(FoundUniverse {
             universe: Universe::Standalone {
@@ -1077,6 +1080,21 @@ mod tests {
             error.contains("other/buckal.toml is a symlink that resolves to no file"),
             "{error}"
         );
+    }
+
+    // Fable, review 56, p9e: a directory named like the configuration beside a
+    // manifest is refused by the walk, as selection refuses it, rather than
+    // read as no universe.
+    #[test]
+    fn test_a_directory_named_like_the_configuration_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(dir.path()).unwrap();
+        touch(root, "guest/Cargo.toml");
+        std::fs::create_dir_all(root.join("guest/buckal.toml")).unwrap();
+        touch(root, "guest/buckal.toml/inside");
+        let layout = CellLayout::parse("").unwrap();
+        let error = standalone_universes(root, &layout).unwrap_err();
+        assert!(error.contains("guest/buckal.toml is not a file"), "{error}");
     }
 
     #[test]

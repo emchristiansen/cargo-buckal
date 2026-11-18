@@ -109,8 +109,15 @@ pub(crate) fn vendored_path_package_rules(
             rust_rule.env_mut().insert(
                 "CARGO_MANIFEST_PATH".to_owned(),
                 format!(
-                    "$(location //{owner}:{})/{owner}/Cargo.toml",
-                    crate::universe::STANDALONE_SRCS
+                    "$(location //{owner}:{})/{}Cargo.toml",
+                    crate::universe::STANDALONE_SRCS,
+                    // The project's own root package's manifest is at the root
+                    // of its sources.
+                    if owner.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{owner}/")
+                    }
                 ),
             );
         }

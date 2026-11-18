@@ -52,8 +52,12 @@ pub fn execute(args: &AutoremoveArgs) {
     }
 
     let vendor_root = buck2_root.join(universe.vendor_root());
-    for entry_path in
-        unused_package_dirs(vendor_root.as_std_path(), &used_packages).unwrap_or_exit()
+    for entry_path in unused_package_dirs(
+        vendor_root.as_std_path(),
+        vendor_kinds(universe),
+        &used_packages,
+    )
+    .unwrap_or_exit()
     {
         let entry_display = entry_path
             .strip_prefix(&buck2_root)
@@ -70,25 +74,36 @@ pub fn execute(args: &AutoremoveArgs) {
     }
 
     if !args.dry_run {
-        for entry_path in empty_name_dirs(vendor_root.as_std_path()).unwrap_or_exit() {
+        for entry_path in
+            empty_name_dirs(vendor_root.as_std_path(), vendor_kinds(universe)).unwrap_or_exit()
+        {
             std::fs::remove_dir_all(&entry_path).unwrap_or_exit();
         }
     }
 }
 
-/// The source-kind directories of a universe's vendor tree: registry crates
-/// (`crates/`), git crates (`git/`) and, in a standalone universe, the project's
-/// path packages it generates into its own tree (`path/`). Generation writes only
-/// these, so autoremove walks only these. The root universe's vendor tree also
-/// holds `standalone/`, the standalone universes' trees, which a root autoremove
-/// must never touch.
-const VENDOR_KINDS: [&str; 3] = ["crates", "git", "path"];
+/// The source-kind directories of `universe`'s vendor tree: registry crates
+/// (`crates/`), git crates (`git/`) and, in a standalone universe only, the
+/// project's path packages it generates into its own tree (`path/`). Generation
+/// writes only these, so autoremove walks only these. The root universe's vendor
+/// tree also holds `standalone/`, the standalone universes' trees, which a root
+/// autoremove must never touch, and the root never writes a `path/`.
+fn vendor_kinds(universe: &crate::universe::Universe) -> &'static [&'static str] {
+    match universe {
+        crate::universe::Universe::Root => &["crates", "git"],
+        crate::universe::Universe::Standalone { .. } => &["crates", "git", "path"],
+    }
+}
 
 /// The `<kind>/<name>/<version>` directories of the vendor tree at `vendor_root`
-/// whose label is not in `used`, walking only [`VENDOR_KINDS`].
-fn unused_package_dirs(vendor_root: &Path, used: &BTreeSet<String>) -> Result<Vec<PathBuf>> {
+/// whose label is not in `used`, walking only `kinds` ([`vendor_kinds`]).
+fn unused_package_dirs(
+    vendor_root: &Path,
+    kinds: &[&str],
+    used: &BTreeSet<String>,
+) -> Result<Vec<PathBuf>> {
     let mut unused = Vec::new();
-    for kind in VENDOR_KINDS {
+    for kind in kinds {
         let kind_dir = vendor_root.join(kind);
         if !kind_dir.is_dir() {
             continue;
@@ -114,10 +129,10 @@ fn unused_package_dirs(vendor_root: &Path, used: &BTreeSet<String>) -> Result<Ve
 }
 
 /// The `<kind>/<name>` directories of the vendor tree at `vendor_root` left empty,
-/// walking only [`VENDOR_KINDS`].
-fn empty_name_dirs(vendor_root: &Path) -> Result<Vec<PathBuf>> {
+/// walking only `kinds` ([`vendor_kinds`]).
+fn empty_name_dirs(vendor_root: &Path, kinds: &[&str]) -> Result<Vec<PathBuf>> {
     let mut empty = Vec::new();
-    for kind in VENDOR_KINDS {
+    for kind in kinds {
         let kind_dir = vendor_root.join(kind);
         if !kind_dir.is_dir() {
             continue;
@@ -168,12 +183,16 @@ mod tests {
             "standalone/guest/crates/sdep/2.0.0",
             "standalone/guest/git/gsdep/0.2.0",
             "standalone/guest/path/shared/0.1.0",
+            // The root never writes `path/`: a hand-made one is not its to remove.
+            "path/handmade/0.1.0",
+            "path/empty",
         ] {
             mkdir(vendor, path);
         }
         std::fs::write(vendor.join("BUCK"), "").unwrap();
+        let kinds = vendor_kinds(&crate::universe::Universe::Root);
         let used: BTreeSet<String> = ["crates/used/1.0.0"].map(str::to_owned).into();
-        let unused = unused_package_dirs(vendor, &used).unwrap();
+        let unused = unused_package_dirs(vendor, kinds, &used).unwrap();
         assert_eq!(
             unused,
             [
@@ -182,7 +201,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            empty_name_dirs(vendor).unwrap(),
+            empty_name_dirs(vendor, kinds).unwrap(),
             [vendor.join("crates/empty")]
         );
     }
@@ -202,8 +221,12 @@ mod tests {
         let used: BTreeSet<String> = ["crates/sdep/2.0.0", "path/shared/0.1.0"]
             .map(str::to_owned)
             .into();
+        let kinds = vendor_kinds(&crate::universe::Universe::Standalone {
+            dir: "guest".into(),
+            name: "guest".to_owned(),
+        });
         assert_eq!(
-            unused_package_dirs(&vendor, &used).unwrap(),
+            unused_package_dirs(&vendor, kinds, &used).unwrap(),
             [
                 vendor.join("crates/stale/0.1.0"),
                 vendor.join("path/gone/0.1.0")

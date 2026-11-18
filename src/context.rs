@@ -86,9 +86,20 @@ fn standalone_source_requests(
             Some(dir.as_str().to_owned())
         })
         .collect();
-    if let Some(owner) = requests.keys().find(|owner| !packages.contains(*owner)) {
+    if let Some((owner, visibility)) = requests
+        .iter()
+        .find(|(owner, _)| !packages.contains(*owner))
+    {
+        let universes: Vec<&str> = visibility
+            .iter()
+            .filter(|pattern| !pattern.starts_with(&format!("//{}/", crate::RUST_ROOT)))
+            .map(|pattern| pattern.trim_start_matches("//").trim_end_matches("/..."))
+            .collect();
         return Err(format!(
-            "a standalone universe compiles sources of `{owner}`, which is no package of the Buck2 project's own workspace, so nothing exposes them; generate the standalone universes again"
+            "the standalone universe{} `{}` compile{} sources of `{owner}`, which is no package of the Buck2 project's own workspace, so the root generation cannot expose them. Generating the universe again does not change this: add `{owner}` to the members of the root workspace, or remove the universe's dependency on it and generate the universe again",
+            if universes.len() == 1 { "" } else { "s" },
+            universes.join("`, `"),
+            if universes.len() == 1 { "s" } else { "" },
         ));
     }
     Ok(requests)
