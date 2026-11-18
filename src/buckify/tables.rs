@@ -215,46 +215,106 @@ fn root_cell_files(root: &Utf8Path, layout: &CellLayout) -> Result<Vec<(String, 
     Ok(files)
 }
 
+/// A standalone universe found in the project, and whether it has a generation
+/// record (`buckal.snap`) of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundUniverse {
+    pub universe: crate::universe::Universe,
+    pub recorded: bool,
+}
+
+/// Every standalone universe of the Buck2 project at `root`, found as
+/// [`crate::universe::Universe::of_manifest`] selects one: a directory of the root
+/// cell, other than the root, holding both a `Cargo.toml` and a `buckal.toml`,
+/// walked as [`source_tree_packages`] describes.
+pub fn standalone_universes(
+    root: &Utf8Path,
+    layout: &CellLayout,
+) -> Result<Vec<FoundUniverse>, String> {
+    use crate::universe::{CACHE_FILE, CONFIG_FILE, Universe};
+
+    let files = root_cell_files(root, layout)?;
+    let present: BTreeSet<(&str, &str)> = files
+        .iter()
+        .map(|(dir, name)| (dir.as_str(), name.as_str()))
+        .collect();
+    Ok(files
+        .iter()
+        .filter(|(dir, name)| {
+            dir != "." && name == CONFIG_FILE && present.contains(&(dir.as_str(), "Cargo.toml"))
+        })
+        .map(|(dir, _)| FoundUniverse {
+            universe: Universe::Standalone {
+                dir: dir.into(),
+                name: dir
+                    .rsplit_once('/')
+                    .map_or(dir.as_str(), |(_, last)| last)
+                    .to_owned(),
+            },
+            recorded: present.contains(&(dir.as_str(), CACHE_FILE)),
+        })
+        .collect())
+}
+
+/// Refuse two standalone universes that would share a vendor tree
+/// (`third-party/rust/standalone/<directory name>`): among those with a record and
+/// `selected` (the universe a command is about to generate, if standalone), no two
+/// directories may share a name. A universe never generated and not selected
+/// writes nothing, so it is not counted: a test fixture's `buckal.toml` does not
+/// stop generation.
+pub fn check_universe_names(
+    found: &[FoundUniverse],
+    selected: Option<&crate::universe::Universe>,
+) -> Result<(), String> {
+    use crate::universe::Universe;
+
+    let mut names: BTreeMap<&str, &Utf8Path> = BTreeMap::new();
+    let counted = found
+        .iter()
+        .filter(|found| found.recorded || Some(&found.universe) == selected)
+        .map(|found| &found.universe)
+        .chain(selected);
+    for universe in counted {
+        let Universe::Standalone { dir, name } = universe else {
+            continue;
+        };
+        match names.insert(name, dir) {
+            Some(other) if other != dir => {
+                return Err(format!(
+                    "the standalone workspaces `{other}` and `{dir}` share the directory name `{name}`, so both would vendor into third-party/rust/standalone/{name}; rename one. Nothing is written"
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// The directories of the BUCK files every standalone universe of the Buck2
 /// project at `root` writes whole (see [`crate::universe`]), so that the root
 /// generation classifies them as generated rather than as source-tree packages.
 ///
-/// A standalone universe is found as [`crate::universe::Universe::of_manifest`]
-/// selects one: a directory of the root cell, other than the root, holding both a
-/// `Cargo.toml` and a `buckal.toml`. Its inventory is read from its own generation
-/// record, the `buckal.snap` beside them: each registry or git package it records,
-/// placed under the universe's vendor root as its own generation placed it.
+/// The universes are [`standalone_universes`]. Each recorded universe's inventory
+/// is read from its own generation record, the `buckal.snap` beside its
+/// `buckal.toml`: each registry or git package it records, placed under the
+/// universe's vendor root as its own generation placed it.
 ///
-/// Refused: two standalone universes with one directory name (they would share a
-/// vendor tree), and a universe whose vendor tree exists but whose record does
-/// not (its BUCK files could not be told from hand-written ones). A universe
-/// never generated, with neither, contributes nothing.
+/// Refused: universes sharing a vendor tree ([`check_universe_names`]), and a
+/// universe whose vendor tree exists but whose record does not (its BUCK files
+/// could not be told from hand-written ones). A universe never generated, with
+/// neither, contributes nothing.
 pub fn standalone_package_dirs(
     root: &Utf8Path,
     layout: &CellLayout,
 ) -> Result<BTreeSet<String>, String> {
-    use crate::universe::{CACHE_FILE, CONFIG_FILE, Universe};
+    use crate::universe::CACHE_FILE;
 
-    let files = root_cell_files(root, layout)?;
-    let has = |dir: &str, name: &str| files.iter().any(|(d, n)| d == dir && n == name);
-    let mut names: BTreeMap<String, String> = BTreeMap::new();
+    let found = standalone_universes(root, layout)?;
+    check_universe_names(&found, None)?;
     let mut dirs = BTreeSet::new();
-    for (dir, name) in &files {
-        if dir == "." || name != CONFIG_FILE || !has(dir, "Cargo.toml") {
-            continue;
-        }
-        let universe_name = dir.rsplit_once('/').map_or(dir.as_str(), |(_, last)| last);
-        if let Some(other) = names.insert(universe_name.to_owned(), dir.clone()) {
-            return Err(format!(
-                "the standalone workspaces `{other}` and `{dir}` share the directory name `{universe_name}`, so both would vendor into third-party/rust/standalone/{universe_name}; rename one"
-            ));
-        }
-        let universe = Universe::Standalone {
-            dir: dir.into(),
-            name: universe_name.to_owned(),
-        };
-        let record = root.join(dir).join(CACHE_FILE);
-        if !record.is_file() {
+    for FoundUniverse { universe, recorded } in &found {
+        let dir = universe.config_dir();
+        if !recorded {
             let vendor = root.join(universe.vendor_root());
             if vendor.exists() {
                 return Err(format!(
@@ -263,6 +323,7 @@ pub fn standalone_package_dirs(
             }
             continue;
         }
+        let record = root.join(dir).join(CACHE_FILE);
         let cache = crate::cache::BuckalCache::load_from(&record)
             .map_err(|error| format!("{record}: {error}"))?;
         for id in cache.package_ids() {
@@ -373,6 +434,9 @@ pub struct TablesPlan {
     write: Option<String>,
     /// The file an earlier generation wrote that `tables` no longer names.
     stale: Option<String>,
+    /// Every standalone universe's generated package directories, read before
+    /// anything is written so that a refusal leaves every file as it was.
+    standalone: BTreeSet<String>,
 }
 
 impl TablesPlan {
@@ -387,8 +451,8 @@ impl TablesPlan {
         let write = ctx.repo_config.package_macro.tables.clone();
         if write.is_some() && *crate::universe::selected() != crate::universe::Universe::Root {
             return Err(format!(
-                "`[package_macro] tables` is set in the configuration of the standalone workspace {:?}; the tables are the whole project's, so only the Buck2 project's own `buckal.toml` may set them. Nothing is written",
-                crate::universe::selected()
+                "`[package_macro] tables` is set in the configuration of the standalone workspace `{}`; the tables are the whole project's, so only the Buck2 project's own `buckal.toml` may set them. Nothing is written",
+                crate::universe::selected().config_dir()
             ));
         }
         let stale = previous
@@ -418,7 +482,20 @@ impl TablesPlan {
                 }
             }
         }
-        Ok(Some(Self { root, write, stale }))
+        // `tables` is refused to a standalone universe above, so this is the root
+        // generation, whose tables hold every standalone universe's packages too.
+        let standalone = if write.is_some() {
+            standalone_package_dirs(&root, &CellLayout::of_project(&root)?)
+                .map_err(|error| format!("{error}. Nothing is written"))?
+        } else {
+            BTreeSet::new()
+        };
+        Ok(Some(Self {
+            root,
+            write,
+            stale,
+            standalone,
+        }))
     }
 
     /// Remove the stale file, if generation wrote it, with a warning; then write
@@ -450,10 +527,9 @@ impl TablesPlan {
             return Ok(None);
         };
         let layout = CellLayout::of_project(&self.root)?;
-        // `new` refuses tables to a standalone universe, so this is the root
-        // generation: its inventory and every standalone universe's.
+        // The root generation's inventory and every standalone universe's.
         let mut generated = generated.clone();
-        generated.extend(standalone_package_dirs(&self.root, &layout)?);
+        generated.extend(self.standalone.iter().cloned());
         let generated = &generated;
         let tables = PackageTables {
             whole_repository: whole_repository_packages(generated, &layout.root_cell),
@@ -775,6 +851,8 @@ mod tests {
 
     #[test]
     fn test_standalone_universes_refuse_a_shared_name_and_a_missing_record() {
+        use crate::universe::Universe;
+
         let dir = tempfile::tempdir().unwrap();
         let root = Utf8Path::from_path(dir.path()).unwrap();
         for path in [
@@ -786,6 +864,28 @@ mod tests {
             touch(root, path);
         }
         let layout = CellLayout::parse("").unwrap();
+        let found = standalone_universes(root, &layout).unwrap();
+        // Neither generated: two fixtures sharing a name do not stop generation.
+        check_universe_names(&found, None).unwrap();
+        assert!(standalone_package_dirs(root, &layout).unwrap().is_empty());
+        // Selecting one while the other is unrecorded is allowed...
+        let a = Universe::Standalone {
+            dir: "a/ws".into(),
+            name: "ws".to_owned(),
+        };
+        check_universe_names(&found, Some(&a)).unwrap();
+        // ...but once one has a record, generating the other is refused, whether or
+        // not the run writes tables.
+        std::fs::write(root.join("a/ws/buckal.snap"), standalone_record(&[])).unwrap();
+        let found = standalone_universes(root, &layout).unwrap();
+        let b = Universe::Standalone {
+            dir: "b/ws".into(),
+            name: "ws".to_owned(),
+        };
+        let error = check_universe_names(&found, Some(&b)).unwrap_err();
+        assert!(error.contains("share the directory name `ws`"), "{error}");
+        check_universe_names(&found, Some(&a)).unwrap();
+        std::fs::write(root.join("b/ws/buckal.snap"), standalone_record(&[])).unwrap();
         let error = standalone_package_dirs(root, &layout).unwrap_err();
         assert!(error.contains("share the directory name `ws`"), "{error}");
 
@@ -800,5 +900,29 @@ mod tests {
         }
         let error = standalone_package_dirs(root, &layout).unwrap_err();
         assert!(error.contains("has no buckal.snap"), "{error}");
+    }
+
+    #[test]
+    fn test_a_root_package_named_after_its_directory_is_not_vendored() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(dir.path()).unwrap();
+        for path in ["guest/Cargo.toml", "guest/buckal.toml"] {
+            touch(root, path);
+        }
+        std::fs::write(
+            root.join("guest/buckal.snap"),
+            standalone_record(&[
+                "path+file://($WORKSPACE)#0.1.0",
+                "registry+https://github.com/rust-lang/crates.io-index#sdep@2.0.0",
+            ]),
+        )
+        .unwrap();
+        let layout = CellLayout::parse("").unwrap();
+        assert_eq!(
+            standalone_package_dirs(root, &layout).unwrap(),
+            ["third-party/rust/standalone/guest/crates/sdep/2.0.0"]
+                .map(str::to_owned)
+                .into()
+        );
     }
 }

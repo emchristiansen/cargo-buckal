@@ -81,6 +81,12 @@ impl Universe {
     /// `<git root>/<name>/<version>` for a git package, and `None` for any other
     /// source (a path package is first-party, not vendored).
     pub fn vendor_path_relative(&self, repr: &str) -> Result<Option<String>> {
+        // A path package is never vendored. Its package-id may also not parse as a
+        // spec: Cargo writes a package named after its directory without the name
+        // (`path+file:///…/guest#0.1.0`).
+        if repr.starts_with("path+") {
+            return Ok(None);
+        }
         let spec =
             PackageIdSpec::parse(repr).with_context(|| format!("`{repr}` is not a package-id"))?;
         let root = match spec.kind() {
@@ -140,15 +146,63 @@ impl Universe {
     }
 }
 
+/// The standalone workspace enclosing `cwd`, relative to the Buck2 root
+/// `buck2_root`: the nearest directory from `cwd` up to, but not including, the
+/// root that holds both a `Cargo.toml` and a `buckal.toml`.
+fn enclosing_standalone(cwd: &Utf8Path, buck2_root: &Utf8Path) -> Result<Option<Utf8PathBuf>> {
+    let cwd = cwd
+        .canonicalize_utf8()
+        .with_context(|| format!("failed to resolve the current directory {cwd}"))?;
+    let root = buck2_root
+        .canonicalize_utf8()
+        .with_context(|| format!("failed to resolve the Buck2 root {buck2_root}"))?;
+    for dir in cwd.ancestors() {
+        let Ok(relative) = dir.strip_prefix(&root) else {
+            return Ok(None);
+        };
+        if relative.as_str().is_empty() {
+            return Ok(None);
+        }
+        if dir.join(CONFIG_FILE).is_file() && dir.join("Cargo.toml").is_file() {
+            return Ok(Some(relative.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
 static SELECTED: OnceLock<Universe> = OnceLock::new();
 
 /// Select the universe `manifest_path` names for the rest of the process. A command
 /// taking `--manifest-path` calls this before it reads a configuration, a
 /// generation record or a vendor path; selecting a second, different universe is an
 /// error.
+///
+/// Refused, before anything is written:
+/// - no `--manifest-path` inside a standalone workspace, where Cargo would resolve
+///   the standalone workspace while generation took the root universe and
+///   rewrote the root record;
+/// - a standalone universe sharing its vendor tree with another
+///   ([`crate::buckify::tables::check_universe_names`]).
 pub fn select(manifest_path: Option<&str>) -> Result<&'static Universe> {
     let buck2_root = get_buck2_root().context("failed to get the Buck2 project root")?;
+    if manifest_path.is_none() {
+        let cwd = std::env::current_dir().context("failed to read the current directory")?;
+        let cwd = Utf8PathBuf::from_path_buf(cwd).map_err(|cwd| {
+            anyhow::anyhow!("the current directory {} is not UTF-8", cwd.display())
+        })?;
+        if let Some(dir) = enclosing_standalone(&cwd, &buck2_root)? {
+            bail!(
+                "the current directory is inside the standalone workspace `{dir}`; generate it with `--manifest-path {dir}/Cargo.toml`, or run from outside it to generate the Buck2 project's own workspace. Nothing is written"
+            );
+        }
+    }
     let universe = Universe::of_manifest(manifest_path, &buck2_root)?;
+    if matches!(universe, Universe::Standalone { .. }) {
+        use crate::buckify::tables::{CellLayout, check_universe_names, standalone_universes};
+        let layout = CellLayout::of_project(&buck2_root).map_err(anyhow::Error::msg)?;
+        let found = standalone_universes(&buck2_root, &layout).map_err(anyhow::Error::msg)?;
+        check_universe_names(&found, Some(&universe)).map_err(anyhow::Error::msg)?;
+    }
     let selected = SELECTED.get_or_init(|| universe.clone());
     if *selected != universe {
         bail!("this command already generates {selected:?}; it cannot also generate {universe:?}");
@@ -237,6 +291,60 @@ mod tests {
             "third-party/rust/standalone/guest/crates"
         );
         assert_eq!(universe.git_root(), "third-party/rust/standalone/guest/git");
+    }
+
+    #[test]
+    fn test_a_path_package_is_never_vendored() {
+        let universe = Universe::Standalone {
+            dir: "standalone_workspaces/guest".into(),
+            name: "guest".to_owned(),
+        };
+        // A package named after its directory: Cargo leaves the name out.
+        assert_eq!(
+            universe
+                .vendor_path_relative("path+file://($WORKSPACE)#0.1.0")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            universe
+                .vendor_path_relative("path+file://($WORKSPACE)#guest-pkg@0.1.0")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            universe
+                .vendor_path_relative(
+                    "registry+https://github.com/rust-lang/crates.io-index#sdep@2.0.0"
+                )
+                .unwrap()
+                .as_deref(),
+            Some("third-party/rust/standalone/guest/crates/sdep/2.0.0")
+        );
+    }
+
+    #[test]
+    fn test_inside_a_standalone_workspace_is_found() {
+        let dir = project();
+        let root = root_of(&dir);
+        let guest = root.join("standalone_workspaces/guest");
+        std::fs::create_dir_all(guest.join("src")).unwrap();
+        // Without its own configuration the directory is the root workspace's.
+        assert_eq!(
+            enclosing_standalone(&guest.join("src"), &root).unwrap(),
+            None
+        );
+        std::fs::write(guest.join(CONFIG_FILE), "").unwrap();
+        assert_eq!(
+            enclosing_standalone(&guest.join("src"), &root).unwrap(),
+            Some("standalone_workspaces/guest".into())
+        );
+        assert_eq!(
+            enclosing_standalone(&guest, &root).unwrap(),
+            Some("standalone_workspaces/guest".into())
+        );
+        // The root itself, with its own buckal.toml, is not standalone.
+        assert_eq!(enclosing_standalone(&root, &root).unwrap(), None);
     }
 
     #[test]
