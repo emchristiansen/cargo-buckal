@@ -114,6 +114,10 @@ pub fn execute(args: &MigrateArgs) {
         fetch_buckal_cell(&cwd).unwrap_or_exit();
     }
 
+    // The universe the manifest selects: its configuration, generation record and
+    // vendor tree (`crate::universe`).
+    crate::universe::select(args.manifest_path.as_deref()).unwrap_or_exit();
+
     // get cargo metadata and generate context
     let mut ctx = BuckalContext::new(args.manifest_path.clone());
     ctx.no_merge = !args.merge;

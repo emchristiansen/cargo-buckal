@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 
 use anyhow::{Error, Result, anyhow};
-use cargo_metadata::{PackageId, camino::Utf8PathBuf};
+use cargo_metadata::{
+    PackageId,
+    camino::{Utf8Path, Utf8PathBuf},
+};
 use serde::{Deserialize, Serialize};
 
 use crate::buckal_error;
@@ -395,6 +398,12 @@ impl BuckalCache {
         self
     }
 
+    /// The package-ids of every package this cache records, in its canonical
+    /// (workspace-portable) spelling.
+    pub fn package_ids(&self) -> impl Iterator<Item = &str> {
+        self.fingerprints.keys().map(|id| id.repr.as_str())
+    }
+
     /// Whether this is an inventory whose packages must all be regenerated.
     pub fn is_unverified_inventory(&self) -> bool {
         self.regenerate_all
@@ -402,10 +411,16 @@ impl BuckalCache {
 
     pub fn load() -> Result<Self, Error> {
         let cache_path = get_cache_path().unwrap_or_exit_ctx("failed to get cache path");
+        Self::load_from(&cache_path)
+    }
+
+    /// The generation record at `cache_path`, which need not be the selected
+    /// universe's (the root generation reads standalone universes' records).
+    pub fn load_from(cache_path: &Utf8Path) -> Result<Self, Error> {
         if !cache_path.exists() {
             return Err(anyhow!("Cache file does not exist"));
         }
-        let content = std::fs::read_to_string(&cache_path)?;
+        let content = std::fs::read_to_string(cache_path)?;
         let mut cache = toml::from_str::<BuckalCache>(&content)
             .map_err(|e| anyhow!("Failed to parse cache file: {}", e))?;
         if cache.version > CACHE_VERSION {

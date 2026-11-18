@@ -30,6 +30,7 @@ pub struct UpdateArgs {
 
 pub fn execute(args: &UpdateArgs) {
     ensure_prerequisites().unwrap_or_exit();
+    crate::universe::select(args.manifest_path.as_deref()).unwrap_or_exit();
 
     let last_cache = get_last_cache(args.manifest_path.as_deref());
 

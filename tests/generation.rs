@@ -168,6 +168,10 @@ impl Fixture {
     }
 
     fn output(&self, args: &[&str]) -> std::process::Output {
+        self.output_in(&self.ws, args)
+    }
+
+    fn output_in(&self, dir: &Path, args: &[&str]) -> std::process::Output {
         let cargo_home = std::env::var_os("CARGO_HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| {
@@ -176,7 +180,7 @@ impl Fixture {
         Command::new(env!("CARGO_BIN_EXE_cargo-buckal"))
             .arg("buckal")
             .args(args)
-            .current_dir(&self.ws)
+            .current_dir(dir)
             .env("HOME", &self.home)
             .env("CARGO_HOME", cargo_home)
             .env("CARGO_NET_OFFLINE", "true")
@@ -4809,8 +4813,11 @@ fn test_a_sibling_directory_sharing_the_root_prefix_is_not_the_workspace() {
         &manifest("b", "[workspace]\n"),
     );
     write(&sibling.join("b/src/lib.rs"), "");
+    // The configuration is the Buck project's, at its root: a `buckal.toml` beside
+    // `ws/Cargo.toml` would make `ws` a standalone universe.
+    std::fs::remove_file(f.ws.join("buckal.toml")).unwrap();
     write(
-        &f.ws.join("buckal.toml"),
+        &f.ws.with_file_name("buckal.toml"),
         BUCKAL_TOML.split("[fixups.extra]").next().unwrap(),
     );
     f.migrate(&[]);
@@ -5861,4 +5868,82 @@ fn test_package_macro_keeps_a_marked_load_while_a_kept_call_uses_it() {
             "{between:?}:\n{stderr}"
         );
     }
+}
+
+#[test]
+fn test_a_standalone_universe_generates_beside_the_root() {
+    let f = fixture();
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!("{BUCKAL_TOML}\n[package_macro]\ntables = \"buckal_packages.bzl\"\n"),
+    );
+    // A standalone workspace whose package is named after its directory: Cargo
+    // records its package-id without the name.
+    write(
+        &f.ws.join("guests/guest/Cargo.toml"),
+        &manifest("guest", "[workspace]\n"),
+    );
+    write(&f.ws.join("guests/guest/src/lib.rs"), "");
+    write(
+        &f.ws.join("guests/guest/buckal.toml"),
+        "ignore_tests = false\n",
+    );
+    f.migrate(&[]);
+    let root_snap = std::fs::read_to_string(f.ws.join("buckal.snap")).unwrap();
+    assert!(!root_snap.contains("guest"), "{root_snap}");
+
+    // The universe: its own BUCK file and record, and the root's left alone.
+    f.migrate(&["--manifest-path", "guests/guest/Cargo.toml"]);
+    let guest_snap = std::fs::read_to_string(f.ws.join("guests/guest/buckal.snap")).unwrap();
+    assert!(
+        guest_snap.contains("path+file://($WORKSPACE)#0.1.0"),
+        "{guest_snap}"
+    );
+    assert!(rule(&f.buck("guests/guest"), "guest").contains("crate_root"));
+    assert_eq!(
+        std::fs::read_to_string(f.ws.join("buckal.snap")).unwrap(),
+        root_snap
+    );
+
+    // The root generation with tables reads the universe's record (U-4).
+    f.migrate(&["--no-cache"]);
+    let tables = std::fs::read_to_string(f.ws.join("buckal_packages.bzl")).unwrap();
+    assert!(
+        source_tree_list(&tables).contains(&"guests/guest".to_owned()),
+        "{tables}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.ws.join("guests/guest/buckal.snap")).unwrap(),
+        guest_snap
+    );
+
+    // Inside the universe without `--manifest-path`: refused, nothing written.
+    let refused = f.output_in(&f.ws.join("guests/guest/src"), &["migrate"]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("inside the standalone workspace `guests/guest`"),
+        "{stderr}"
+    );
+
+    // A second universe sharing the directory name: refused before anything is
+    // written, whether or not the run writes tables.
+    write(
+        &f.ws.join("other/guest/Cargo.toml"),
+        &manifest("other-guest", "[workspace]\n"),
+    );
+    write(&f.ws.join("other/guest/src/lib.rs"), "");
+    write(
+        &f.ws.join("other/guest/buckal.toml"),
+        "ignore_tests = false\n",
+    );
+    let refused = f.output(&["migrate", "--manifest-path", "other/guest/Cargo.toml"]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("share the directory name `guest`"),
+        "{stderr}"
+    );
+    assert!(!f.ws.join("other/guest/BUCK").exists());
+    assert!(!f.ws.join("other/guest/buckal.snap").exists());
 }

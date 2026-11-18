@@ -542,6 +542,7 @@ pub fn profile_flags(profile: &UnitProfile) -> Result<(Vec<String>, Vec<String>)
 /// has its own variants.
 pub fn resolve_modules(
     modules: &[String],
+    triple: &str,
     platform: &str,
     manifest_path: Option<&str>,
     packages: &HashMap<PackageId, Package>,
@@ -560,17 +561,11 @@ pub fn resolve_modules(
             bail!("`[wasm] packages`: `{module}` declares no `[package.metadata.buck2.wasm]`");
         };
         for (key, features, profile) in declaration.modules(module) {
-            let graph = resolve_package_graph(
-                manifest_path,
-                packages,
-                module,
-                features,
-                profile,
-                WASM_TRIPLE,
-            )?;
+            let graph =
+                resolve_package_graph(manifest_path, packages, module, features, profile, triple)?;
             if !graph.contains_key(id) {
                 bail!(
-                    "`[wasm] packages`: `{key}`'s own graph does not compile its library for {WASM_TRIPLE}"
+                    "`[wasm] packages`: `{key}`'s own graph does not compile its library for {triple}"
                 );
             }
             for (pkg, lib) in graph {

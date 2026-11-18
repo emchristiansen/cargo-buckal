@@ -898,12 +898,14 @@ fn wasm_variant_rules(
                 platform: platform.clone(),
                 visibility: Set::from(["PUBLIC".to_owned()]),
             }));
-            // The module's SHA-256 witness, where a test-env declaration names it.
-            let witnessed = ctx
-                .declared_test_env
-                .values()
-                .flat_map(|declared| declared.values())
-                .any(|value| value.sha256 && &value.module == module);
+            // The module's SHA-256 witness, where a test-env declaration names it or
+            // `[wasm] witnessed` lists it.
+            let witnessed = ctx.repo_config.wasm.witnessed.contains(module)
+                || ctx
+                    .declared_test_env
+                    .values()
+                    .flat_map(|declared| declared.values())
+                    .any(|value| value.sha256 && &value.module == module);
             if witnessed {
                 variant.push(Rule::WasmSha256(crate::buck::WasmSha256 {
                     name: format!("{alias}{}", crate::wasm::SHA256_SUFFIX),

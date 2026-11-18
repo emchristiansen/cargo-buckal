@@ -13,6 +13,7 @@ pub mod platform;
 pub mod platform_features;
 pub mod registry;
 pub mod resolve;
+pub mod universe;
 pub mod utils;
 pub mod wasm;
 pub mod workspace_inputs;
