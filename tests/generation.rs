@@ -14,7 +14,7 @@ struct Fixture {
     home: PathBuf,
 }
 
-/// A fixture that keeps another one's directory alive (its stand-in `buck2`).
+/// A fixture that keeps another one alive (the fixture whose HOME it copied).
 struct Kept {
     fixture: Fixture,
     _keepalive: Fixture,
@@ -39,6 +39,37 @@ impl Fixture {
 fn write(path: &Path, content: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(path, content).unwrap();
+}
+
+/// The stand-in `buck2`, written once per test process before any test can spawn a
+/// process. Writing an executable while another thread forks lets the child inherit the
+/// open write descriptor until it execs, and running the file meanwhile fails with "text
+/// file busy" (ETXTBSY): a per-fixture shim made `cargo buckal` report Buck2 missing
+/// at random under parallel tests. Every spawn here follows a `fixture()` call, which
+/// waits on this initialisation, so no fork can overlap the write.
+fn buck2_shim() -> &'static Path {
+    static SHIM: std::sync::OnceLock<(tempfile::TempDir, PathBuf)> = std::sync::OnceLock::new();
+    &SHIM
+        .get_or_init(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let shim = dir.path().join("bin/buck2");
+            write(
+                &shim,
+                "#!/bin/sh\n\
+                 case \"$1\" in\n\
+                 --help|--version) exit 0 ;;\n\
+                 root) d=$PWD; while [ \"$d\" != / ]; do [ -f \"$d/.buckconfig\" ] && { echo \"$d\"; exit 0; }; d=$(dirname \"$d\"); done; exit 1 ;;\n\
+                 *) echo \"generation-only buck2 stand-in: $*\" >&2; exit 2 ;;\n\
+                 esac\n",
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            (dir, shim)
+        })
+        .1
 }
 
 fn manifest(name: &str, body: &str) -> String {
@@ -123,24 +154,9 @@ extra = { path = "../extra" }
     write(&ws.join(".buckconfig"), "[cells]\nroot = .\n");
     write(&ws.join("buckal.toml"), BUCKAL_TOML);
 
-    let shim = dir.path().join("bin/buck2");
-    write(
-        &shim,
-        "#!/bin/sh\n\
-         case \"$1\" in\n\
-         --help|--version) exit 0 ;;\n\
-         root) d=$PWD; while [ \"$d\" != / ]; do [ -f \"$d/.buckconfig\" ] && { echo \"$d\"; exit 0; }; d=$(dirname \"$d\"); done; exit 1 ;;\n\
-         *) echo \"generation-only buck2 stand-in: $*\" >&2; exit 2 ;;\n\
-         esac\n",
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
     write(
         &home.join(".config/buckal/config.toml"),
-        &format!("buck2_binary = {:?}\n", shim.to_str().unwrap()),
+        &format!("buck2_binary = {:?}\n", buck2_shim().to_str().unwrap()),
     );
     Fixture {
         _dir: dir,
