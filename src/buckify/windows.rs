@@ -46,6 +46,15 @@ pub(super) fn patch_root_windows_rustc_flags(
     for lib_target in lib_targets {
         if lib_target.test {
             rust_test_names.insert("unittest".to_owned());
+            // Its `unit_test_variants` are the same compilation under other names.
+            if let Some(fixup) = ctx.repo_config.fixups.get(&root.name) {
+                rust_test_names.extend(
+                    fixup
+                        .unit_test_variants
+                        .iter()
+                        .map(|v| super::rules::unit_test_variant_name(v)),
+                );
+            }
         }
     }
 

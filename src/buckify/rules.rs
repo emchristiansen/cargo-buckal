@@ -545,6 +545,21 @@ fn buckify_root_node_targets(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule
             }
             test_context_rules.insert("unittest".to_owned());
 
+            // `unit_test_variants`: the same unit tests under further names, each
+            // its own process with its own per-test fixups.
+            let variants = ctx
+                .repo_config
+                .fixups
+                .get(&node.name)
+                .map(|fixup| fixup.unit_test_variants.clone())
+                .unwrap_or_default();
+            for variant in variants {
+                let mut variant_test = rust_test.clone();
+                variant_test.name = unit_test_variant_name(&variant);
+                test_context_rules.insert(variant_test.name.clone());
+                buck_rules.push(Rule::RustTest(variant_test));
+            }
+
             buck_rules.push(Rule::RustTest(rust_test));
         }
     }
@@ -646,7 +661,7 @@ fn buckify_root_node_targets(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule
                     .is_some_and(|name| test_context_rules.contains(name));
             let unit_test_host = unit_test_build
                 .as_ref()
-                .filter(|_| rule.name() == Some("unittest"));
+                .filter(|_| rule.name().is_some_and(is_unit_test_rule));
             if let Some(rust_rule) = rule.as_rust_rule_mut() {
                 if let Some(build) = unit_test_host {
                     patch_with_buildscript(rust_rule, build);
@@ -1367,6 +1382,12 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
         buckal_error!("{:#}", error);
         std::process::exit(1);
     }
+    if !ctx.repo_config.ignore_tests
+        && let Err(error) = check_unit_test_variants(&node.name, fixup, rules)
+    {
+        buckal_error!("{:#}", error);
+        std::process::exit(1);
+    }
     if let Err(error) = check_buildscript_fixup(&node.name, &fixup.buildscript) {
         buckal_error!("{:#}", error);
         std::process::exit(1);
@@ -1444,6 +1465,7 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
                             (!runtime_tools.is_empty()).then(|| runtime_tools.clone());
                     }
                     r.labels.extend(test.labels.iter().cloned());
+                    r.extra_resources.extend(test.resources.iter().cloned());
                     r.args.extend(test.args.iter().cloned());
                     if !test.compatible_with.is_empty() {
                         r.target_compatible_with
@@ -1471,6 +1493,47 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
         rustc_flags.extend(fixup.rustc_flags.iter().cloned());
         mapped_srcs.extend(mapped.clone());
     }
+}
+
+/// The rule of the library's unit tests named `variant` in `unit_test_variants`.
+pub(crate) fn unit_test_variant_name(variant: &str) -> String {
+    format!("unittest.{variant}")
+}
+
+/// Whether `name` is the library's unit-test rule or one of its
+/// `unit_test_variants`.
+pub(crate) fn is_unit_test_rule(name: &str) -> bool {
+    name == "unittest" || name.starts_with("unittest.")
+}
+
+/// Refuse a `unit_test_variants` name that is empty or holds anything but ASCII
+/// letters, digits and `_`, and any variant of a package without unit tests.
+fn check_unit_test_variants(
+    package: &str,
+    fixup: &crate::config::PackageFixup,
+    rules: &[Rule],
+) -> anyhow::Result<()> {
+    if fixup.unit_test_variants.is_empty() {
+        return Ok(());
+    }
+    if let Some(bad) = fixup
+        .unit_test_variants
+        .iter()
+        .find(|v| v.is_empty() || !v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    {
+        anyhow::bail!(
+            "`[fixups.{package}] unit_test_variants`: `{bad}` is not a name of ASCII letters, digits and `_`"
+        );
+    }
+    if !rules
+        .iter()
+        .any(|rule| matches!(rule, Rule::RustTest(r) if r.name == "unittest"))
+    {
+        anyhow::bail!(
+            "`[fixups.{package}] unit_test_variants`: the package has no unit tests to vary"
+        );
+    }
+    Ok(())
 }
 
 /// The names of the build-script binaries among `rules` (those a
@@ -2330,6 +2393,7 @@ mod tests {
                 test_supports_execution_caching: None,
                 test_args: Default::default(),
                 tests: Default::default(),
+                unit_test_variants: Default::default(),
                 target_compatible_with: Default::default(),
                 extra_deps: Default::default(),
                 buildscript: Default::default(),
@@ -2478,6 +2542,82 @@ mod tests {
             "{content}"
         );
         assert!(!content.contains("extra_resources"), "{content}");
+    }
+
+    #[test]
+    fn test_unit_test_variant_is_the_unit_test_under_its_own_fixups() {
+        let (_dir, node) = first_party_package("conta/wire", &["src/lib.rs", "tests/wire.rs"]);
+        let mut ctx = test_ctx();
+        let operand = "//buck2/structural_operand:structural_operand".to_owned();
+        ctx.repo_config.fixups.insert(
+            node.name.clone(),
+            crate::config::PackageFixup {
+                unit_test_variants: Set::from(["live".to_owned()]),
+                tests: [
+                    (
+                        "unittest".to_owned(),
+                        crate::config::TestFixup {
+                            args: vec!["--declared-skip".to_owned(), "a::b".to_owned()],
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "unittest.live".to_owned(),
+                        crate::config::TestFixup {
+                            args: vec!["--declared-only-substring".to_owned(), "a::".to_owned()],
+                            run_env: [("OPERAND".to_owned(), "$(location //x:y)".to_owned())]
+                                .into(),
+                            resources: Set::from([operand.clone()]),
+                            ..Default::default()
+                        },
+                    ),
+                ]
+                .into(),
+                ..Default::default()
+            },
+        );
+        let rules = buckify_root_node(&node, &ctx);
+        let unit = find_test(&rules, "unittest");
+        let live = find_test(&rules, "unittest.live");
+        // The same compilation.
+        assert_eq!(live.crate_root, unit.crate_root);
+        assert_eq!(live.crate_name, unit.crate_name);
+        assert_eq!(live.srcs, unit.srcs);
+        assert_eq!(live.deps, unit.deps);
+        assert_eq!(live.rustc_flags, unit.rustc_flags);
+        assert_eq!(live.features, unit.features);
+        // Each with its own fixups only.
+        assert_eq!(unit.args.plain, vec!["--declared-skip", "a::b"]);
+        assert_eq!(live.args.plain, vec!["--declared-only-substring", "a::"]);
+        assert!(unit.run_env.is_empty());
+        assert_eq!(
+            live.run_env.get("OPERAND").map(String::as_str),
+            Some("$(location //x:y)")
+        );
+        assert!(unit.extra_resources.is_empty());
+        assert_eq!(live.extra_resources, Set::from([operand]));
+        // The integration test is untouched.
+        assert!(find_test(&rules, "wire").extra_resources.is_empty());
+    }
+
+    #[test]
+    fn test_unit_test_variant_names_are_refused_unless_plain() {
+        let (_dir, node) = first_party_package("conta/wire", &["src/lib.rs"]);
+        let mut fixup = crate::config::PackageFixup::default();
+        let rules = buckify_root_node(&node, &test_ctx());
+        for bad in ["", "a.b", "a-b", "a b"] {
+            fixup.unit_test_variants = Set::from([bad.to_owned()]);
+            let error = check_unit_test_variants("wire", &fixup, &rules).unwrap_err();
+            assert!(error.to_string().contains("is not a name"), "{error}");
+        }
+        fixup.unit_test_variants = Set::from(["ok_1".to_owned()]);
+        assert!(check_unit_test_variants("wire", &fixup, &rules).is_ok());
+        let without_unit_tests: Vec<Rule> = rules
+            .into_iter()
+            .filter(|rule| !matches!(rule, Rule::RustTest(_)))
+            .collect();
+        let error = check_unit_test_variants("wire", &fixup, &without_unit_tests).unwrap_err();
+        assert!(error.to_string().contains("no unit tests"), "{error}");
     }
 
     #[test]
