@@ -215,7 +215,10 @@ pub struct RepoConfig {
 /// `[package_macro]` of `buckal.toml`: a macro of the repository's own (`bzl`,
 /// `function`) that generation calls once, at package scope, in every BUCK file
 /// it writes for a first-party package when `first_party` is set, with
-/// `first_party_kwargs` as its keyword arguments. Generation emits the macro's
+/// `first_party_kwargs` as its keyword arguments, and in every third-party
+/// package's BUCK file when `third_party` is set, with `third_party_kwargs`.
+/// Third-party BUCK files are generated whole, so there the call is simply part
+/// of the output. Generation emits the macro's
 /// `load` and the call and owns both: a hand-written call of `function` in such
 /// a file is replaced by the generated one, and a hand-written `load` of `bzl`
 /// that binds only `function` is dropped. What the macro declares (for example
@@ -239,6 +242,12 @@ pub struct PackageMacroConfig {
     /// booleans.
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub first_party_kwargs: Map<String, MacroArg>,
+    /// Call the macro in third-party packages' BUCK files.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub third_party: bool,
+    /// Keyword arguments of the third-party call, as `first_party_kwargs`.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub third_party_kwargs: Map<String, MacroArg>,
 }
 
 /// A literal keyword argument of a [`PackageMacroConfig`] call.
@@ -258,6 +267,8 @@ struct RawPackageMacroConfig {
     function: String,
     first_party: bool,
     first_party_kwargs: Map<String, MacroArg>,
+    third_party: bool,
+    third_party_kwargs: Map<String, MacroArg>,
 }
 
 /// Whether `word` is a Starlark identifier.
@@ -278,6 +289,8 @@ impl TryFrom<RawPackageMacroConfig> for PackageMacroConfig {
             function: raw.function,
             first_party: raw.first_party,
             first_party_kwargs: raw.first_party_kwargs,
+            third_party: raw.third_party,
+            third_party_kwargs: raw.third_party_kwargs,
         };
         if config.is_empty() {
             return Ok(config);
@@ -294,7 +307,12 @@ impl TryFrom<RawPackageMacroConfig> for PackageMacroConfig {
                 config.function
             ));
         }
-        if let Some(key) = config.first_party_kwargs.keys().find(|k| !is_identifier(k)) {
+        if let Some(key) = config
+            .first_party_kwargs
+            .keys()
+            .chain(config.third_party_kwargs.keys())
+            .find(|k| !is_identifier(k))
+        {
             return Err(format!(
                 "[package_macro] keyword argument {key:?} is not a Starlark identifier"
             ));
@@ -313,6 +331,12 @@ impl PackageMacroConfig {
     /// macro is not called there.
     pub fn first_party_call(&self) -> Option<&Map<String, MacroArg>> {
         self.first_party.then_some(&self.first_party_kwargs)
+    }
+
+    /// The call's keyword arguments in third-party packages, or `None` when the
+    /// macro is not called there.
+    pub fn third_party_call(&self) -> Option<&Map<String, MacroArg>> {
+        self.third_party.then_some(&self.third_party_kwargs)
     }
 }
 
@@ -405,6 +429,25 @@ impl RepoConfig {
                     &self.package_macro.bzl,
                     &self.package_macro.function,
                     &self.package_macro.first_party_kwargs,
+                ))
+                .expect("package_macro config serializes"),
+            );
+        }
+        key
+    }
+
+    /// Workspace-level settings that change the rules of every third-party
+    /// package, serialized for the cache fingerprints (empty when none is set).
+    pub fn third_party_generation_key(&self) -> Vec<u8> {
+        let mut key = Vec::new();
+        // The macro call is part of every third-party package's BUCK file.
+        if self.package_macro.third_party {
+            key.extend(b"package_macro");
+            key.extend(
+                serde_json::to_vec(&(
+                    &self.package_macro.bzl,
+                    &self.package_macro.function,
+                    &self.package_macro.third_party_kwargs,
                 ))
                 .expect("package_macro config serializes"),
             );
@@ -846,7 +889,7 @@ mod tests {
                 bzl: "//buck2:inputs.bzl".to_owned(),
                 function: "declare_inputs".to_owned(),
                 first_party: true,
-                first_party_kwargs: Default::default(),
+                ..PackageMacroConfig::default()
             },
             ..RepoConfig::default()
         };
@@ -865,6 +908,71 @@ mod tests {
         let mut off = configured.clone();
         off.package_macro.first_party = false;
         assert!(off.first_party_generation_key().is_empty());
+        // The first-party call does not reach third-party packages.
+        assert!(configured.third_party_generation_key().is_empty());
+    }
+
+    #[test]
+    fn test_package_macro_reaches_the_third_party_generation_key() {
+        assert!(
+            RepoConfig::default()
+                .third_party_generation_key()
+                .is_empty()
+        );
+        let configured = RepoConfig {
+            package_macro: PackageMacroConfig {
+                bzl: "//buck2:inputs.bzl".to_owned(),
+                function: "declare_inputs".to_owned(),
+                third_party: true,
+                ..PackageMacroConfig::default()
+            },
+            ..RepoConfig::default()
+        };
+        let key = configured.third_party_generation_key();
+        assert!(!key.is_empty());
+        assert!(configured.first_party_generation_key().is_empty());
+        let mut other = configured.clone();
+        other
+            .package_macro
+            .third_party_kwargs
+            .insert("whole_repository_only".to_owned(), MacroArg::Bool(true));
+        assert_ne!(other.third_party_generation_key(), key);
+        // A first-party argument changes only the first-party key.
+        let mut first = configured.clone();
+        first
+            .package_macro
+            .first_party_kwargs
+            .insert("whole_repository_only".to_owned(), MacroArg::Bool(true));
+        assert_eq!(first.third_party_generation_key(), key);
+    }
+
+    #[test]
+    fn test_repo_config_deserializes_third_party_package_macro() {
+        let config = RepoConfig::parse(
+            r#"
+                [package_macro]
+                bzl = "//buck2:source_tree_inputs.bzl"
+                function = "declare_source_tree_inputs"
+                third_party = true
+                third_party_kwargs = { whole_repository_only = true }
+            "#,
+        )
+        .expect("failed to deserialize repo config");
+        assert!(config.package_macro.first_party_call().is_none());
+        let kwargs = config
+            .package_macro
+            .third_party_call()
+            .expect("third-party call");
+        assert_eq!(
+            kwargs.get("whole_repository_only"),
+            Some(&MacroArg::Bool(true))
+        );
+        assert!(
+            RepoConfig::parse(
+                "[package_macro]\nbzl = \"//a:b.bzl\"\nfunction = \"f\"\nthird_party = true\nthird_party_kwargs = { \"a-b\" = true }\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]

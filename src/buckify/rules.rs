@@ -53,6 +53,35 @@ pub(super) fn is_proc_macro_built_nowhere(node: &BuckalNode, ctx: &BuckalContext
 }
 
 pub fn buckify_dep_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
+    let mut rules = buckify_dep_node_targets(node, ctx);
+    rules.extend(third_party_package_macro(ctx));
+    rules
+}
+
+/// The `[package_macro]` call of a third-party package's BUCK file, when the
+/// repository configures one there.
+fn third_party_package_macro(ctx: &BuckalContext) -> Option<Rule> {
+    let config = &ctx.repo_config.package_macro;
+    config
+        .third_party_call()
+        .map(|kwargs| package_macro_rule(config, kwargs))
+}
+
+/// The `[package_macro]` call of `config` with `kwargs`, with its load.
+fn package_macro_rule(
+    config: &crate::config::PackageMacroConfig,
+    kwargs: &std::collections::BTreeMap<String, crate::config::MacroArg>,
+) -> Rule {
+    Rule::PackageMacro(PackageMacro {
+        bzl: config.bzl.clone(),
+        function: config.function.clone(),
+        kwargs: kwargs.clone(),
+        load: true,
+    })
+}
+
+/// [`buckify_dep_node`]'s rules for the package's targets.
+fn buckify_dep_node_targets(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
     if is_proc_macro_built_nowhere(node, ctx) {
         return Vec::new();
     }
@@ -184,14 +213,9 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
 /// repository configures one there.
 fn first_party_package_macro(ctx: &BuckalContext) -> Option<Rule> {
     let config = &ctx.repo_config.package_macro;
-    config.first_party_call().map(|kwargs| {
-        Rule::PackageMacro(PackageMacro {
-            bzl: config.bzl.clone(),
-            function: config.function.clone(),
-            kwargs: kwargs.clone(),
-            load: true,
-        })
-    })
+    config
+        .first_party_call()
+        .map(|kwargs| package_macro_rule(config, kwargs))
 }
 
 /// [`buckify_root_node`]'s rules for the package's targets.
@@ -2730,6 +2754,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| ((*k).to_owned(), v.clone()))
                 .collect(),
+            ..Default::default()
         };
         ctx
     }
@@ -2811,9 +2836,64 @@ mod tests {
     }
 
     #[test]
-    fn test_package_macro_is_not_called_in_third_party_packages() {
+    fn test_package_macro_is_not_called_in_third_party_packages_unless_configured() {
+        let plain = buckify_dep_node(&registry_dep_node(), &test_ctx());
+        // The first-party call does not reach third-party packages.
         let rules = buckify_dep_node(&registry_dep_node(), &package_macro_ctx(&[]));
         assert!(rules.iter().any(|r| matches!(r, Rule::RustLibrary(_))));
         assert!(!rules.iter().any(|r| matches!(r, Rule::PackageMacro(_))));
+        assert_eq!(gen_buck_content(&rules), gen_buck_content(&plain));
+    }
+
+    #[test]
+    fn test_package_macro_is_called_in_third_party_packages_with_their_arguments() {
+        use crate::config::MacroArg;
+        let mut ctx = package_macro_ctx(&[("first_only", MacroArg::Bool(true))]);
+        ctx.repo_config.package_macro.third_party = true;
+        ctx.repo_config
+            .package_macro
+            .third_party_kwargs
+            .insert("whole_repository_only".to_owned(), MacroArg::Bool(true));
+        let content = gen_buck_content(&buckify_dep_node(&registry_dep_node(), &ctx));
+        assert!(content.starts_with(GENERATED_HEADER), "{content}");
+        assert_eq!(
+            content
+                .matches(&format!(
+                    "{PACKAGE_MACRO_MARKER}\nload(\"//buck2:source_tree_inputs.bzl\", \"declare_source_tree_inputs\")\n"
+                ))
+                .count(),
+            1,
+            "{content}"
+        );
+        assert!(
+            content.contains(&format!(
+                "{PACKAGE_MACRO_MARKER}\ndeclare_source_tree_inputs(whole_repository_only = True)\n"
+            )) || content.contains(&format!(
+                "{PACKAGE_MACRO_MARKER}\ndeclare_source_tree_inputs(\n    whole_repository_only = True,\n)\n"
+            )),
+            "{content}"
+        );
+        assert!(!content.contains("first_only"), "{content}");
+        assert_eq!(content.matches("declare_source_tree_inputs(").count(), 1);
+    }
+
+    #[test]
+    fn test_package_macro_is_called_in_a_third_party_package_with_no_rules() {
+        // A proc-macro package no configured platform builds gets no rules, but
+        // its BUCK file is still written, so it still calls the macro.
+        let mut node = registry_dep_node();
+        node.targets[0].kind = vec![TargetKind::ProcMacro];
+        let mut ctx = package_macro_ctx(&[]);
+        ctx.repo_config.feature_platforms.insert(
+            "linux-x86_64".to_owned(),
+            "x86_64-unknown-linux-gnu".to_owned(),
+        );
+        ctx.repo_config.package_macro.third_party = true;
+        // Not a workspace member (with no member list, every package is one).
+        ctx.workspace_members = Some(Default::default());
+        assert!(is_proc_macro_built_nowhere(&node, &ctx));
+        let rules = buckify_dep_node(&node, &ctx);
+        assert_eq!(rules.len(), 1);
+        assert!(matches!(&rules[0], Rule::PackageMacro(_)));
     }
 }

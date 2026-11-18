@@ -861,7 +861,7 @@ mod tests {
                 bzl: "//buck2:source_tree_inputs.bzl".to_owned(),
                 function: "declare_source_tree_inputs".to_owned(),
                 first_party: true,
-                first_party_kwargs: Default::default(),
+                ..Default::default()
             },
             ..RepoConfig::default()
         }
