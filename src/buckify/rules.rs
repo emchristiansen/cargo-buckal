@@ -8,7 +8,10 @@ use itertools::Itertools;
 use crate::platform_features::{EdgeRole, platform_list_mut};
 
 use crate::{
-    buck::{ExportFile, GENERATED_HEADER, Load, PARTLY_GENERATED_HEADER, Rule, RustRule},
+    buck::{
+        ExportFile, GENERATED_HEADER, Load, PACKAGE_MACRO_MARKER, PARTLY_GENERATED_HEADER,
+        PackageMacro, Rule, RustRule,
+    },
     buckal_error, buckal_note, buckal_warn,
     context::BuckalContext,
     resolve::{BuckalNode, BuckalTarget, NodeKind, is_lib_like},
@@ -172,6 +175,27 @@ pub fn buckify_dep_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
 
 /// Buckifies workspace package into a list of BUCK rules, including rules for all targets (bin, lib, test) and handling build scripts if present.
 pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
+    let mut rules = buckify_root_node_targets(node, ctx);
+    rules.extend(first_party_package_macro(ctx));
+    rules
+}
+
+/// The `[package_macro]` call of a first-party package's BUCK file, when the
+/// repository configures one there.
+fn first_party_package_macro(ctx: &BuckalContext) -> Option<Rule> {
+    let config = &ctx.repo_config.package_macro;
+    config.first_party_call().map(|kwargs| {
+        Rule::PackageMacro(PackageMacro {
+            bzl: config.bzl.clone(),
+            function: config.function.clone(),
+            kwargs: kwargs.clone(),
+            load: true,
+        })
+    })
+}
+
+/// [`buckify_root_node`]'s rules for the package's targets.
+fn buckify_root_node_targets(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
     if is_proc_macro_built_nowhere(node, ctx) {
         return Vec::new();
     }
@@ -1692,9 +1716,30 @@ fn render_buck_content(
 
     let mut content = rules
         .iter()
-        .map(serde_starlark::to_string)
-        .map(|r| r.unwrap())
+        .map(|rule| {
+            let text = serde_starlark::to_string(rule).unwrap();
+            match rule {
+                Rule::PackageMacro(_) => format!("{PACKAGE_MACRO_MARKER}\n{text}"),
+                _ => text,
+            }
+        })
         .join("\n");
+
+    // The `[package_macro]` load, after the generated loads, marked as generated.
+    let macro_loads: Vec<String> = rules
+        .iter()
+        .filter_map(|rule| match rule {
+            Rule::PackageMacro(m) if m.load => Some(format!(
+                "{PACKAGE_MACRO_MARKER}\n{}",
+                serde_starlark::to_string(&Rule::Load(Load {
+                    bzl: m.bzl.clone(),
+                    items: Set::from([m.function.clone()]),
+                }))
+                .unwrap()
+            )),
+            _ => None,
+        })
+        .collect();
 
     for statement in preserved_statements {
         content.push('\n');
@@ -1702,12 +1747,15 @@ fn render_buck_content(
         content.push('\n');
     }
 
-    if !loads.is_empty() || !preserved_loads.is_empty() {
+    if !loads.is_empty() || !macro_loads.is_empty() || !preserved_loads.is_empty() {
         let mut loads_string = loads
             .iter()
             .map(serde_starlark::to_string)
             .map(|r| r.unwrap())
             .join("");
+        for load in macro_loads {
+            loads_string.push_str(&load);
+        }
         for load in preserved_loads {
             loads_string.push_str(load);
             loads_string.push('\n');
@@ -2642,5 +2690,130 @@ mod tests {
         node.platform_features.host_variant = None;
         let rules = buckify_root_node(&node, &test_ctx());
         assert!(!gen_buck_content(&rules).contains("-host"));
+    }
+
+    /// A registry package with a library target only.
+    fn registry_dep_node() -> BuckalNode {
+        let manifest_dir = Utf8PathBuf::from("/registry/dep-1.0.0");
+        BuckalNode {
+            package_id: PackageId {
+                repr: "registry+https://github.com/rust-lang/crates.io-index#dep@1.0.0".to_owned(),
+            },
+            name: "dep".to_owned(),
+            version: "1.0.0".to_owned(),
+            features: vec![],
+            platform_features: Default::default(),
+            kind: NodeKind::ThirdParty,
+            edition: Edition::E2021,
+            manifest_path: manifest_dir.join("Cargo.toml"),
+            targets: vec![BuckalTarget {
+                name: "dep".to_owned(),
+                kind: vec![TargetKind::Lib],
+                src_path: manifest_dir.join("src/lib.rs"),
+                doctest: true,
+                required_features: Vec::new(),
+                test: true,
+            }],
+            source: Some("registry+https://github.com/rust-lang/crates.io-index".to_owned()),
+            links: None,
+            checksum: Some("0".repeat(64)),
+        }
+    }
+
+    fn package_macro_ctx(kwargs: &[(&str, crate::config::MacroArg)]) -> BuckalContext {
+        let mut ctx = test_ctx();
+        ctx.repo_config.package_macro = crate::config::PackageMacroConfig {
+            bzl: "//buck2:source_tree_inputs.bzl".to_owned(),
+            function: "declare_source_tree_inputs".to_owned(),
+            first_party: true,
+            first_party_kwargs: kwargs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect(),
+        };
+        ctx
+    }
+
+    #[test]
+    fn test_package_macro_is_called_once_in_a_first_party_package() {
+        let (_dir, node) = first_party_package("sealed_source", &["src/lib.rs", "tests/wire.rs"]);
+        let content = gen_buck_content(&buckify_root_node(&node, &package_macro_ctx(&[])));
+        assert!(
+            content.contains(&format!(
+                "{PACKAGE_MACRO_MARKER}\nload(\"//buck2:source_tree_inputs.bzl\", \"declare_source_tree_inputs\")\n"
+            )),
+            "{content}"
+        );
+        assert!(
+            content.contains(&format!(
+                "{PACKAGE_MACRO_MARKER}\ndeclare_source_tree_inputs()\n"
+            )),
+            "{content}"
+        );
+        assert_eq!(content.matches("declare_source_tree_inputs()").count(), 1);
+        // After the generated loads, and after the generated rules.
+        let load = content.find("load(\"//buck2:").unwrap();
+        assert!(content.find("load(\"@buckal//:wrapper.bzl\"").unwrap() < load);
+        assert!(
+            content.rfind("rust_test(").unwrap()
+                < content.find("declare_source_tree_inputs()").unwrap()
+        );
+    }
+
+    #[test]
+    fn test_package_macro_call_carries_its_keyword_arguments() {
+        use crate::config::MacroArg;
+        let (_dir, node) = first_party_package("pkg", &["src/lib.rs", "tests/wire.rs"]);
+        let ctx = package_macro_ctx(&[
+            ("whole_repository_only", MacroArg::Bool(true)),
+            ("cell_path", MacroArg::Str("tool\"chains".to_owned())),
+            ("depth", MacroArg::Int(2)),
+        ]);
+        let rules = buckify_root_node(&node, &ctx);
+        let call = rules
+            .iter()
+            .find_map(|r| match r {
+                Rule::PackageMacro(m) => Some(m),
+                _ => None,
+            })
+            .expect("package macro");
+        assert_eq!(call.function, "declare_source_tree_inputs");
+        assert_eq!(call.bzl, "//buck2:source_tree_inputs.bzl");
+        assert!(call.load);
+        let content = gen_buck_content(&rules);
+        let start = content
+            .find(&format!(
+                "{PACKAGE_MACRO_MARKER}\ndeclare_source_tree_inputs("
+            ))
+            .unwrap();
+        let text = &content[start..];
+        let text = &text[..text.find("\n)\n").unwrap() + 3];
+        assert_eq!(
+            text,
+            format!(
+                "{PACKAGE_MACRO_MARKER}\ndeclare_source_tree_inputs(\n    cell_path = \"tool\\\"chains\",\n    depth = 2,\n    whole_repository_only = True,\n)\n"
+            ),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn test_no_package_macro_call_unless_configured() {
+        let (_dir, node) = first_party_package("pkg", &["src/lib.rs", "tests/wire.rs"]);
+        let plain = gen_buck_content(&buckify_root_node(&node, &test_ctx()));
+        assert!(!plain.contains(PACKAGE_MACRO_MARKER), "{plain}");
+        assert!(!plain.contains("declare_source_tree_inputs"), "{plain}");
+
+        // Configured, but not for first-party packages.
+        let mut ctx = package_macro_ctx(&[]);
+        ctx.repo_config.package_macro.first_party = false;
+        assert_eq!(gen_buck_content(&buckify_root_node(&node, &ctx)), plain);
+    }
+
+    #[test]
+    fn test_package_macro_is_not_called_in_third_party_packages() {
+        let rules = buckify_dep_node(&registry_dep_node(), &package_macro_ctx(&[]));
+        assert!(rules.iter().any(|r| matches!(r, Rule::RustLibrary(_))));
+        assert!(!rules.iter().any(|r| matches!(r, Rule::PackageMacro(_))));
     }
 }
