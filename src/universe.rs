@@ -24,6 +24,7 @@ use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 use cargo_metadata::camino::{Utf8Path, Utf8PathBuf};
+use cargo_util_schemas::core::{PackageIdSpec, SourceKind};
 
 use crate::{RUST_ROOT, utils::get_buck2_root};
 
@@ -73,6 +74,24 @@ impl Universe {
     /// Where the universe's git crates are vendored.
     pub fn git_root(&self) -> String {
         format!("{}/git", self.vendor_root())
+    }
+
+    /// Where the universe vendors the package whose package-id is `repr`, relative
+    /// to the Buck2 root: `<crates root>/<name>/<version>` for a registry package,
+    /// `<git root>/<name>/<version>` for a git package, and `None` for any other
+    /// source (a path package is first-party, not vendored).
+    pub fn vendor_path_relative(&self, repr: &str) -> Result<Option<String>> {
+        let spec =
+            PackageIdSpec::parse(repr).with_context(|| format!("`{repr}` is not a package-id"))?;
+        let root = match spec.kind() {
+            Some(SourceKind::Registry) => self.crates_root(),
+            Some(SourceKind::Git(_)) => self.git_root(),
+            _ => return Ok(None),
+        };
+        let version = spec
+            .version()
+            .with_context(|| format!("package-id `{repr}` names no version"))?;
+        Ok(Some(format!("{root}/{}/{version}", spec.name())))
     }
 
     /// The universe `manifest_path` selects, `buck2_root` being the Buck2 project

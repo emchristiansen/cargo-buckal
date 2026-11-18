@@ -438,31 +438,9 @@ pub fn get_cache_path() -> Result<Utf8PathBuf> {
 /// where the roots are the selected universe's ([`crate::universe`]):
 /// `third-party/rust/{crates,git}` for the Buck2 project's own workspace.
 pub fn get_vendor_path_relative(package_id: &PackageId) -> Result<String> {
-    let package_id_spec = PackageIdSpec::parse(&package_id.repr)?;
-    match package_id_spec
-        .kind()
-        .expect("failed to extract package source kind")
-    {
-        SourceKind::Registry => Ok(format!(
-            "{}/{}/{}",
-            crate::universe::selected().crates_root(),
-            package_id_spec.name(),
-            package_id_spec
-                .version()
-                .expect("failed to extract package version")
-        )),
-        SourceKind::Git(_) => Ok(format!(
-            "{}/{}/{}",
-            crate::universe::selected().git_root(),
-            package_id_spec.name(),
-            package_id_spec
-                .version()
-                .expect("failed to extract package version")
-        )),
-        _ => bail!(
-            "unsupported source kind for package '{}'",
-            package_id_spec.name()
-        ),
+    match crate::universe::selected().vendor_path_relative(&package_id.repr)? {
+        Some(path) => Ok(path),
+        None => bail!("unsupported source kind for package '{}'", package_id.repr),
     }
 }
 
