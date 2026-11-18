@@ -102,7 +102,7 @@ pub fn module_alias(key: &str) -> String {
 /// (`<lib>-wasm-<key>`): `<package>__test`, or `<package>__test__<variant>`. It
 /// holds only letters, digits, `_` and `-`, so the crate names derived from it
 /// (variant build scripts) are Rust identifiers. Two graphs can share a key
-/// (`a` with variant `b`, and `a__test__b` without one), and a module key
+/// (`a` with variant `b__test`, and `a__test__b` without one), and a module key
 /// (`<package>`, `<package>.<variant>`) can be spelled like one when a package is
 /// named so. [`resolve_tests`] refuses the first, and the generation refuses the
 /// second where the two graphs share a library.
@@ -768,7 +768,7 @@ mod tests {
 
     #[test]
     fn test_wasm_test_key_collision_is_refused() {
-        // `a` with variant `b` and `a__test__b` without one share `a__test__b__test`.
+        // `a` with variant `b__test` and `a__test__b` without one share `a__test__b__test`.
         assert_eq!(test_key("a", Some("b__test")), test_key("a__test__b", None));
         let mut keys = BTreeMap::new();
         claim_test_key(
