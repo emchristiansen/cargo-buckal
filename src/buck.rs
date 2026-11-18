@@ -406,6 +406,11 @@ pub struct RustTest {
     /// the prelude to add to `resources` at their project paths.
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub extra_resources: Set<String>,
+    /// Sets of source files from outside the package
+    /// (`[fixups.<pkg>] test_source_resource_sets`), each a target of source artifacts,
+    /// for the prelude to add to the test's inputs at their project paths.
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub source_resource_sets: Set<String>,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub features: Set<String>,
     /// Per-platform attributes for the prelude's `platform` argument
@@ -1374,6 +1379,7 @@ impl RustTest {
         let resources = kwargs.get_glob_opt("resources");
         let cargo_bin_exes = kwargs.get_dict("cargo_bin_exes");
         let extra_resources = kwargs.get_list("extra_resources");
+        let source_resource_sets = kwargs.get_list("source_resource_sets");
         Ok(RustTest {
             name,
             srcs,
@@ -1395,6 +1401,7 @@ impl RustTest {
             resources,
             cargo_bin_exes,
             extra_resources,
+            source_resource_sets,
             features,
             platform: Map::new(),
             rustc_flags,
@@ -2749,6 +2756,7 @@ mod tests {
             resources: None,
             cargo_bin_exes: Map::new(),
             extra_resources: Set::new(),
+            source_resource_sets: Set::new(),
             features: Set::from(["default".to_string()]),
             platform: Map::new(),
             rustc_flags: Vec::from(["@$(location :manifest[env_flags])".to_string()]),

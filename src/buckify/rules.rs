@@ -1401,6 +1401,8 @@ fn apply_fixups(rules: &mut [Rule], node: &BuckalNode, ctx: &BuckalContext) {
                 let unset_labels = fixup.tests.get(&r.name).map(|test| &test.unset_labels);
                 r.extra_resources
                     .extend(fixup.test_resources.iter().cloned());
+                r.source_resource_sets
+                    .extend(fixup.test_source_resource_sets.iter().cloned());
                 r.run_env.extend(fixup.test_run_env.clone());
                 if let Some(remote_execution) = &fixup.test_remote_execution {
                     r.remote_execution = Some(remote_execution.clone());
@@ -2316,6 +2318,7 @@ mod tests {
                 rustc_flags: vec!["-Lnative=/opt/openssl/lib".to_owned()],
                 mapped_srcs: Default::default(),
                 test_resources: Default::default(),
+                test_source_resource_sets: Default::default(),
                 test_remote_execution: None,
                 test_run_env: Default::default(),
                 test_runtime_tools: None,
@@ -2443,6 +2446,38 @@ mod tests {
             None,
         );
         assert_eq!(gen_buck_content(&regenerated), content);
+    }
+
+    #[test]
+    fn test_fixup_test_source_resource_sets_reach_tests_only() {
+        let (_dir, node) = first_party_package("api/rs_gen", &["src/lib.rs", "tests/wire.rs"]);
+        let mut ctx = test_ctx();
+        let label = "//buck2/cargo_workspace:reference".to_owned();
+        ctx.repo_config.fixups.insert(
+            node.name.clone(),
+            crate::config::PackageFixup {
+                test_source_resource_sets: vec![label.clone()],
+                ..Default::default()
+            },
+        );
+        let rules = buckify_root_node(&node, &ctx);
+        for test in ["unittest", "wire"] {
+            let t = find_test(&rules, test);
+            assert_eq!(t.source_resource_sets, Set::from([label.clone()]));
+            assert!(t.extra_resources.is_empty());
+        }
+        let content = gen_buck_content(&rules);
+        assert!(
+            content
+                .contains("    source_resource_sets = [\"//buck2/cargo_workspace:reference\"],\n"),
+            "{content}"
+        );
+        assert_eq!(
+            content.matches("source_resource_sets").count(),
+            2,
+            "{content}"
+        );
+        assert!(!content.contains("extra_resources"), "{content}");
     }
 
     #[test]
