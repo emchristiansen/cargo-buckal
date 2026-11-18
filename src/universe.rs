@@ -159,7 +159,7 @@ impl Universe {
         let root = buck2_root
             .canonicalize_utf8()
             .with_context(|| format!("failed to resolve the Buck2 root {buck2_root}"))?;
-        if dir == root || !dir.join(CONFIG_FILE).is_file() {
+        if dir == root || !holds_file(&dir, CONFIG_FILE)? {
             return Ok(Universe::Root);
         }
         let Ok(relative) = dir.strip_prefix(&root) else {
@@ -195,7 +195,7 @@ fn enclosing_standalone(cwd: &Utf8Path, buck2_root: &Utf8Path) -> Result<Option<
         if relative.as_str().is_empty() {
             return Ok(None);
         }
-        if dir.join(CONFIG_FILE).is_file() && dir.join("Cargo.toml").is_file() {
+        if holds_file(dir, CONFIG_FILE)? && holds_file(dir, "Cargo.toml")? {
             return Ok(Some(relative.to_owned()));
         }
     }
@@ -252,6 +252,27 @@ pub fn select(manifest_path: Option<&str>) -> Result<&'static Universe> {
 }
 
 /// The selected universe: the root universe unless [`select`] chose another.
+/// Whether `dir` holds the file `name`, deciding for selection, the walk of the
+/// project and configuration loading alike whether a directory is a universe. A
+/// symlink counts as the file it resolves to. A dangling symlink, or an entry that
+/// is not a file, is refused: the walk sees the entry while a check that follows
+/// it sees nothing, so counting it either way would let the two disagree.
+pub fn holds_file(dir: &Utf8Path, name: &str) -> Result<bool> {
+    let path = dir.join(name);
+    match path.symlink_metadata() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).with_context(|| format!("failed to inspect {path}")),
+        Ok(_) => {}
+    }
+    let metadata = path
+        .metadata()
+        .with_context(|| format!("{path} is a symlink that resolves to no file"))?;
+    if !metadata.is_file() {
+        bail!("{path} is not a file");
+    }
+    Ok(true)
+}
+
 pub fn selected() -> &'static Universe {
     SELECTED.get_or_init(|| Universe::Root)
 }
@@ -416,6 +437,34 @@ mod tests {
         );
         // The root itself, with its own buckal.toml, is not standalone.
         assert_eq!(enclosing_standalone(&root, &root).unwrap(), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_selection_follows_a_symlinked_configuration_and_refuses_a_dangling_one() {
+        let dir = project();
+        let root = root_of(&dir);
+        let guest = root.join("standalone_workspaces/guest");
+        let manifest = guest.join("Cargo.toml");
+        std::os::unix::fs::symlink("missing.toml", guest.join(CONFIG_FILE)).unwrap();
+        let error = Universe::of_manifest(Some(manifest.as_str()), &root).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("is a symlink that resolves to no file"),
+            "{error:#}"
+        );
+        assert!(enclosing_standalone(&guest, &root).is_err());
+        std::fs::write(guest.join("missing.toml"), "").unwrap();
+        assert_eq!(
+            Universe::of_manifest(Some(manifest.as_str()), &root).unwrap(),
+            Universe::Standalone {
+                dir: "standalone_workspaces/guest".into(),
+                name: "guest".to_owned()
+            }
+        );
+        assert_eq!(
+            enclosing_standalone(&guest, &root).unwrap(),
+            Some("standalone_workspaces/guest".into())
+        );
     }
 
     #[test]

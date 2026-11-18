@@ -231,19 +231,25 @@ pub fn standalone_universes(
     root: &Utf8Path,
     layout: &CellLayout,
 ) -> Result<Vec<FoundUniverse>, String> {
-    use crate::universe::{CACHE_FILE, CONFIG_FILE, Universe};
+    use crate::universe::{CACHE_FILE, CONFIG_FILE, Universe, holds_file};
 
     let files = root_cell_files(root, layout)?;
     let present: BTreeSet<(&str, &str)> = files
         .iter()
         .map(|(dir, name)| (dir.as_str(), name.as_str()))
         .collect();
-    Ok(files
-        .iter()
-        .filter(|(dir, name)| {
-            dir != "." && name == CONFIG_FILE && present.contains(&(dir.as_str(), "Cargo.toml"))
-        })
-        .map(|(dir, _)| FoundUniverse {
+    let mut universes = Vec::new();
+    for (dir, name) in &files {
+        if dir == "." || name != CONFIG_FILE || !present.contains(&(dir.as_str(), "Cargo.toml")) {
+            continue;
+        }
+        // The walk does not follow symlinks; refuse one that resolves to no file,
+        // as selection does.
+        let path = root.join(dir);
+        for name in [CONFIG_FILE, "Cargo.toml"] {
+            holds_file(&path, name).map_err(|error| format!("{error:#}"))?;
+        }
+        universes.push(FoundUniverse {
             universe: Universe::Standalone {
                 dir: dir.into(),
                 name: dir
@@ -252,8 +258,9 @@ pub fn standalone_universes(
                     .to_owned(),
             },
             recorded: present.contains(&(dir.as_str(), CACHE_FILE)),
-        })
-        .collect())
+        });
+    }
+    Ok(universes)
 }
 
 /// Refuse two standalone universes that would share a vendor tree
@@ -1038,6 +1045,37 @@ mod tests {
             ["third-party/rust/standalone/ws/crates/sdep/2.0.0"]
                 .map(str::to_owned)
                 .into()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_a_symlinked_universe_configuration_counts_and_a_dangling_one_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(dir.path()).unwrap();
+        for path in ["shared/buckal.toml", "guest/Cargo.toml", "other/Cargo.toml"] {
+            touch(root, path);
+        }
+        std::os::unix::fs::symlink("../shared/buckal.toml", root.join("guest/buckal.toml"))
+            .unwrap();
+        let layout = CellLayout::parse("").unwrap();
+        let found = standalone_universes(root, &layout).unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|found| found.universe.clone())
+                .collect::<Vec<_>>(),
+            [crate::universe::Universe::Standalone {
+                dir: "guest".into(),
+                name: "guest".to_owned()
+            }]
+        );
+        std::os::unix::fs::symlink("../missing/buckal.toml", root.join("other/buckal.toml"))
+            .unwrap();
+        let error = standalone_universes(root, &layout).unwrap_err();
+        assert!(
+            error.contains("other/buckal.toml is a symlink that resolves to no file"),
+            "{error}"
         );
     }
 
