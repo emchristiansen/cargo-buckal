@@ -206,8 +206,10 @@ pub struct RepoConfig {
     /// `[wasm]`: wasm32 modules built from their own Cargo graph.
     #[serde(skip_serializing_if = "WasmConfig::is_empty")]
     pub wasm: WasmConfig,
-    /// `[package_macro]`: one call of a repository macro in each BUCK file
-    /// generation writes.
+    /// `[package_macro]`: one call of a repository macro in each package BUCK
+    /// file generation writes, first-party, third-party or both; not in
+    /// `platforms/BUCK` or in the workspace-root BUCK file of a virtual
+    /// workspace, into which generation only splices rules.
     #[serde(skip_serializing_if = "PackageMacroConfig::is_empty")]
     pub package_macro: PackageMacroConfig,
 }
@@ -218,15 +220,30 @@ pub struct RepoConfig {
 /// `first_party_kwargs` as its keyword arguments, and in every third-party
 /// package's BUCK file when `third_party` is set, with `third_party_kwargs`.
 /// Third-party BUCK files are generated whole, so there the call is simply part
-/// of the output. Generation emits the macro's
-/// `load` and the call and owns both: a hand-written call of `function` in such
-/// a file is replaced by the generated one, and a hand-written `load` of `bzl`
-/// that binds only `function` is dropped. What the macro declares (for example
-/// a `filegroup` of the package's files for a tree that stages every package) is
-/// the repository's business: generation only places the call.
+/// of the output. What the macro declares (for example a `filegroup` of the
+/// package's files for a tree that stages every package) is the repository's
+/// business: generation only places the call. It places none in
+/// `platforms/BUCK`, or in the workspace-root BUCK file of a virtual workspace,
+/// into which it only splices rules; the root BUCK file of a root package is
+/// that package's, and gets the call.
 ///
-/// The call is preceded by [`crate::buck::PACKAGE_MACRO_MARKER`], by which a later
-/// generation recognises a call it wrote and removes it once the table is unset.
+/// In a first-party BUCK file generation emits the macro's `load` and the call
+/// and owns both:
+/// - A hand-written call of `function` is replaced by the generated one, with a
+///   warning if its arguments differ. The call that replaces it is marked like
+///   any other generated call, so the takeover is one-way: once the table is
+///   unset, generation removes it, and the file no longer calls the macro.
+/// - A hand-written `load` of `bzl` that binds only `function` is dropped. One
+///   that binds other names too is kept, and generation adds no second load;
+///   once the table is unset, it still binds `function`, which nothing calls.
+/// - A hand-written `load` that binds `function` to anything but `function` of
+///   `bzl`, or binds `function` of `bzl` under another name, is refused: the
+///   file is left unchanged and generation exits with an error.
+///
+/// Generation writes [`crate::buck::PACKAGE_MACRO_MARKER`] on the line directly
+/// above the call and above its load. A later generation recognises a statement
+/// it wrote by that line, and removes the call and its load once the table is
+/// unset, or once the side that called the macro is switched off.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(try_from = "RawPackageMacroConfig")]
 pub struct PackageMacroConfig {

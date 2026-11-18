@@ -2865,10 +2865,9 @@ mod tests {
             1,
             "{content}"
         );
+        // A call with arguments is written one argument per line.
         assert!(
             content.contains(&format!(
-                "{PACKAGE_MACRO_MARKER}\ndeclare_source_tree_inputs(whole_repository_only = True)\n"
-            )) || content.contains(&format!(
                 "{PACKAGE_MACRO_MARKER}\ndeclare_source_tree_inputs(\n    whole_repository_only = True,\n)\n"
             )),
             "{content}"
