@@ -342,7 +342,8 @@ pub fn resolve_package_graph(
 
 /// The target-context libraries of `cargo test -p <package> --lib --no-run --target
 /// <triple> --features <features>`, by package, and the package's library unit-test
-/// unit (`None` when Cargo compiles none: no library, or `test = false`).
+/// unit (`None` when Cargo compiles none, as for a package without a library; `--lib`
+/// names the library explicitly, so `[lib] test = false` still compiles its unit tests).
 pub fn resolve_package_test_graph(
     manifest_path: Option<&str>,
     packages: &HashMap<PackageId, Package>,
