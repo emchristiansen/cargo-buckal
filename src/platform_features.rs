@@ -255,6 +255,19 @@ pub struct WasmVariant {
     /// profile's link-time flags.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub root: bool,
+    /// The module's binary, for a root whose declaration names one
+    /// (`[package.metadata.buck2.wasm] bin`): the module is that binary compiled
+    /// for wasm32, not the library as a cdylib.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bin: Option<WasmBin>,
+}
+
+/// A wasm32 module's binary target: its name, and its rustc flags (the profile's,
+/// with the link-time ones that a cdylib root would take).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WasmBin {
+    pub name: String,
+    pub rustc_flags: Vec<String>,
 }
 
 /// A package's library unit tests in one of its `wasm-test` graphs: the test-mode

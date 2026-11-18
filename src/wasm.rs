@@ -7,6 +7,13 @@
 //! resolves that graph, gives every library in it a `<lib>-wasm` variant with the
 //! profile's flags, and configures the module's for the wasm32 platform.
 //!
+//! With `bin = "<name>"`, the module is that binary target instead of the
+//! library as a cdylib, as `dx build --platform web` builds a Dioxus app's
+//! `main.rs`. The binary (`<name>-wasm-<key>`) takes the graph's dependencies
+//! and the package's own library as the graph's variant, and the profile's
+//! link-time flags. `bin-wasm-wasm32[.<variant>]` configures it for wasm32, and
+//! its default output is the module.
+//!
 //! A package listed in `[wasm] test_packages` declares
 //! `[package.metadata.buck2.wasm-test]` (`features`, optional `tests` and
 //! `labels`) and any `[package.metadata.buck2.wasm-test-variants.<name>]`: its
@@ -28,7 +35,7 @@ use anyhow::{Context, Result, bail};
 use cargo_metadata::{Package, PackageId, camino::Utf8PathBuf};
 
 use crate::platform_features::{
-    UnitProfile, WasmTest, WasmVariant, resolve_package_graph, resolve_package_test_graph,
+    UnitProfile, WasmBin, WasmTest, WasmVariant, resolve_package_graph, resolve_package_test_graph,
 };
 
 /// The target triple of the modules.
@@ -36,6 +43,10 @@ pub const WASM_TRIPLE: &str = "wasm32-unknown-unknown";
 
 /// The name of a module's `configured_alias`, whose `[cdylib]` is the module.
 pub const MODULE_ALIAS: &str = "lib-wasm-wasm32";
+
+/// The name of a binary module's `configured_alias` (`[package.metadata.buck2.wasm]
+/// bin`), whose default output is the module.
+pub const BIN_MODULE_ALIAS: &str = "bin-wasm-wasm32";
 
 /// The suffix of the rule holding a module's SHA-256 witness, after its alias.
 pub const SHA256_SUFFIX: &str = "-sha256";
@@ -58,6 +69,9 @@ pub const BROWSER_TEST_BZL: &str = "@buckal//:wasm_browser_test.bzl";
 pub struct ModuleDeclaration {
     pub features: Vec<String>,
     pub profile: String,
+    /// The binary target that is the module (`bin`), when the module is a binary
+    /// rather than the library as a cdylib. It holds for every variant.
+    pub bin: Option<String>,
     /// Each variant's own features (exactly these, in a graph of its own) and
     /// profile (the module's when not given).
     pub variants: BTreeMap<String, (Vec<String>, String)>,
@@ -95,6 +109,16 @@ pub fn module_alias(key: &str) -> String {
     match key.split_once('.') {
         None => MODULE_ALIAS.to_owned(),
         Some((_, variant)) => format!("{MODULE_ALIAS}.{variant}"),
+    }
+}
+
+/// The name of the `configured_alias` of a binary module `key`
+/// (`[package.metadata.buck2.wasm] bin`), whose default output is the module:
+/// `bin-wasm-wasm32`, or `bin-wasm-wasm32.<variant>`.
+pub fn bin_module_alias(key: &str) -> String {
+    match key.split_once('.') {
+        None => BIN_MODULE_ALIAS.to_owned(),
+        Some((_, variant)) => format!("{BIN_MODULE_ALIAS}.{variant}"),
     }
 }
 
@@ -364,6 +388,28 @@ pub fn module_declaration(package: &Package) -> Result<Option<ModuleDeclaration>
             })?
             .to_owned(),
     };
+    let bin = match wasm.get("bin") {
+        None => None,
+        Some(bin) => {
+            let bin = bin.as_str().with_context(|| {
+                format!(
+                    "`{}`: `[package.metadata.buck2.wasm] bin` is not a string",
+                    package.name
+                )
+            })?;
+            if !package
+                .targets
+                .iter()
+                .any(|t| t.name == bin && t.kind.contains(&cargo_metadata::TargetKind::Bin))
+            {
+                bail!(
+                    "`{}`: `[package.metadata.buck2.wasm] bin` names `{bin}`, which is no binary target of the package",
+                    package.name
+                );
+            }
+            Some(bin.to_owned())
+        }
+    };
     let mut variants = BTreeMap::new();
     if let Some(table) = package
         .metadata
@@ -411,6 +457,7 @@ pub fn module_declaration(package: &Package) -> Result<Option<ModuleDeclaration>
     Ok(Some(ModuleDeclaration {
         features,
         profile,
+        bin,
         variants,
     }))
 }
@@ -572,9 +619,20 @@ pub fn resolve_modules(
                 let root = &pkg == id;
                 let (mut rustc_flags, root_flags) = profile_flags(&lib.profile)
                     .with_context(|| format!("`[wasm] packages`: `{key}`: `{pkg}`"))?;
-                if root {
-                    rustc_flags.extend(root_flags);
-                }
+                // The module's link-time flags go to what links it: the binary that
+                // `bin` names, or else the library itself as the cdylib.
+                let bin = match (&declaration.bin, root) {
+                    (Some(name), true) => Some(WasmBin {
+                        name: name.clone(),
+                        rustc_flags: rustc_flags.iter().cloned().chain(root_flags).collect(),
+                    }),
+                    _ => {
+                        if root {
+                            rustc_flags.extend(root_flags);
+                        }
+                        None
+                    }
+                };
                 let variant = WasmVariant {
                     platform: platform.to_owned(),
                     features: lib.features,
@@ -582,6 +640,7 @@ pub fn resolve_modules(
                     build: lib.build,
                     rustc_flags,
                     root,
+                    bin,
                 };
                 variants
                     .entry(pkg)
@@ -685,6 +744,7 @@ pub fn resolve_tests(
                         build: lib.build,
                         rustc_flags,
                         root: false,
+                        bin: None,
                     },
                 );
             }

@@ -68,7 +68,7 @@ use crate::resolve::BuckalResolve;
 /// Migration strategy:
 /// - If found < expected (stale cache from older Buckal): ignore the old cache and rebuild.
 /// - If found > expected (cache from newer Buckal): exit immediately and prompt the user to upgrade.
-const CACHE_VERSION: u32 = 17;
+const CACHE_VERSION: u32 = 18;
 
 /// The oldest cache version whose record of the fixups a generation applied
 /// (`fixup_rustc_flags`, `fixups`) is still read, from a cache whose rules are
