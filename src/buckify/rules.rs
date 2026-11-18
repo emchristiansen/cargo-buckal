@@ -1853,6 +1853,7 @@ mod tests {
         let node = mock_node("foo", vec![lib, bin]);
 
         let ctx = BuckalContext {
+            buck2_root: None,
             workspace_members: None,
             host_platform_differences: None,
             host_platform_difference_digests: None,
@@ -1893,6 +1894,7 @@ mod tests {
         let node = mock_node("foo", vec![lib, bin, test]);
 
         let ctx = BuckalContext {
+            buck2_root: None,
             workspace_members: None,
             host_platform_differences: None,
             host_platform_difference_digests: None,
@@ -1931,6 +1933,7 @@ mod tests {
 
     fn test_ctx() -> BuckalContext {
         BuckalContext {
+            buck2_root: None,
             workspace_members: None,
             host_platform_differences: None,
             host_platform_difference_digests: None,

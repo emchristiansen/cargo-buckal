@@ -207,9 +207,11 @@ pub struct RepoConfig {
     #[serde(skip_serializing_if = "WasmConfig::is_empty")]
     pub wasm: WasmConfig,
     /// `[package_macro]`: one call of a repository macro in each package BUCK
-    /// file generation writes, first-party, third-party or both; not in
-    /// `platforms/BUCK` or in the workspace-root BUCK file of a virtual
-    /// workspace, into which generation only splices rules.
+    /// file generation writes, first-party, third-party or both, and in the
+    /// generated `platforms/BUCK` beside the first-party ones; not in the
+    /// workspace-root BUCK file of a virtual workspace, into which generation
+    /// only splices rules. Optionally, a generated Starlark file of the
+    /// repository's package tables (`tables`).
     #[serde(skip_serializing_if = "PackageMacroConfig::is_empty")]
     pub package_macro: PackageMacroConfig,
 }
@@ -222,10 +224,21 @@ pub struct RepoConfig {
 /// Third-party BUCK files are generated whole, so there the call is simply part
 /// of the output. What the macro declares (for example a `filegroup` of the
 /// package's files for a tree that stages every package) is the repository's
-/// business: generation only places the call. It places none in
-/// `platforms/BUCK`, or in the workspace-root BUCK file of a virtual workspace,
-/// into which it only splices rules; the root BUCK file of a root package is
-/// that package's, and gets the call.
+/// business: generation only places the call. It places none in the
+/// workspace-root BUCK file of a virtual workspace, into which it only splices
+/// rules; the root BUCK file of a root package is that package's, and gets the
+/// call.
+///
+/// With `first_party` set, the generator-written `platforms/BUCK` (the
+/// `platforms` asset, recognised by its `@generated` first line) gets the
+/// first-party load and call too, with `first_party_kwargs`, under the same
+/// takeover, marker and removal rules as a first-party BUCK file. Generation
+/// keeps the rest of that file byte for byte: the load goes directly below its
+/// last `load`, the call at its end. A hand-written statement it takes over
+/// goes with its comments, as in a first-party BUCK file, except that the
+/// comments above the file's first statement (its header) stay. A
+/// `platforms/BUCK` without the `@generated` first line is the repository's own
+/// and is left alone.
 ///
 /// In a first-party BUCK file generation emits the macro's `load` and the call
 /// and owns both:
@@ -251,6 +264,17 @@ pub struct RepoConfig {
 /// Labels are compared as text: `root//buck2:inputs.bzl` is not recognised as
 /// the same file as `//buck2:inputs.bzl`, so a load through another spelling is
 /// treated as a load of another file.
+///
+/// `tables` names a root-relative `.bzl` path at which generation writes the
+/// repository's package tables (see `crate::buckify::tables`):
+/// `GENERATED_WHOLE_REPOSITORY_PACKAGES`, each generated third-party package's
+/// directory mapped to its package (`"<root cell>//<dir>:"`), and
+/// `GENERATED_SOURCE_TREE_PACKAGES`, every other directory of the root cell that
+/// holds a BUCK file (`"."` for the root). It is written on every generation,
+/// cached or not, and `buckal.snap` records its path and a digest of its
+/// content. Generation refuses to replace a file there that it did not write.
+/// Once `tables` is unset or names another path, generation removes the file it
+/// wrote before, with a warning. `tables` needs neither `bzl` nor `function`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(try_from = "RawPackageMacroConfig")]
 pub struct PackageMacroConfig {
@@ -272,6 +296,9 @@ pub struct PackageMacroConfig {
     /// Keyword arguments of the third-party call, as `first_party_kwargs`.
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub third_party_kwargs: Map<String, MacroArg>,
+    /// The root-relative path of the generated package tables file, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tables: Option<String>,
 }
 
 /// A literal keyword argument of a [`PackageMacroConfig`] call.
@@ -293,6 +320,23 @@ struct RawPackageMacroConfig {
     first_party_kwargs: Map<String, MacroArg>,
     third_party: bool,
     third_party_kwargs: Map<String, MacroArg>,
+    tables: Option<String>,
+}
+
+/// Why `path` cannot be the `[package_macro] tables` file: it must be a
+/// root-relative path to a `.bzl` file, written with `/`, with no empty, `.` or
+/// `..` component.
+fn tables_path_error(path: &str) -> Option<String> {
+    let components: Vec<&str> = path.split('/').collect();
+    let bad_component = components
+        .iter()
+        .any(|c| c.is_empty() || *c == "." || *c == "..");
+    if bad_component || path.contains(['\\', '"', '\n']) || !path.ends_with(".bzl") {
+        return Some(format!(
+            "[package_macro] tables must be a root-relative path to a .bzl file (e.g. \"buckal_packages.bzl\"), written with `/` and without `.` or `..` components, not {path:?}"
+        ));
+    }
+    None
 }
 
 /// Whether `word` is a Starlark identifier.
@@ -315,8 +359,17 @@ impl TryFrom<RawPackageMacroConfig> for PackageMacroConfig {
             first_party_kwargs: raw.first_party_kwargs,
             third_party: raw.third_party,
             third_party_kwargs: raw.third_party_kwargs,
+            tables: raw.tables,
         };
-        if config.is_empty() {
+        if let Some(error) = config.tables.as_deref().and_then(tables_path_error) {
+            return Err(error);
+        }
+        // `tables` alone names no macro.
+        let macro_named = PackageMacroConfig {
+            tables: None,
+            ..config.clone()
+        };
+        if macro_named.is_empty() {
             return Ok(config);
         }
         if !config.bzl.ends_with(".bzl") || config.bzl.contains(['"', '\\', '\n']) {
@@ -1040,6 +1093,58 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn test_repo_config_deserializes_package_tables() {
+        // `tables` alone: no macro needed.
+        let config =
+            RepoConfig::parse("[package_macro]\ntables = \"buckal_packages.bzl\"\n").unwrap();
+        assert_eq!(
+            config.package_macro.tables.as_deref(),
+            Some("buckal_packages.bzl")
+        );
+        assert!(config.package_macro.first_party_call().is_none());
+        assert!(!config.package_macro.is_empty());
+        // It reaches neither side's generation key: no BUCK file depends on it.
+        assert!(config.first_party_generation_key().is_empty());
+        assert!(config.third_party_generation_key().is_empty());
+
+        let config = RepoConfig::parse(
+            "[package_macro]\nbzl = \"//a:b.bzl\"\nfunction = \"f\"\nfirst_party = true\ntables = \"buck2/generated/packages.bzl\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.package_macro.tables.as_deref(),
+            Some("buck2/generated/packages.bzl")
+        );
+        assert!(RepoConfig::default().package_macro.tables.is_none());
+    }
+
+    #[test]
+    fn test_repo_config_refuses_a_malformed_tables_path() {
+        for path in [
+            "",
+            "/abs/packages.bzl",
+            "./packages.bzl",
+            "a/../packages.bzl",
+            "a//packages.bzl",
+            "packages.txt",
+            "a\\\\packages.bzl",
+        ] {
+            let error = RepoConfig::parse(&format!("[package_macro]\ntables = {path:?}\n"))
+                .expect_err(path)
+                .to_string();
+            assert!(
+                error.contains("[package_macro] tables must"),
+                "{path}: {error}"
+            );
+        }
+        // A macro still needs its name beside `tables`.
+        let error = RepoConfig::parse("[package_macro]\nfirst_party = true\ntables = \"t.bzl\"\n")
+            .expect_err("no bzl")
+            .to_string();
+        assert!(error.contains("bzl"), "{error}");
     }
 
     #[test]

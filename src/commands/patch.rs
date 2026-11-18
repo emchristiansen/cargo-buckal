@@ -76,8 +76,8 @@ pub fn execute(args: &PatchArgs) {
         )
     );
 
-    changes.apply(&ctx);
-    ctx.new_cache().save();
+    let tables = changes.apply(&ctx);
+    ctx.new_cache().with_package_tables(tables).save();
 }
 
 fn select_patch_for_spec(ctx: &BuckalContext, spec: &str) -> Result<SelectedPatch> {
@@ -316,6 +316,7 @@ mod tests {
         }
 
         BuckalContext {
+            buck2_root: None,
             workspace_members: None,
             host_platform_differences: None,
             host_platform_difference_digests: None,

@@ -67,8 +67,8 @@ pub fn execute(args: &RemoveArgs) {
     let new_cache = ctx.new_cache();
     let changes = new_cache.diff(&last_cache, &ctx.workspace_root);
 
-    changes.apply(&ctx);
-    new_cache.save();
+    let tables = changes.apply(&ctx);
+    new_cache.with_package_tables(tables).save();
 }
 
 fn handle_classic_remove(args: &RemoveArgs) -> Result<()> {

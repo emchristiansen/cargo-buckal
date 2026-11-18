@@ -21,6 +21,10 @@ use crate::{
 };
 
 pub struct BuckalContext {
+    /// The Buck2 project root. `None` only in a context built without one (unit
+    /// tests), in which generation leaves `platforms/BUCK` alone and refuses
+    /// `[package_macro] tables`.
+    pub buck2_root: Option<Utf8PathBuf>,
     /// The root package id, if any (None for virtual workspaces)
     pub root: Option<PackageId>,
     pub resolve: BuckalResolve,
@@ -431,6 +435,7 @@ impl BuckalContext {
         }
 
         Self {
+            buck2_root: Some(buck2_root),
             root,
             resolve,
             workspace_members,
@@ -618,6 +623,7 @@ mod tests {
 
     fn make_context(resolve: BuckalResolve, patch: RepoPatchConfig) -> BuckalContext {
         BuckalContext {
+            buck2_root: None,
             workspace_members: None,
             host_platform_differences: None,
             host_platform_difference_digests: None,
