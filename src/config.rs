@@ -404,11 +404,32 @@ pub struct WasmConfig {
     /// Packages whose library unit tests run in a browser (`wasm-test`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub test_packages: Vec<String>,
+    /// The target triple the modules are built for: `wasm32-unknown-unknown`
+    /// ([`crate::wasm::WASM_TRIPLE`]) when not given, or another wasm32 triple such
+    /// as `wasm32-wasip1` for a standalone universe's guest modules. Browser tests
+    /// (`test_packages`) are wasm-bindgen modules and need the default triple.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub triple: Option<String>,
+    /// Module keys (`<package>` or `<package>.<variant>`) whose SHA-256 witness
+    /// (`<alias>-sha256`) is emitted although no `test-env` declaration of this
+    /// universe names it: a standalone universe's module that the root universe's
+    /// tests read by label.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub witnessed: Vec<String>,
 }
 
 impl WasmConfig {
     pub fn is_empty(&self) -> bool {
-        self.packages.is_empty() && self.platform.is_none() && self.test_packages.is_empty()
+        self.packages.is_empty()
+            && self.platform.is_none()
+            && self.test_packages.is_empty()
+            && self.triple.is_none()
+            && self.witnessed.is_empty()
+    }
+
+    /// The target triple of the modules.
+    pub fn triple(&self) -> &str {
+        self.triple.as_deref().unwrap_or(crate::wasm::WASM_TRIPLE)
     }
 }
 
@@ -834,15 +855,37 @@ impl RepoConfig {
         toml::from_str(content)
     }
 
+    /// The selected universe's `buckal.toml` ([`crate::universe`]).
     pub fn repo_config_path() -> PathBuf {
         let buck2_root = get_buck2_root().unwrap_or_exit();
-        buck2_root.join("buckal.toml").into()
+        buck2_root
+            .join(crate::universe::selected().config_dir())
+            .join(crate::universe::CONFIG_FILE)
+            .into()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{ExportFileEntry, MacroArg, PackageMacroConfig, RepoConfig, Set};
+
+    #[test]
+    fn test_wasm_modules_default_to_wasm32_unknown_unknown() {
+        let config = RepoConfig::parse("[wasm]\npackages = [\"m\"]\n").expect("parses");
+        assert_eq!(config.wasm.triple(), crate::wasm::WASM_TRIPLE);
+        assert!(config.wasm.witnessed.is_empty());
+    }
+
+    #[test]
+    fn test_wasm_modules_name_their_triple_and_witnesses() {
+        let config = RepoConfig::parse(
+            "[wasm]\npackages = [\"guest\"]\ntriple = \"wasm32-wasip1\"\nwitnessed = [\"guest\"]\n",
+        )
+        .expect("parses");
+        assert_eq!(config.wasm.triple(), "wasm32-wasip1");
+        assert_eq!(config.wasm.witnessed, vec!["guest".to_owned()]);
+        assert!(!config.wasm.is_empty());
+    }
 
     #[test]
     fn test_repo_config_deserializes_package_macro() {

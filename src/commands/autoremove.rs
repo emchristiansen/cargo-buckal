@@ -6,7 +6,7 @@ use clap::Parser;
 use walkdir::WalkDir;
 
 use crate::{
-    RUST_ROOT, buckal_log, buckal_note,
+    buckal_log, buckal_note,
     utils::{UnwrapOrExit, ensure_prerequisites, get_buck2_root},
 };
 
@@ -22,6 +22,7 @@ pub struct AutoremoveArgs {
 
 pub fn execute(args: &AutoremoveArgs) {
     ensure_prerequisites().unwrap_or_exit();
+    let universe = crate::universe::select(args.manifest_path.as_deref()).unwrap_or_exit();
 
     let buck2_root = get_buck2_root().unwrap_or_exit();
     let cargo_metadata = if let Some(manifest) = &args.manifest_path {
@@ -49,8 +50,20 @@ pub fn execute(args: &AutoremoveArgs) {
         buckal_note!("The following packages would be removed:");
     }
 
-    let third_party_dir = buck2_root.join(RUST_ROOT);
-    for entry in WalkDir::new(&third_party_dir).min_depth(3).max_depth(3) {
+    // The universe's own vendor tree: the root universe's never reaches into the
+    // standalone universes' trees below it.
+    let third_party_dir = buck2_root.join(universe.vendor_root());
+    let is_standalone_tree = |entry: &walkdir::DirEntry| {
+        *universe == crate::universe::Universe::Root
+            && entry.depth() == 1
+            && entry.file_name() == crate::universe::STANDALONE_ROOT
+    };
+    for entry in WalkDir::new(&third_party_dir)
+        .min_depth(3)
+        .max_depth(3)
+        .into_iter()
+        .filter_entry(|entry| !is_standalone_tree(entry))
+    {
         let entry_path = entry.as_ref().unwrap().path();
         let entry_label = entry_path
             .strip_prefix(&third_party_dir)
@@ -76,7 +89,12 @@ pub fn execute(args: &AutoremoveArgs) {
     }
 
     if !args.dry_run {
-        for entry in WalkDir::new(&third_party_dir).min_depth(2).max_depth(2) {
+        for entry in WalkDir::new(&third_party_dir)
+            .min_depth(2)
+            .max_depth(2)
+            .into_iter()
+            .filter_entry(|entry| !is_standalone_tree(entry))
+        {
             let is_empty = entry
                 .as_ref()
                 .unwrap()

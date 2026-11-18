@@ -14,7 +14,6 @@ use inquire::Select;
 
 use crate::buck2::Buck2Command;
 use crate::cache::BuckalCache;
-use crate::{RUST_CRATES_ROOT, RUST_GIT_ROOT};
 
 #[macro_export]
 macro_rules! buckal_log {
@@ -422,15 +421,22 @@ pub fn get_cfgs() -> Vec<Cfg> {
         .collect()
 }
 
+/// The generation record of the selected universe ([`crate::universe`]).
 pub fn get_cache_path() -> Result<Utf8PathBuf> {
-    Ok(get_buck2_root()?.join("buckal.snap"))
+    let universe = crate::universe::selected();
+    Ok(get_buck2_root()?
+        .join(universe.config_dir())
+        .join(crate::universe::CACHE_FILE))
 }
 
 /// Get the relative vendor path for a given package
 ///
 /// This function determines the vendor path based on the package source:
-/// - For registry packages, it returns `third-party/rust/crates/<package>/<version>`
-/// - For git packages, it returns `third-party/rust/git/<package>/<version>`
+/// - For registry packages, it returns `<crates root>/<package>/<version>`
+/// - For git packages, it returns `<git root>/<package>/<version>`
+///
+/// where the roots are the selected universe's ([`crate::universe`]):
+/// `third-party/rust/{crates,git}` for the Buck2 project's own workspace.
 pub fn get_vendor_path_relative(package_id: &PackageId) -> Result<String> {
     let package_id_spec = PackageIdSpec::parse(&package_id.repr)?;
     match package_id_spec
@@ -438,14 +444,16 @@ pub fn get_vendor_path_relative(package_id: &PackageId) -> Result<String> {
         .expect("failed to extract package source kind")
     {
         SourceKind::Registry => Ok(format!(
-            "{RUST_CRATES_ROOT}/{}/{}",
+            "{}/{}/{}",
+            crate::universe::selected().crates_root(),
             package_id_spec.name(),
             package_id_spec
                 .version()
                 .expect("failed to extract package version")
         )),
         SourceKind::Git(_) => Ok(format!(
-            "{RUST_GIT_ROOT}/{}/{}",
+            "{}/{}/{}",
+            crate::universe::selected().git_root(),
             package_id_spec.name(),
             package_id_spec
                 .version()

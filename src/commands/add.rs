@@ -45,6 +45,7 @@ pub struct AddArgs {
 
 pub fn execute(args: &AddArgs) {
     ensure_prerequisites().unwrap_or_exit();
+    crate::universe::select(args.manifest_path.as_deref()).unwrap_or_exit();
 
     check_buck2_package().unwrap_or_exit();
 

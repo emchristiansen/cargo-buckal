@@ -291,16 +291,23 @@ impl BuckalContext {
         let mut declared_test_env = HashMap::new();
         if !repo_config.wasm.is_empty() {
             let wasm = &repo_config.wasm;
+            let triple = wasm.triple();
             let Some(platform) = repo_config
                 .feature_platforms
                 .iter()
-                .find_map(|(name, triple)| (triple == WASM_TRIPLE).then_some(name.clone()))
+                .find_map(|(name, configured)| (configured == triple).then_some(name.clone()))
             else {
                 buckal_error!(format!(
-                    "`[wasm]` needs a `feature_platforms` entry for {WASM_TRIPLE}"
+                    "`[wasm]` needs a `feature_platforms` entry for {triple}"
                 ));
                 std::process::exit(1);
             };
+            if triple != WASM_TRIPLE && !wasm.test_packages.is_empty() {
+                buckal_error!(format!(
+                    "`[wasm] test_packages` run in a browser as wasm-bindgen modules, which need `triple = \"{WASM_TRIPLE}\"`, not `{triple}`"
+                ));
+                std::process::exit(1);
+            }
             if wasm.platform.is_none() {
                 buckal_error!(
                     "`[wasm] platform` is required: the wasm32 target platform the modules are configured for"
@@ -321,6 +328,7 @@ impl BuckalContext {
                 .collect();
             let variants = resolve_modules(
                 &wasm.packages,
+                triple,
                 &platform,
                 manifest_path.as_deref(),
                 &packages_map,
@@ -330,6 +338,16 @@ impl BuckalContext {
                 buckal_error!(format!("{error:#}"));
                 std::process::exit(1);
             });
+            let module_keys: std::collections::BTreeSet<&String> = variants
+                .values()
+                .flat_map(|by_module| by_module.keys())
+                .collect();
+            if let Some(unknown) = wasm.witnessed.iter().find(|key| !module_keys.contains(key)) {
+                buckal_error!(format!(
+                    "`[wasm] witnessed`: `{unknown}` is no module of `[wasm] packages`"
+                ));
+                std::process::exit(1);
+            }
             for (id, by_module) in variants {
                 let Some(&idx) = resolve.index_map.get(&id) else {
                     let modules = by_module.keys().cloned().collect::<Vec<_>>().join("`, `");

@@ -35,6 +35,7 @@ struct SelectedPatch {
 
 pub fn execute(args: &PatchArgs) {
     ensure_prerequisites().unwrap_or_exit();
+    crate::universe::select(args.manifest_path.as_deref()).unwrap_or_exit();
 
     let mut ctx = BuckalContext::new(args.manifest_path.clone());
 
