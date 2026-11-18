@@ -9,7 +9,7 @@ use crate::{
     },
     buckal_error, buckal_log,
     buckify::emit::emit_export_file,
-    cache::{BuckalChange, ChangeType},
+    cache::{BuckalChange, ChangeType, PackageTablesRecord},
     context::BuckalContext,
     resolve::{BuckalNode, NodeKind},
     utils::{UnwrapOrExit, get_buck2_root, get_vendor_dir, is_path_source},
@@ -18,12 +18,17 @@ use crate::{
 use super::{
     buckify_dep_node, buckify_root_node, cross, gen_buck_content, gen_buck_content_preserving,
     rules::{MANIFEST_EXPORT, build_script_names, fixup_set_contributions},
+    tables::TablesPlan,
     windows,
 };
 
 impl BuckalChange {
     /// Apply the changes to the BUCK files based on the detected package changes in the cache diff.
-    pub fn apply(&self, ctx: &BuckalContext) {
+    /// Also places the `[package_macro]` call in `platforms/BUCK` and writes (or
+    /// removes) the `[package_macro] tables` file, whose record it returns for
+    /// `buckal.snap`.
+    #[must_use = "the tables record belongs in the cache this generation saves"]
+    pub fn apply(&self, ctx: &BuckalContext) -> Option<PackageTablesRecord> {
         let re: Regex = Regex::new(r"^([^+#]+)\+([^#]+)#([^@]+)@([^+#]+)(?:\+(.+))?$")
             .expect("error creating regex");
 
@@ -258,6 +263,33 @@ impl BuckalChange {
             writes.push((buck_path, buck_content));
         }
 
+        // The generator-written `platforms/BUCK` gets the first-party
+        // `[package_macro]` call (or loses the one an earlier generation wrote).
+        if let Some(root) = &ctx.buck2_root {
+            let path = root.join(PLATFORMS_BUCK);
+            if !writes.iter().any(|(written, _)| *written == path)
+                && let Ok(content) = std::fs::read_to_string(&path)
+            {
+                match platforms_buck(&path, &content, &ctx.repo_config.package_macro) {
+                    Ok(Some(content)) => writes.push((path, content)),
+                    Ok(None) => {}
+                    Err(error) => {
+                        buckal_error!(error);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+
+        // Decided before anything is written: a refusal leaves every file as it was.
+        let tables = match TablesPlan::new(ctx, self.previous_package_tables.as_ref()) {
+            Ok(plan) => plan,
+            Err(error) => {
+                buckal_error!(error);
+                std::process::exit(1);
+            }
+        };
+
         for (path, content) in writes {
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir).expect("Failed to create the package directory");
@@ -274,6 +306,18 @@ impl BuckalChange {
             {
                 std::fs::remove_dir_all(package_dir)
                     .expect("Failed to remove empty package directory");
+            }
+        }
+
+        // After the BUCK files are written, so that the walk sees them.
+        let plan = tables?;
+        match plan.execute(&ctx.resolve) {
+            Ok(record) => record,
+            Err(error) => {
+                buckal_error!(format!(
+                    "[package_macro] tables: {error}; the BUCK files are written, buckal.snap is not"
+                ));
+                std::process::exit(1);
             }
         }
     }
@@ -455,59 +499,29 @@ fn hand_written(buck_path: &Utf8Path, owned: &OwnedNames) -> Result<HandWritten,
     let mut hand = HandWritten::default();
     for statement in statements {
         let text = content[statement.with_comments.clone()].to_owned();
-        let marked = is_package_macro_marked(&content, &statement);
-        match &statement.kind {
-            TopLevelKind::Load(bzl, _) if bzl.starts_with("@buckal//") => {}
-            // The `[package_macro]` load an earlier generation wrote.
-            TopLevelKind::Load(..) if marked => {}
-            TopLevelKind::Load(bzl, bindings) => match &owned.package_macro {
-                // The macro bound under another local name: its calls are calls of
-                // the macro that generation does not recognise as such, so it
-                // would call the macro a second time.
-                Some(OwnedMacro {
-                    bzl: macro_bzl,
-                    function,
-                    ..
-                }) if bzl == macro_bzl
-                    && let Some((local, _)) = bindings
-                        .iter()
-                        .find(|(local, their)| their == function && local != function) =>
-                {
-                    return Err(format!(
-                        "{buck_path}: a hand-written load binds `{function}` of `{macro_bzl}`, the `[package_macro]` function generation calls here, under another name, `{local}`, so generation would call it a second time; load it as `{function}`, whose hand-written call generation then takes over, or remove the load and its calls. The file is left unchanged"
-                    ));
-                }
-                Some(OwnedMacro {
-                    bzl: macro_bzl,
-                    function,
-                    ..
-                }) if bindings.iter().any(|(local, _)| local == function) => {
-                    let only = bindings.len() == 1;
-                    let same = bzl == macro_bzl
-                        && bindings
-                            .iter()
-                            .any(|(local, their)| local == function && their == function);
-                    if !same {
-                        return Err(format!(
-                            "{buck_path}: a hand-written load binds `{function}`, the `[package_macro]` function generation calls here, to something other than `{function}` of `{macro_bzl}`; rename the binding. The file is left unchanged"
-                        ));
-                    }
-                    if !only {
-                        // It binds other names of the file too: keep it, and
-                        // generation does not load the macro again.
-                        hand.binds_macro = true;
-                        hand.loads.push(text);
-                    }
-                }
-                _ => hand.loads.push(text),
-            },
-            // The `[package_macro]` call an earlier generation wrote, which this one
-            // no longer configures.
-            TopLevelKind::Call { function, .. } if marked && !owned.owns(function, None) => {
-                crate::buckal_warn!(format!(
-                    "{buck_path}: removing the `{function}()` call an earlier generation wrote from `[package_macro]`, which no longer configures it here"
-                ));
+        if let TopLevelKind::Load(bzl, _) = &statement.kind
+            && bzl.starts_with("@buckal//")
+        {
+            continue;
+        }
+        match package_macro_disposition(
+            buck_path,
+            &content,
+            &statement,
+            owned.package_macro.as_ref(),
+        )? {
+            MacroDisposition::Drop => continue,
+            MacroDisposition::KeepBindingMacro => {
+                // It binds other names of the file too: keep it, and generation
+                // does not load the macro again.
+                hand.binds_macro = true;
+                hand.loads.push(text);
+                continue;
             }
+            MacroDisposition::Other => {}
+        }
+        match &statement.kind {
+            TopLevelKind::Load(..) => hand.loads.push(text),
             TopLevelKind::Call { function, name }
                 if owned.owns(function, name.as_deref())
                     // An `export_files` rule generation wrote, recognised by its
@@ -515,19 +529,6 @@ fn hand_written(buck_path: &Utf8Path, owned: &OwnedNames) -> Result<HandWritten,
                     || function == "export_file"
                         && text.contains(&format!("\"{}\"", crate::buck::EXPORT_FILES_LABEL)) =>
             {
-                // A hand-written call of the macro that generation takes over.
-                if !marked
-                    && let Some(warning) = owned.package_macro.as_ref().and_then(|m| {
-                        replaced_arguments_warning(
-                            buck_path,
-                            m,
-                            function,
-                            &content[statement.span.clone()],
-                        )
-                    })
-                {
-                    crate::buckal_warn!(warning);
-                }
                 // A rule generation owns but no longer emits (a removed target, or
                 // one written by hand in a kind generation owns) goes away: say so.
                 if let Some(name) = name
@@ -558,6 +559,109 @@ fn hand_written(buck_path: &Utf8Path, owned: &OwnedNames) -> Result<HandWritten,
     hand.statements
         .extend(trailing.map(|range| content[range].to_owned()));
     Ok(hand)
+}
+
+/// What the `[package_macro]` rules make of one top-level statement of a BUCK
+/// file whose macro call generation writes (`owned`), or that it no longer
+/// writes (`None`).
+#[derive(Debug, PartialEq, Eq)]
+enum MacroDisposition {
+    /// Not the macro's: the file's other rules decide.
+    Other,
+    /// Dropped: the load or call an earlier generation wrote (removed, with a
+    /// warning for a call, when the macro is no longer called), a hand-written
+    /// load that binds only the macro, or a hand-written call that generation
+    /// takes over (with a warning if its arguments change).
+    Drop,
+    /// A hand-written load of the macro that binds other names too: kept, and
+    /// generation adds no load of its own.
+    KeepBindingMacro,
+}
+
+/// The [`MacroDisposition`] of `statement` of `content`, the BUCK file at
+/// `buck_path`. An `Err` is a refusal: a load generation cannot reconcile with
+/// the call it writes (the macro bound under another name, or the macro's name
+/// bound to something else).
+fn package_macro_disposition(
+    buck_path: &Utf8Path,
+    content: &str,
+    statement: &TopLevelStatement,
+    owned: Option<&OwnedMacro>,
+) -> Result<MacroDisposition, String> {
+    let marked = is_package_macro_marked(content, statement);
+    match &statement.kind {
+        // The `[package_macro]` load an earlier generation wrote.
+        TopLevelKind::Load(..) if marked => Ok(MacroDisposition::Drop),
+        TopLevelKind::Load(bzl, bindings) => match owned {
+            // The macro bound under another local name: its calls are calls of
+            // the macro that generation does not recognise as such, so it would
+            // call the macro a second time.
+            Some(OwnedMacro {
+                bzl: macro_bzl,
+                function,
+                ..
+            }) if bzl == macro_bzl
+                && let Some((local, _)) = bindings
+                    .iter()
+                    .find(|(local, their)| their == function && local != function) =>
+            {
+                Err(format!(
+                    "{buck_path}: a hand-written load binds `{function}` of `{macro_bzl}`, the `[package_macro]` function generation calls here, under another name, `{local}`, so generation would call it a second time; load it as `{function}`, whose hand-written call generation then takes over, or remove the load and its calls. The file is left unchanged"
+                ))
+            }
+            Some(OwnedMacro {
+                bzl: macro_bzl,
+                function,
+                ..
+            }) if bindings.iter().any(|(local, _)| local == function) => {
+                let same = bzl == macro_bzl
+                    && bindings
+                        .iter()
+                        .any(|(local, their)| local == function && their == function);
+                if !same {
+                    return Err(format!(
+                        "{buck_path}: a hand-written load binds `{function}`, the `[package_macro]` function generation calls here, to something other than `{function}` of `{macro_bzl}`; rename the binding. The file is left unchanged"
+                    ));
+                }
+                Ok(if bindings.len() == 1 {
+                    MacroDisposition::Drop
+                } else {
+                    MacroDisposition::KeepBindingMacro
+                })
+            }
+            _ => Ok(MacroDisposition::Other),
+        },
+        // The `[package_macro]` call an earlier generation wrote, which this one
+        // no longer configures.
+        TopLevelKind::Call { function, .. }
+            if marked && owned.is_none_or(|owned| &owned.function != function) =>
+        {
+            crate::buckal_warn!(format!(
+                "{buck_path}: removing the `{function}()` call an earlier generation wrote from `[package_macro]`, which no longer configures it here"
+            ));
+            Ok(MacroDisposition::Drop)
+        }
+        // The call generation writes, or a hand-written call of the macro that it
+        // takes over.
+        TopLevelKind::Call { function, .. }
+            if owned.is_some_and(|owned| &owned.function == function) =>
+        {
+            if !marked
+                && let Some(warning) = owned.and_then(|m| {
+                    replaced_arguments_warning(
+                        buck_path,
+                        m,
+                        function,
+                        &content[statement.span.clone()],
+                    )
+                })
+            {
+                crate::buckal_warn!(warning);
+            }
+            Ok(MacroDisposition::Drop)
+        }
+        TopLevelKind::Call { .. } | TopLevelKind::Other => Ok(MacroDisposition::Other),
+    }
 }
 
 /// The warning for a hand-written call `hand` of `function` (the statement alone,
@@ -595,6 +699,134 @@ fn is_package_macro_marked(content: &str, statement: &TopLevelStatement) -> bool
         .strip_suffix('\n')
         .and_then(|above| above.rsplit('\n').next())
         .is_some_and(|line| line.trim() == PACKAGE_MACRO_MARKER)
+}
+
+/// The project-relative path of the BUCK file of the `platforms` asset.
+pub(crate) const PLATFORMS_BUCK: &str = "platforms/BUCK";
+
+/// The `[package_macro]` call of `config` in the generator-written
+/// `platforms/BUCK` (`content`, at `buck_path`): the first-party load and call,
+/// under the takeover, marker and removal rules of a first-party BUCK file
+/// ([`package_macro_disposition`]). Generation keeps everything else byte for
+/// byte: the marked load goes directly below the file's last `load`, the marked
+/// call at its end. `Ok(None)` leaves the file as it is: it does not start with
+/// [`crate::buck::GENERATED_HEADER`] (so it is the repository's own), or it
+/// needs no change. An `Err` is a refusal, as for a first-party BUCK file.
+pub(crate) fn platforms_buck(
+    buck_path: &Utf8Path,
+    content: &str,
+    config: &crate::config::PackageMacroConfig,
+) -> Result<Option<String>, String> {
+    let owned = config.first_party_call().map(|kwargs| {
+        let rule = Rule::PackageMacro(crate::buck::PackageMacro {
+            bzl: config.bzl.clone(),
+            function: config.function.clone(),
+            kwargs: kwargs.clone(),
+            load: true,
+        });
+        OwnedMacro {
+            bzl: config.bzl.clone(),
+            function: config.function.clone(),
+            call: serde_starlark::to_string(&rule).expect("serialize package macro call"),
+        }
+    });
+    if content.lines().next().map(str::trim_end) != Some(crate::buck::GENERATED_HEADER) {
+        if owned.is_some() {
+            crate::buckal_warn!(format!(
+                "{buck_path}: no `[package_macro]` call placed here: the file does not start with `{}`, so generation did not write it",
+                crate::buck::GENERATED_HEADER
+            ));
+        }
+        return Ok(None);
+    }
+    if owned.is_none() && !content.contains(PACKAGE_MACRO_MARKER) {
+        return Ok(None);
+    }
+    let parse = |text: &str| {
+        top_level_statements(buck_path.as_str(), text)
+            .map(|(statements, _)| statements)
+            .map_err(|error| format!("{buck_path}: cannot parse it: {error}"))
+    };
+    // What goes: each dropped statement, from its marker (or, for a hand-written
+    // statement, its comments) to its end.
+    let mut drops: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut binds_macro = false;
+    for statement in parse(content)? {
+        match package_macro_disposition(buck_path, content, &statement, owned.as_ref())? {
+            MacroDisposition::Drop => {
+                let start = if is_package_macro_marked(content, &statement) {
+                    let above = content[..statement.span.start]
+                        .strip_suffix('\n')
+                        .expect("a marker line precedes a marked statement");
+                    above.rfind('\n').map_or(0, |at| at + 1)
+                } else if statement.with_comments.start == 0 {
+                    // Its comments open the file, header and all: they stay.
+                    content[..statement.span.start]
+                        .rfind('\n')
+                        .map_or(0, |at| at + 1)
+                } else {
+                    statement.with_comments.start
+                };
+                drops.push(start..statement.span.end);
+            }
+            MacroDisposition::KeepBindingMacro => binds_macro = true,
+            MacroDisposition::Other => {}
+        }
+    }
+    let mut text = content.to_owned();
+    for range in drops.into_iter().rev() {
+        remove_statement(&mut text, range);
+    }
+    if let Some(owned) = &owned {
+        if !binds_macro {
+            let load = serde_starlark::to_string(&Rule::Load(crate::buck::Load {
+                bzl: owned.bzl.clone(),
+                items: std::collections::BTreeSet::from([owned.function.clone()]),
+            }))
+            .expect("serialize package macro load");
+            let load = load.trim_end();
+            let statements = parse(&text)?;
+            match statements
+                .iter()
+                .rfind(|statement| matches!(statement.kind, TopLevelKind::Load(..)))
+            {
+                Some(last) => {
+                    text.insert_str(last.span.end, &format!("\n{PACKAGE_MACRO_MARKER}\n{load}"))
+                }
+                // No load: directly above the first statement, so that the
+                // header stays the first line and removal restores the file.
+                None => {
+                    let at = statements.first().map_or(text.len(), |s| s.span.start);
+                    text.insert_str(at, &format!("{PACKAGE_MACRO_MARKER}\n{load}\n"));
+                }
+            }
+        }
+        let kept = text.trim_end_matches('\n').len();
+        text.truncate(kept);
+        text.push_str(&format!("\n\n{PACKAGE_MACRO_MARKER}\n{}", owned.call));
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+    }
+    Ok((text != content).then_some(text))
+}
+
+/// Remove `range` (a whole statement, from the start of its first line) from
+/// `text` with the line break that ends it, and then one blank line if the
+/// removal leaves two in a row, or one at the end of the file.
+fn remove_statement(text: &mut String, range: std::ops::Range<usize>) {
+    let mut end = range.end;
+    if text[end..].starts_with('\n') {
+        end += 1;
+    }
+    text.replace_range(range.start..end, "");
+    let at = range.start;
+    let rest = &text[at..];
+    if (rest.is_empty() || rest.starts_with('\n')) && text[..at].ends_with("\n\n") {
+        text.remove(at - 1);
+    } else if at == 0 && rest.starts_with('\n') {
+        text.remove(0);
+    }
 }
 
 /// What [`hand_written`] keeps of a BUCK file.
@@ -849,6 +1081,7 @@ mod tests {
 
         // BuckalContext with root set to our package (this is the key scenario)
         let ctx = BuckalContext {
+            buck2_root: None,
             workspace_members: None,
             host_platform_differences: None,
             host_platform_difference_digests: None,
@@ -863,7 +1096,7 @@ mod tests {
             repo_config: RepoConfig::default(),
         };
 
-        change.apply(&ctx);
+        let _ = change.apply(&ctx);
 
         let buck_path = tmp_path.join("BUCK");
         assert!(
@@ -919,6 +1152,7 @@ mod tests {
             ..Default::default()
         };
         let ctx = BuckalContext {
+            buck2_root: None,
             workspace_members: None,
             host_platform_differences: None,
             host_platform_difference_digests: None,
@@ -932,7 +1166,7 @@ mod tests {
             no_merge: false,
             repo_config: config,
         };
-        change.apply(&ctx);
+        let _ = change.apply(&ctx);
         std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK file")
     }
 
@@ -1247,6 +1481,216 @@ mod tests {
         assert!(
             !content.contains("declare_source_tree_inputs()"),
             "{content}"
+        );
+    }
+
+    // Feature (a): the first-party `[package_macro]` call in the generator-written
+    // `platforms/BUCK`.
+
+    /// The `platforms` asset as generation extracts it.
+    const PLATFORMS_ASSET: &str = include_str!("../../assets/platforms/BUCK.template");
+
+    fn platforms_config(
+        kwargs: &[(&str, crate::config::MacroArg)],
+    ) -> crate::config::PackageMacroConfig {
+        crate::config::PackageMacroConfig {
+            bzl: "//buck2:source_tree_inputs.bzl".to_owned(),
+            function: "declare_source_tree_inputs".to_owned(),
+            first_party: true,
+            first_party_kwargs: kwargs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), v.clone()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn platforms(
+        content: &str,
+        config: &crate::config::PackageMacroConfig,
+    ) -> Result<Option<String>, String> {
+        super::platforms_buck(
+            cargo_metadata::camino::Utf8Path::new("platforms/BUCK"),
+            content,
+            config,
+        )
+    }
+
+    /// `platforms` of `content`, or `content` itself when it needs no change.
+    fn platforms_text(content: &str, config: &crate::config::PackageMacroConfig) -> String {
+        platforms(content, config)
+            .expect("not refused")
+            .unwrap_or_else(|| content.to_owned())
+    }
+
+    #[test]
+    fn test_platforms_buck_gets_the_first_party_call() {
+        let config = platforms_config(&[]);
+        let content = platforms_text(PLATFORMS_ASSET, &config);
+        let marker = crate::buck::PACKAGE_MACRO_MARKER;
+        // The asset's last load, then the marked macro load.
+        assert!(
+            content.contains(&format!(
+                "load(\"@prelude//platforms:defs.bzl\", \"execution_platform\")\n{marker}\n{MACRO_LOAD}\n\n"
+            )),
+            "{content}"
+        );
+        // The marked call at the end, after a blank line.
+        assert!(
+            content.ends_with(&format!(")\n\n{marker}\ndeclare_source_tree_inputs()\n")),
+            "{content}"
+        );
+        assert_eq!(content.matches("declare_source_tree_inputs()").count(), 1);
+        assert!(content.starts_with(crate::buck::GENERATED_HEADER));
+        // Everything else byte for byte.
+        let stripped = content
+            .replace(&format!("\n{marker}\n{MACRO_LOAD}"), "")
+            .replace(&format!("\n{marker}\ndeclare_source_tree_inputs()\n"), "");
+        assert_eq!(stripped, PLATFORMS_ASSET);
+        // A fixed point.
+        assert_eq!(platforms(&content, &config).unwrap(), None);
+        // Removing the table restores the asset exactly.
+        let removed = platforms_text(&content, &crate::config::PackageMacroConfig::default());
+        assert_eq!(removed, PLATFORMS_ASSET);
+        // So does switching the first-party side off.
+        let off = crate::config::PackageMacroConfig {
+            first_party: false,
+            ..config
+        };
+        assert_eq!(platforms_text(&content, &off), PLATFORMS_ASSET);
+    }
+
+    #[test]
+    fn test_platforms_buck_is_untouched_unless_configured() {
+        let unset = crate::config::PackageMacroConfig::default();
+        assert_eq!(platforms(PLATFORMS_ASSET, &unset).unwrap(), None);
+        // A third-party call does not reach it.
+        let third = crate::config::PackageMacroConfig {
+            first_party: false,
+            third_party: true,
+            ..platforms_config(&[])
+        };
+        assert_eq!(platforms(PLATFORMS_ASSET, &third).unwrap(), None);
+        // A file generation did not write is the repository's own.
+        let own = "load(\"@prelude//platforms:defs.bzl\", \"execution_platform\")\n\nplatform(name = \"p\")\n";
+        assert_eq!(platforms(own, &platforms_config(&[])).unwrap(), None);
+    }
+
+    #[test]
+    fn test_platforms_buck_call_carries_the_first_party_kwargs() {
+        use crate::config::MacroArg;
+        let config = platforms_config(&[("whole_repository_only", MacroArg::Bool(true))]);
+        let content = platforms_text(PLATFORMS_ASSET, &config);
+        assert!(
+            content.ends_with(&format!(
+                "{}\ndeclare_source_tree_inputs(\n    whole_repository_only = True,\n)\n",
+                crate::buck::PACKAGE_MACRO_MARKER
+            )),
+            "{content}"
+        );
+        assert_eq!(platforms(&content, &config).unwrap(), None);
+        // A changed argument rewrites the call in place.
+        let plain = platforms_text(&content, &platforms_config(&[]));
+        assert_eq!(
+            plain,
+            platforms_text(PLATFORMS_ASSET, &platforms_config(&[]))
+        );
+    }
+
+    #[test]
+    fn test_platforms_buck_takes_over_a_hand_written_call_and_load() {
+        let config = platforms_config(&[]);
+        let hand = format!(
+            "{PLATFORMS_ASSET}\n{MACRO_LOAD}\n\n# by hand\ndeclare_source_tree_inputs(whole = True)\n"
+        );
+        let content = platforms_text(&hand, &config);
+        assert_eq!(
+            content,
+            platforms_text(PLATFORMS_ASSET, &config),
+            "{content}"
+        );
+        assert!(!content.contains("by hand"));
+    }
+
+    #[test]
+    fn test_platforms_buck_keeps_a_load_that_binds_more() {
+        let config = platforms_config(&[]);
+        let load = "load(\"//buck2:source_tree_inputs.bzl\", \"SOURCE_TREES\", \"declare_source_tree_inputs\")";
+        let hand = PLATFORMS_ASSET.replacen(
+            "load(\"@prelude//platforms:defs.bzl\", \"execution_platform\")\n",
+            &format!("load(\"@prelude//platforms:defs.bzl\", \"execution_platform\")\n{load}\n"),
+            1,
+        );
+        let content = platforms_text(&hand, &config);
+        assert!(content.contains(load), "{content}");
+        assert!(!content.contains(MACRO_LOAD), "{content}");
+        assert_eq!(content.matches("declare_source_tree_inputs()").count(), 1);
+        assert_eq!(platforms(&content, &config).unwrap(), None);
+    }
+
+    #[test]
+    fn test_platforms_buck_refuses_a_load_of_the_macro_under_another_name() {
+        let hand = format!(
+            "{PLATFORMS_ASSET}\nload(\"//buck2:source_tree_inputs.bzl\", d = \"declare_source_tree_inputs\")\n\nd()\n"
+        );
+        let error = platforms(&hand, &platforms_config(&[])).unwrap_err();
+        assert!(
+            error.starts_with(
+                "platforms/BUCK: a hand-written load binds `declare_source_tree_inputs`"
+            ),
+            "{error}"
+        );
+        // Unconfigured, it is the file's own.
+        assert_eq!(
+            platforms(&hand, &crate::config::PackageMacroConfig::default()).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_platforms_buck_marker_below_a_hand_comment_and_a_blank_line() {
+        // PM-2 in platforms/BUCK: the table removed after a hand comment and a
+        // blank line were put above the marked call.
+        let marker = crate::buck::PACKAGE_MACRO_MARKER;
+        let content = platforms_text(PLATFORMS_ASSET, &platforms_config(&[]));
+        let call = format!("{marker}\ndeclare_source_tree_inputs()\n");
+        let edited = content.replace(&call, &format!("# why\n\n{call}"));
+        let removed = platforms_text(&edited, &crate::config::PackageMacroConfig::default());
+        assert!(!removed.contains("declare_source_tree_inputs"), "{removed}");
+        assert!(!removed.contains(marker), "{removed}");
+        assert!(removed.ends_with(")\n\n# why\n"), "{removed}");
+    }
+
+    #[test]
+    fn test_platforms_buck_keeps_its_header_above_a_first_statement_it_takes_over() {
+        let hand = format!(
+            "# @generated by `cargo buckal`\n#\n# Platforms.\n\n{MACRO_LOAD}\n\nplatform(name = \"p\")\n"
+        );
+        let content = platforms_text(&hand, &platforms_config(&[]));
+        assert!(
+            content.starts_with("# @generated by `cargo buckal`\n#\n# Platforms.\n"),
+            "{content}"
+        );
+        assert_eq!(content.matches(MACRO_LOAD).count(), 1, "{content}");
+        assert_eq!(platforms(&content, &platforms_config(&[])).unwrap(), None);
+    }
+
+    #[test]
+    fn test_platforms_buck_without_a_load_round_trips() {
+        let marker = crate::buck::PACKAGE_MACRO_MARKER;
+        let bare = "# @generated by `cargo buckal`\n#\n# Platforms.\n\nplatform(name = \"p\")\n";
+        let config = platforms_config(&[]);
+        let content = platforms_text(bare, &config);
+        assert_eq!(
+            content,
+            format!(
+                "# @generated by `cargo buckal`\n#\n# Platforms.\n\n{marker}\n{MACRO_LOAD}\nplatform(name = \"p\")\n\n{marker}\ndeclare_source_tree_inputs()\n"
+            )
+        );
+        assert_eq!(platforms(&content, &config).unwrap(), None);
+        assert_eq!(
+            platforms_text(&content, &crate::config::PackageMacroConfig::default()),
+            bare
         );
     }
 }

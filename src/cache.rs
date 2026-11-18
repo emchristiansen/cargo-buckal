@@ -204,6 +204,23 @@ pub struct BuckalCache {
     /// `BuckalContext::host_platform_difference_digests`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     host_platform_difference_digests: Option<BTreeMap<String, String>>,
+    /// The `[package_macro] tables` file this generation wrote (see
+    /// `crate::buckify::tables`): its path and a digest of its content. A change
+    /// of the tables changes the record, and a later generation removes the file
+    /// once `tables` is unset or names another path. `None` when no tables file
+    /// was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    package_tables: Option<PackageTablesRecord>,
+}
+
+/// What `buckal.snap` records of the `[package_macro] tables` file a generation
+/// wrote.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct PackageTablesRecord {
+    /// The file's path, relative to the Buck2 project root.
+    pub path: String,
+    /// The BLAKE3 digest of its content, in hex.
+    pub blake3: String,
 }
 
 impl BuckalCache {
@@ -314,6 +331,7 @@ impl BuckalCache {
             fixups: Some(fixups.clone()),
             host_platform_differences: None,
             host_platform_difference_digests: None,
+            package_tables: None,
         }
     }
 
@@ -328,6 +346,7 @@ impl BuckalCache {
             fixups: None,
             host_platform_differences: None,
             host_platform_difference_digests: None,
+            package_tables: None,
         }
     }
 
@@ -340,6 +359,18 @@ impl BuckalCache {
         self.host_platform_differences = differences;
         self.host_platform_difference_digests = digests;
         self
+    }
+
+    /// Record the `[package_macro] tables` file this generation wrote, if any.
+    pub fn with_package_tables(mut self, tables: Option<PackageTablesRecord>) -> Self {
+        self.package_tables = tables;
+        self
+    }
+
+    /// The `[package_macro] tables` file the generation this cache records wrote,
+    /// if it records one.
+    pub fn previous_package_tables_record(&self) -> Option<PackageTablesRecord> {
+        self.recorded.then(|| self.package_tables.clone()).flatten()
     }
 
     /// The recorded digests of the entries' resolutions, if recorded.
@@ -421,6 +452,7 @@ impl BuckalCache {
         let mut _diff = BuckalChange {
             previous_fixup_rustc_flags: other.previous_fixup_record(),
             previous_fixups: other.previous_fixups_record(),
+            previous_package_tables: other.previous_package_tables_record(),
             ..Default::default()
         };
         for (id, fp) in &self.fingerprints {
@@ -460,6 +492,10 @@ pub struct BuckalChange {
     /// records them (`None`: unknown, so `--merge` cannot tell their set-valued
     /// contributions from manual edits).
     pub previous_fixups: Option<BTreeMap<String, PackageFixup>>,
+    /// The `[package_macro] tables` file the previous generation wrote, when a
+    /// cache records one, so that this one removes it once `tables` no longer
+    /// names it.
+    pub previous_package_tables: Option<PackageTablesRecord>,
 }
 
 impl BuckalChange {
@@ -473,6 +509,9 @@ impl BuckalChange {
         }
         if self.previous_fixups.is_none() {
             self.previous_fixups = other.previous_fixups;
+        }
+        if self.previous_package_tables.is_none() {
+            self.previous_package_tables = other.previous_package_tables;
         }
     }
 }
@@ -691,6 +730,44 @@ mod package_macro_tests {
                 .expect("fingerprint")
         };
         (of(&ids.0), of(&ids.1))
+    }
+
+    #[test]
+    fn test_package_tables_record_is_kept_only_when_written() {
+        use super::PackageTablesRecord;
+        let resolve = BuckalResolve {
+            dag: Dag::new(),
+            index_map: HashMap::new(),
+            test_only_edges: Default::default(),
+        };
+        let root = Utf8PathBuf::from("/work/proj");
+        let plain =
+            BuckalCache::from_resolve_with_config(&resolve, &root, &RepoConfig::default(), &[]);
+        let text = toml::to_string_pretty(&plain).unwrap();
+        assert!(!text.contains("package_tables"), "{text}");
+
+        let record = PackageTablesRecord {
+            path: "buckal_packages.bzl".to_owned(),
+            blake3: "ab".repeat(32),
+        };
+        let with =
+            BuckalCache::from_resolve_with_config(&resolve, &root, &RepoConfig::default(), &[])
+                .with_package_tables(Some(record.clone()));
+        let text = toml::to_string_pretty(&with).unwrap();
+        assert!(
+            text.contains("[package_tables]\npath = \"buckal_packages.bzl\"\n"),
+            "{text}"
+        );
+        let mut loaded: BuckalCache = toml::from_str(&text).unwrap();
+        // Not a record until it is loaded as one.
+        assert_eq!(loaded.previous_package_tables_record(), None);
+        loaded.recorded = true;
+        assert_eq!(
+            loaded.previous_package_tables_record(),
+            Some(record.clone())
+        );
+        let change = plain.diff(&loaded, &root);
+        assert_eq!(change.previous_package_tables, Some(record));
     }
 
     #[test]

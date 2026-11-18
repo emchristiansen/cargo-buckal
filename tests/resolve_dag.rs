@@ -577,6 +577,7 @@ fn test_patch_redirects_generated_dependency_label() {
     let workspace_root = Utf8PathBuf::from(fixture_dir.to_str().unwrap());
 
     let base_ctx = BuckalContext {
+        buck2_root: None,
         workspace_members: None,
         host_platform_differences: None,
         host_platform_difference_digests: None,
@@ -610,6 +611,7 @@ fn test_patch_redirects_generated_dependency_label() {
     );
 
     let patched_ctx = BuckalContext {
+        buck2_root: None,
         workspace_members: None,
         host_platform_differences: None,
         host_platform_difference_digests: None,
