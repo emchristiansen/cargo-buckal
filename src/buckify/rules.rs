@@ -25,8 +25,8 @@ use super::deps::{
 use super::emit::{
     emit_buildscript_build, emit_buildscript_run, emit_cargo_manifest, emit_filegroup,
     emit_git_fetch, emit_http_archive, emit_rust_binary, emit_rust_library, emit_rust_test,
-    host_variant_build_target, patch_with_buildscript, test_host_variant_build_target,
-    test_variant_build_target, wasm_variant_build_target,
+    emit_test_module, host_variant_build_target, patch_with_buildscript,
+    test_host_variant_build_target, test_variant_build_target, wasm_variant_build_target,
 };
 
 /// Buckifies a third-party dependency into a list of BUCK rules.
@@ -523,6 +523,13 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
             &manifest_dir,
             ctx,
         ));
+        buck_rules.extend(wasm_test_rules(
+            node,
+            lib_target,
+            lib_name,
+            &manifest_dir,
+            ctx,
+        ));
     }
 
     apply_fixups(&mut buck_rules, node, ctx);
@@ -858,6 +865,82 @@ fn wasm_variant_rules(
             }
         }
         rules.extend(variant);
+    }
+    rules
+}
+
+/// The rules of `node`'s `wasm-test` graphs (`[wasm] test_packages`), for each: the
+/// test-mode module `wasm-test-module[.<variant>]`, a `rust_binary` compiling the
+/// library's crate root with `--test` and the test unit's features, profile flags
+/// and dependencies (each library as that graph's `-wasm-<key>` variant, the
+/// package's own where Cargo links it in), for wasm32 only; its `configured_alias`
+/// `wasm-test-module-wasm32[.<variant>]` for `[wasm] platform`; and the browser test
+/// `wasm_browser_test(name = "unittest-browser[.<variant>]")` running it. A
+/// `rust_binary`, not a `rust_test`: nothing can run the module natively.
+fn wasm_test_rules(
+    node: &BuckalNode,
+    lib_target: &BuckalTarget,
+    lib_name: &str,
+    manifest_dir: &Utf8PathBuf,
+    ctx: &BuckalContext,
+) -> Vec<Rule> {
+    use crate::platform_features::{Edges, PlatformResolution};
+    use crate::wasm::{BROWSER_TEST, TEST_MODULE, TEST_MODULE_ALIAS, test_key, test_rule_name};
+    let mut rules = Vec::new();
+    let Some(platform) = &ctx.repo_config.wasm.platform else {
+        return rules;
+    };
+    let default_key = test_key(&node.name, None);
+    for (key, test) in &node.platform_features.wasm_tests {
+        let variant = if *key == default_key {
+            None
+        } else {
+            key.strip_prefix(&format!("{default_key}__"))
+        };
+        let on = |set: &Set<String>| {
+            std::collections::BTreeMap::from([(test.platform.clone(), set.clone())])
+        };
+        let mut deps = test.deps.clone();
+        // Cargo links the package's own library (as the graph builds it) into its
+        // unit tests where a dev-dependency cycle needs it.
+        let self_linked = deps.remove(&node.package_id.repr);
+        let resolution = PlatformResolution {
+            features: on(&test.features),
+            deps: Edges {
+                dev: on(&deps),
+                ..Default::default()
+            },
+            host_variant_deps: node.platform_features.host_variant_deps.clone(),
+            wasm_rules: Some(key.clone()),
+            ..Default::default()
+        };
+        let test_node = BuckalNode {
+            platform_features: resolution,
+            ..node.clone()
+        };
+        let module = test_rule_name(TEST_MODULE, variant);
+        let mut binary = emit_test_module(&test_node, lib_target, manifest_dir, &module, ctx);
+        binary.rustc_flags.extend(test.rustc_flags.iter().cloned());
+        binary.rustc_flags.push("--test".to_owned());
+        if self_linked {
+            binary
+                .deps
+                .insert(format!(":{}", wasm_variant_name(lib_name, key)));
+        }
+        let alias = test_rule_name(TEST_MODULE_ALIAS, variant);
+        rules.push(Rule::RustBinary(binary));
+        rules.push(Rule::ConfiguredAlias(crate::buck::ConfiguredAlias {
+            name: alias.clone(),
+            actual: format!(":{module}"),
+            platform: platform.clone(),
+            visibility: Set::from(["PUBLIC".to_owned()]),
+        }));
+        rules.push(Rule::WasmBrowserTest(crate::buck::WasmBrowserTest {
+            name: test_rule_name(BROWSER_TEST, variant),
+            wasm: format!(":{alias}"),
+            tests: test.tests.clone(),
+            labels: test.labels.clone(),
+        }));
     }
     rules
 }
@@ -1545,10 +1628,12 @@ fn render_buck_content(
     let mut has_rust_test = false;
     let mut has_buildscript_run = false;
     let mut has_wasm_sha256 = false;
+    let mut has_wasm_browser_test = false;
 
     for rule in rules {
         match rule {
             Rule::WasmSha256(_) => has_wasm_sha256 = true,
+            Rule::WasmBrowserTest(_) => has_wasm_browser_test = true,
             Rule::CargoManifest(_) => has_cargo_manifest = true,
             Rule::RustLibrary(_) => has_rust_library = true,
             Rule::RustBinary(_) => has_rust_binary = true,
@@ -1595,6 +1680,13 @@ fn render_buck_content(
         loads.push(Rule::Load(Load {
             bzl: "@buckal//:wasm_digest.bzl".to_owned(),
             items: Set::from(["wasm_sha256".to_owned()]),
+        }));
+    }
+
+    if has_wasm_browser_test {
+        loads.push(Rule::Load(Load {
+            bzl: crate::wasm::BROWSER_TEST_BZL.to_owned(),
+            items: Set::from(["wasm_browser_test".to_owned()]),
         }));
     }
 

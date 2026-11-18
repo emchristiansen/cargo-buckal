@@ -6,13 +6,30 @@
 //! that profile's code generation for every crate of the graph. Generation
 //! resolves that graph, gives every library in it a `<lib>-wasm` variant with the
 //! profile's flags, and configures the module's for the wasm32 platform.
+//!
+//! A package listed in `[wasm] test_packages` declares
+//! `[package.metadata.buck2.wasm-test]` (`features`, optional `tests` and
+//! `labels`) and any `[package.metadata.buck2.wasm-test-variants.<name>]`: its
+//! library unit tests, compiled for wasm32 from Cargo's own `cargo test -p
+//! <package> --lib --target wasm32-unknown-unknown --features <features>` graph
+//! (not the workspace's feature unification, which may pull native-only crates into
+//! wasm32). Every library of that graph gets a `<lib>-wasm-<key>` variant, keyed
+//! [`test_key`]; the package gets the test-mode module `wasm-test-module[.<name>]`
+//! (a `rust_binary` compiled with `--test`, so nothing runs it natively), its
+//! wasm32 `configured_alias` `wasm-test-module-wasm32[.<name>]`, and the buckal
+//! cell's `wasm_browser_test(name = "unittest-browser[.<name>]", wasm = <alias>)`,
+//! which runs it in a browser. Generation owns every `wasm_browser_test` call in a
+//! BUCK file it writes, and a declaration has no `timeout_seconds`, so a generated
+//! browser test always has the rule's default timeout.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use anyhow::{Context, Result, bail};
 use cargo_metadata::{Package, PackageId, camino::Utf8PathBuf};
 
-use crate::platform_features::{UnitProfile, WasmVariant, resolve_package_graph};
+use crate::platform_features::{
+    UnitProfile, WasmTest, WasmVariant, resolve_package_graph, resolve_package_test_graph,
+};
 
 /// The target triple of the modules.
 pub const WASM_TRIPLE: &str = "wasm32-unknown-unknown";
@@ -22,6 +39,18 @@ pub const MODULE_ALIAS: &str = "lib-wasm-wasm32";
 
 /// The suffix of the rule holding a module's SHA-256 witness, after its alias.
 pub const SHA256_SUFFIX: &str = "-sha256";
+
+/// The name of a package's wasm32 test-mode module (`rust_binary` with `--test`).
+pub const TEST_MODULE: &str = "wasm-test-module";
+
+/// The name of the `configured_alias` of a package's test-mode module.
+pub const TEST_MODULE_ALIAS: &str = "wasm-test-module-wasm32";
+
+/// The name of a package's browser test (`wasm_browser_test`).
+pub const BROWSER_TEST: &str = "unittest-browser";
+
+/// The buckal cell file defining `wasm_browser_test`.
+pub const BROWSER_TEST_BZL: &str = "@buckal//:wasm_browser_test.bzl";
 
 /// A module's `[package.metadata.buck2.wasm]`, with its feature variants
 /// (`[package.metadata.buck2.wasm-variants.<name>]`).
@@ -67,6 +96,146 @@ pub fn module_alias(key: &str) -> String {
         None => MODULE_ALIAS.to_owned(),
         Some((_, variant)) => format!("{MODULE_ALIAS}.{variant}"),
     }
+}
+
+/// The key of a package's `wasm-test` graph, which names its libraries' variants
+/// (`<lib>-wasm-<key>`): `<package>__test`, or `<package>__test__<variant>`. It
+/// holds only letters, digits, `_` and `-`, so the crate names derived from it
+/// (variant build scripts) are Rust identifiers. Two graphs can share a key
+/// (`a` with variant `b__test`, and `a__test__b` without one), and a module key
+/// (`<package>`, `<package>.<variant>`) can be spelled like one when a package is
+/// named so. [`resolve_tests`] refuses the first, and the generation refuses the
+/// second where the two graphs share a library.
+pub fn test_key(package: &str, variant: Option<&str>) -> String {
+    match variant {
+        None => format!("{package}__test"),
+        Some(variant) => format!("{package}__test__{variant}"),
+    }
+}
+
+/// The rule name `base` for a `wasm-test` variant: `base`, or `base.<variant>`.
+pub fn test_rule_name(base: &str, variant: Option<&str>) -> String {
+    match variant {
+        None => base.to_owned(),
+        Some(variant) => format!("{base}.{variant}"),
+    }
+}
+
+/// One `wasm-test` graph of a package: exactly these features, and the browser
+/// test's declared test names and labels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestGraph {
+    pub features: Vec<String>,
+    pub tests: Vec<String>,
+    pub labels: Vec<String>,
+}
+
+/// A package's `[package.metadata.buck2.wasm-test]` and its variants
+/// (`[package.metadata.buck2.wasm-test-variants.<name>]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestDeclaration {
+    pub default: TestGraph,
+    pub variants: BTreeMap<String, TestGraph>,
+}
+
+impl TestDeclaration {
+    /// Every graph, as `(variant, graph)`: the default (`None`) first.
+    pub fn graphs(&self) -> Vec<(Option<&str>, &TestGraph)> {
+        std::iter::once((None, &self.default))
+            .chain(
+                self.variants
+                    .iter()
+                    .map(|(name, g)| (Some(name.as_str()), g)),
+            )
+            .collect()
+    }
+}
+
+/// Whether `package` has any `wasm-test` metadata.
+pub fn declares_tests(package: &Package) -> bool {
+    package
+        .metadata
+        .get("buck2")
+        .is_some_and(|b| b.get("wasm-test").is_some() || b.get("wasm-test-variants").is_some())
+}
+
+/// One `wasm-test` table at `where_`: `features` (required for a variant: its exact
+/// features), `tests` and `labels`, nothing else.
+fn test_graph(value: &serde_json::Value, where_: &str, variant: bool) -> Result<TestGraph> {
+    let table = value
+        .as_object()
+        .with_context(|| format!("{where_} is not a table"))?;
+    if let Some(key) = table
+        .keys()
+        .find(|k| !["features", "tests", "labels"].contains(&k.as_str()))
+    {
+        bail!("{where_}: unknown key `{key}` (it has `features`, `tests` and `labels`)");
+    }
+    let list = |key: &str| -> Result<Vec<String>> {
+        let Some(value) = table.get(key) else {
+            return Ok(Vec::new());
+        };
+        let items = string_list(value, &format!("{where_} `{key}`"))?;
+        let mut seen = BTreeSet::new();
+        for item in &items {
+            if item.is_empty() {
+                bail!("{where_} `{key}`: an entry is empty");
+            }
+            if !seen.insert(item) {
+                bail!("{where_} `{key}`: `{item}` is listed twice");
+            }
+        }
+        Ok(items)
+    };
+    if variant && !table.contains_key("features") {
+        bail!("{where_}: `features` is required (a variant's exact features)");
+    }
+    Ok(TestGraph {
+        features: list("features")?,
+        tests: list("tests")?,
+        labels: list("labels")?,
+    })
+}
+
+/// `[package.metadata.buck2.wasm-test]` of `package` with its variants, if declared.
+/// Variants without the default declaration are refused.
+pub fn test_declaration(package: &Package) -> Result<Option<TestDeclaration>> {
+    let buck2 = package.metadata.get("buck2");
+    let variants_table = buck2.and_then(|b| b.get("wasm-test-variants"));
+    let Some(default) = buck2.and_then(|b| b.get("wasm-test")) else {
+        if variants_table.is_some() {
+            bail!(
+                "`{}`: `[package.metadata.buck2.wasm-test-variants]` needs `[package.metadata.buck2.wasm-test]`",
+                package.name
+            );
+        }
+        return Ok(None);
+    };
+    let default = test_graph(
+        default,
+        &format!("`{}`: `[package.metadata.buck2.wasm-test]`", package.name),
+        false,
+    )?;
+    let mut variants = BTreeMap::new();
+    if let Some(table) = variants_table {
+        let table = table.as_object().with_context(|| {
+            format!(
+                "`{}`: `[package.metadata.buck2.wasm-test-variants]` is not a table",
+                package.name
+            )
+        })?;
+        for (name, variant) in table {
+            let where_ = format!(
+                "`{}`: `[package.metadata.buck2.wasm-test-variants.{name}]`",
+                package.name
+            );
+            if !valid_variant_name(name) {
+                bail!("{where_}: a variant name holds only letters, digits, `_` and `-`");
+            }
+            variants.insert(name.clone(), test_graph(variant, &where_, true)?);
+        }
+    }
+    Ok(Some(TestDeclaration { default, variants }))
 }
 
 /// What a `[package.metadata.buck2.test-env]` variable gets: the module `module`
@@ -121,10 +290,26 @@ fn valid_variant_name(name: &str) -> bool {
 /// to refuse.
 pub fn declared_module_features(
     modules: &[String],
+    test_packages: &[String],
     packages: &[Package],
     members: &[PackageId],
 ) -> Result<Vec<String>> {
     let mut features = Vec::new();
+    // The `wasm-test` graphs' features, likewise (a listed package that is no member
+    // or declares nothing is left to `resolve_tests`).
+    for tested in test_packages {
+        let Some(package) = packages
+            .iter()
+            .find(|p| p.name.as_str() == tested && members.contains(&p.id))
+        else {
+            continue;
+        };
+        if let Some(declaration) = test_declaration(package)? {
+            for (_, graph) in declaration.graphs() {
+                features.extend(graph.features.iter().map(|f| format!("{tested}/{f}")));
+            }
+        }
+    }
     for module in modules {
         let Some(package) = packages
             .iter()
@@ -413,6 +598,143 @@ pub fn resolve_modules(
     Ok(variants)
 }
 
+/// What `[wasm] test_packages` (package names) adds: the `<lib>-wasm-<key>`
+/// variants of every library of each declared `wasm-test` graph (by package and
+/// [`test_key`]), and each package's test units (by package and key). A listed
+/// package that is listed twice, is no member, declares nothing, has no Rust
+/// library or a build script, or compiles no library unit tests for wasm32 is
+/// refused, and so is a member declaring `wasm-test` that is not listed.
+pub fn resolve_tests(
+    test_packages: &[String],
+    platform: &str,
+    manifest_path: Option<&str>,
+    packages: &HashMap<PackageId, Package>,
+    members: &BTreeMap<String, PackageId>,
+) -> Result<TestVariants> {
+    let mut resolved = TestVariants::default();
+    let mut seen = BTreeSet::new();
+    let mut keys = BTreeMap::new();
+    for tested in test_packages {
+        if !seen.insert(tested) {
+            bail!("`[wasm] test_packages`: `{tested}` is listed twice");
+        }
+        let Some(id) = members.get(tested) else {
+            bail!("`[wasm] test_packages`: `{tested}` is no member of the workspace");
+        };
+        let package = &packages[id];
+        let Some(declaration) = test_declaration(package)? else {
+            bail!(
+                "`[wasm] test_packages`: `{tested}` declares no `[package.metadata.buck2.wasm-test]`"
+            );
+        };
+        if !package.targets.iter().any(|t| {
+            t.kind.iter().any(|k| {
+                matches!(
+                    k,
+                    cargo_metadata::TargetKind::Lib | cargo_metadata::TargetKind::RLib
+                )
+            })
+        }) {
+            bail!(
+                "`[wasm] test_packages`: `{tested}` has no Rust library whose unit tests could run"
+            );
+        }
+        if package
+            .targets
+            .iter()
+            .any(|t| t.kind.contains(&cargo_metadata::TargetKind::CustomBuild))
+        {
+            bail!(
+                "`[wasm] test_packages`: `{tested}` has a build script, which a `wasm-test` module does not support"
+            );
+        }
+        for (variant, graph) in declaration.graphs() {
+            let key = test_key(tested, variant);
+            claim_test_key(&mut keys, &key, tested, variant)?;
+            let (libs, test) = resolve_package_test_graph(
+                manifest_path,
+                packages,
+                id,
+                tested,
+                &graph.features,
+                WASM_TRIPLE,
+            )?;
+            let Some(test) = test else {
+                bail!(
+                    "`[wasm] test_packages`: `cargo test -p {tested} --lib` compiles no library unit tests of `{tested}` for {WASM_TRIPLE} (`{key}`)"
+                );
+            };
+            let (mut rustc_flags, root_flags) = profile_flags(&test.profile)
+                .with_context(|| format!("`[wasm] test_packages`: `{key}`: `{tested}`"))?;
+            rustc_flags.extend(root_flags);
+            resolved.tests.entry(id.clone()).or_default().insert(
+                key.clone(),
+                WasmTest {
+                    platform: platform.to_owned(),
+                    features: test.features,
+                    deps: test.deps,
+                    rustc_flags,
+                    tests: graph.tests.clone(),
+                    labels: graph.labels.iter().cloned().collect(),
+                },
+            );
+            for (pkg, lib) in libs {
+                let (rustc_flags, _) = profile_flags(&lib.profile)
+                    .with_context(|| format!("`[wasm] test_packages`: `{key}`: `{pkg}`"))?;
+                resolved.variants.entry(pkg).or_default().insert(
+                    key.clone(),
+                    WasmVariant {
+                        platform: platform.to_owned(),
+                        features: lib.features,
+                        normal: lib.normal,
+                        build: lib.build,
+                        rustc_flags,
+                        root: false,
+                    },
+                );
+            }
+        }
+    }
+    for (name, id) in members {
+        if !seen.contains(name) && declares_tests(&packages[id]) {
+            bail!(
+                "`{name}` declares `[package.metadata.buck2.wasm-test]`, but `[wasm] test_packages` does not list it"
+            );
+        }
+    }
+    Ok(resolved)
+}
+
+/// Records that `package`'s graph `variant` uses `key`, refusing a key that an
+/// earlier graph already uses: the second graph's library variants would otherwise
+/// replace the first's without a word.
+fn claim_test_key(
+    keys: &mut BTreeMap<String, String>,
+    key: &str,
+    package: &str,
+    variant: Option<&str>,
+) -> Result<()> {
+    let graph = match variant {
+        None => format!("`{package}`'s default `wasm-test` graph"),
+        Some(variant) => format!("`{package}`'s `wasm-test` variant `{variant}`"),
+    };
+    if let Some(earlier) = keys.insert(key.to_owned(), graph.clone()) {
+        bail!(
+            "`[wasm] test_packages`: {graph} and {earlier} both have the test graph key `{key}`; rename the package or the variant"
+        );
+    }
+    Ok(())
+}
+
+/// What [`resolve_tests`] resolves.
+#[derive(Debug, Default)]
+pub struct TestVariants {
+    /// The libraries' variants, by package and test graph key.
+    pub variants: HashMap<PackageId, BTreeMap<String, WasmVariant>>,
+    /// The tested packages' test units, by package and test graph key.
+    pub tests: HashMap<PackageId, BTreeMap<String, WasmTest>>,
+}
+
 /// The directory of `manifest`'s package relative to `root`, with `/`.
 pub fn package_dir(manifest: &Utf8PathBuf, root: &Utf8PathBuf) -> Option<String> {
     manifest
@@ -424,8 +746,85 @@ pub fn package_dir(manifest: &Utf8PathBuf, root: &Utf8PathBuf) -> Option<String>
 
 #[cfg(test)]
 mod tests {
-    use super::profile_flags;
+    use super::{claim_test_key, profile_flags, test_graph, test_key, test_rule_name};
     use crate::platform_features::UnitProfile;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn test_wasm_test_keys_and_names() {
+        // Keys name variant libraries and, through them, build-script crates: only
+        // letters, digits, `_` and `-` (rustc refuses `.` in a crate name).
+        assert_eq!(test_key("observatory_site", None), "observatory_site__test");
+        assert_eq!(
+            test_key("observatory_site", Some("voice")),
+            "observatory_site__test__voice"
+        );
+        assert_eq!(test_rule_name("unittest-browser", None), "unittest-browser");
+        assert_eq!(
+            test_rule_name("unittest-browser", Some("voice")),
+            "unittest-browser.voice"
+        );
+    }
+
+    #[test]
+    fn test_wasm_test_key_collision_is_refused() {
+        // `a` with variant `b__test` and `a__test__b` without one share `a__test__b__test`.
+        assert_eq!(test_key("a", Some("b__test")), test_key("a__test__b", None));
+        let mut keys = BTreeMap::new();
+        claim_test_key(
+            &mut keys,
+            &test_key("a", Some("b__test")),
+            "a",
+            Some("b__test"),
+        )
+        .unwrap();
+        claim_test_key(&mut keys, &test_key("a", None), "a", None).unwrap();
+        let error = claim_test_key(&mut keys, &test_key("a__test__b", None), "a__test__b", None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "`[wasm] test_packages`: `a__test__b`'s default `wasm-test` graph and `a`'s `wasm-test` variant `b__test` both have the test graph key `a__test__b__test`; rename the package or the variant"
+        );
+    }
+
+    #[test]
+    fn test_wasm_test_tables() {
+        let graph = test_graph(
+            &serde_json::json!({"features": ["test_lib"], "tests": ["a::b"], "labels": ["l"]}),
+            "here",
+            true,
+        )
+        .unwrap();
+        assert_eq!(graph.features, ["test_lib"]);
+        assert_eq!(graph.tests, ["a::b"]);
+        assert_eq!(graph.labels, ["l"]);
+        // The default declaration may omit everything; a variant needs `features`.
+        let empty = test_graph(&serde_json::json!({}), "here", false).unwrap();
+        assert!(empty.features.is_empty() && empty.tests.is_empty());
+        for (value, variant, why) in [
+            (serde_json::json!({}), true, "here: `features` is required"),
+            (serde_json::json!([]), false, "here is not a table"),
+            (
+                serde_json::json!({"features": "x"}),
+                false,
+                "here `features` is not a list of strings",
+            ),
+            (
+                serde_json::json!({"tests": [""]}),
+                false,
+                "here `tests`: an entry is empty",
+            ),
+            (
+                serde_json::json!({"profile": "dev"}),
+                false,
+                "here: unknown key `profile`",
+            ),
+        ] {
+            let error = format!("{:#}", test_graph(&value, "here", variant).unwrap_err());
+            assert!(error.contains(why), "{value}: {error}");
+        }
+    }
 
     fn unit_profile(json: &str) -> UnitProfile {
         serde_json::from_str(json).unwrap()

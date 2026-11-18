@@ -134,6 +134,49 @@ pub(super) fn emit_rust_binary(
     rust_binary
 }
 
+/// Emit the `rust_binary` that compiles `lib_target`'s crate root in test mode
+/// (the caller adds `--test`): a wasm32 test-mode module, with the dependencies
+/// of a test (normal and dev) as `node`'s resolution has them.
+pub(super) fn emit_test_module(
+    node: &BuckalNode,
+    lib_target: &BuckalTarget,
+    manifest_dir: &Utf8PathBuf,
+    buckal_name: &str,
+    ctx: &BuckalContext,
+) -> RustBinary {
+    let vendor = vendor_ref(node);
+    let (features, platform) = node_features(node);
+    let mut rust_binary = RustBinary {
+        name: buckal_name.to_owned(),
+        srcs: vendor.srcs.clone(),
+        crate_name: lib_target.name.to_owned().replace("-", "_"),
+        edition: node.edition.to_string(),
+        features,
+        platform,
+        rustc_flags: vec!["@$(location :manifest[env_flags])".to_owned()],
+        visibility: Set::from(["PUBLIC".to_owned()]),
+        ..Default::default()
+    };
+    rust_binary.crate_root = vendor.crate_path(&normalize_path_for_buck(
+        lib_target
+            .src_path
+            .to_owned()
+            .strip_prefix(manifest_dir)
+            .expect("Failed to get library source path")
+            .as_str(),
+    ));
+    set_deps(&mut rust_binary, node, CargoTargetKind::Test, ctx)
+        .unwrap_or_exit_ctx(format!("failed to set dependencies for '{}'", buckal_name));
+    platform_compatibility(
+        node,
+        ctx,
+        false,
+        &mut rust_binary.target_compatible_with,
+        &mut rust_binary.platform,
+    );
+    rust_binary
+}
+
 /// Emit `rust_test` rule for the given bin target
 pub(super) fn emit_rust_test(
     node: &BuckalNode,

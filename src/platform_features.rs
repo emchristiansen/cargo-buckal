@@ -232,6 +232,11 @@ pub struct PlatformResolution {
     /// module, whose variants their target dependencies are too. Never stored.
     #[serde(skip)]
     pub wasm_rules: Option<String>,
+    /// The package's library unit tests compiled for wasm32 in each declared
+    /// `wasm-test` graph (`[wasm] test_packages`), by test graph key: emitted as a
+    /// test-mode module, its alias and a browser test.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub wasm_tests: BTreeMap<String, WasmTest>,
 }
 
 /// A library in a wasm32 module's own Cargo graph (target context).
@@ -250,6 +255,35 @@ pub struct WasmVariant {
     /// profile's link-time flags.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub root: bool,
+}
+
+/// A package's library unit tests in one of its `wasm-test` graphs: the test-mode
+/// compilation of its library root for wasm32.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WasmTest {
+    /// The `feature_platforms` name of wasm32-unknown-unknown.
+    pub platform: String,
+    pub features: BTreeSet<String>,
+    /// The test unit's dependencies (`PackageId::repr`): its normal and
+    /// dev-dependencies, the package itself where Cargo links its library in.
+    pub deps: BTreeSet<String>,
+    /// The test unit's rustc flags, from its resolved profile.
+    pub rustc_flags: Vec<String>,
+    /// The test names the browser test runs (empty: the rule's default).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tests: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub labels: BTreeSet<String>,
+}
+
+/// The library unit-test unit of a package's own test graph.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackageTestUnit {
+    pub features: BTreeSet<String>,
+    /// Its dependencies (`PackageId::repr`), the package itself included when its
+    /// library is linked in.
+    pub deps: BTreeSet<String>,
+    pub profile: UnitProfile,
 }
 
 /// A library of a package's own graph.
@@ -304,6 +338,63 @@ pub fn resolve_package_graph(
             ))
         })
         .collect()
+}
+
+/// The target-context libraries of `cargo test -p <package> --lib --no-run --target
+/// <triple> --features <features>`, by package, and the package's library unit-test
+/// unit (`None` when Cargo compiles none, as for a package without a library; `--lib`
+/// names the library explicitly, so `[lib] test = false` still compiles its unit tests).
+pub fn resolve_package_test_graph(
+    manifest_path: Option<&str>,
+    packages: &HashMap<PackageId, Package>,
+    package: &PackageId,
+    name: &str,
+    features: &[String],
+    triple: &str,
+) -> Result<(HashMap<PackageId, PackageGraphLib>, Option<PackageTestUnit>)> {
+    let output = run_unit_graph(
+        manifest_path,
+        triple,
+        GraphShape::PackageTest(name, features),
+    )
+    .with_context(|| format!("failed to resolve `{name}`'s own test graph for `{triple}`"))?;
+    let parsed = parse_unit_graph(&output, packages)
+        .with_context(|| format!("failed to read Cargo's unit test graph of `{name}`"))?;
+    let target = parsed.target;
+    let test = match target.test_profiles.get(package) {
+        None => None,
+        Some(profile) => {
+            let deps = target.deps.get(package).cloned().unwrap_or_default();
+            Some(PackageTestUnit {
+                features: target.features.get(package).cloned().unwrap_or_default(),
+                deps: deps.role(EdgeRole::Dev).clone(),
+                profile: profile.clone(),
+            })
+        }
+    };
+    let libs = target
+        .features
+        .iter()
+        .filter(|(id, _)| target.libs.contains(*id))
+        .map(|(id, features)| {
+            let deps = target.deps.get(id).cloned().unwrap_or_default();
+            let profile = target
+                .profiles
+                .get(id)
+                .cloned()
+                .with_context(|| format!("Cargo's unit graph gives `{id}` no profile"))?;
+            Ok((
+                id.clone(),
+                PackageGraphLib {
+                    features: features.clone(),
+                    normal: deps.role(EdgeRole::Normal).clone(),
+                    build: deps.role(EdgeRole::Build).clone(),
+                    profile,
+                },
+            ))
+        })
+        .collect::<Result<_>>()?;
+    Ok((libs, test))
 }
 
 /// The resolution of one more compilation context of a package: the host variant of
@@ -609,6 +700,9 @@ enum GraphShape<'a> {
     /// `cargo build -p <package>`, with these `--features` and this `--profile`:
     /// the package's own graph.
     Package(&'a str, &'a [String], &'a str),
+    /// `cargo test -p <package> --lib --no-run`, with these `--features`: the
+    /// package's own graph of its library unit tests.
+    PackageTest(&'a str, &'a [String]),
 }
 
 /// What a unit graph compiles besides each package's resolution.
@@ -1041,6 +1135,13 @@ fn run_unit_graph(manifest_path: Option<&str>, triple: &str, shape: GraphShape) 
             }
             "cargo build -p"
         }
+        GraphShape::PackageTest(package, features) => {
+            cmd.args(["test", "-p", package, "--lib", "--no-run"]);
+            if !features.is_empty() {
+                cmd.args(["--features", &features.join(",")]);
+            }
+            "cargo test -p"
+        }
     };
     cmd.args(["--target", triple, "-Z", "unstable-options", "--unit-graph"]);
     if let Some(path) = manifest_path {
@@ -1098,6 +1199,8 @@ pub(crate) struct ContextTree {
     pub libs: HashSet<PackageId>,
     /// The profile of each package's library unit in this context.
     pub profiles: HashMap<PackageId, UnitProfile>,
+    /// The profile of each package's library unit-test unit in this context.
+    pub test_profiles: HashMap<PackageId, UnitProfile>,
 }
 
 /// The profile Cargo resolved for one unit (`--unit-graph`'s `profile`).
@@ -1240,6 +1343,12 @@ pub(crate) fn parse_unit_graph(
             if let Some(profile) = &u.profile {
                 context.profiles.insert(id.clone(), profile.clone());
             }
+        }
+        if u.mode == "test"
+            && u.is_lib_target()
+            && let Some(profile) = &u.profile
+        {
+            context.test_profiles.insert(id.clone(), profile.clone());
         }
         let deps = context.deps.entry(id).or_default();
         let role = u.edge_role();

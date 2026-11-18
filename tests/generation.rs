@@ -5055,3 +5055,400 @@ fn test_a_hand_written_wasm_sha256_is_removed_with_a_warning() {
     );
     assert_eq!(std::fs::read_to_string(&path).unwrap(), generated);
 }
+
+/// A workspace whose `site` declares `wasm-test` graphs (`site_metadata`) and is
+/// listed by `test_packages` (a TOML list's items). `site` uses `d` with `m`, while
+/// the member `other` enables `d`'s `desktop`, which pulls in the native-only `nat`:
+/// the workspace's resolution of `d` has it, `site`'s own test graph does not (the
+/// dioxus-desktop case). `site` has the wasm32-only dev-dependency `wt` (as
+/// wasm-bindgen-test is), the dev-dependency `dv` and, through `voice`, the
+/// optional `v`.
+fn wasm_test_fixture(site_metadata: &str, test_packages: &str) -> Fixture {
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"site\", \"d\", \"other\", \"v\", \"wt\", \"dv\"]\nexclude = [\"nat\"]\n",
+    );
+    write(
+        &f.ws.join("site/Cargo.toml"),
+        &manifest(
+            "site",
+            &format!(
+                "[features]\ntest_lib = []\nvoice = [\"dep:v\"]\n\
+                 [dependencies]\nd = {{ path = \"../d\", features = [\"m\"] }}\nv = {{ path = \"../v\", optional = true }}\n\
+                 [target.'cfg(target_arch = \"wasm32\")'.dev-dependencies]\nwt = {{ path = \"../wt\" }}\n\
+                 [dev-dependencies]\ndv = {{ path = \"../dv\" }}\n{site_metadata}"
+            ),
+        ),
+    );
+    write(
+        &f.ws.join("d/Cargo.toml"),
+        &manifest(
+            "d",
+            "[features]\nm = []\ndesktop = [\"dep:nat\"]\n[dependencies]\nnat = { path = \"../nat\", optional = true }\n",
+        ),
+    );
+    write(
+        &f.ws.join("other/Cargo.toml"),
+        &manifest(
+            "other",
+            "[dependencies]\nd = { path = \"../d\", features = [\"desktop\"] }\n",
+        ),
+    );
+    write(
+        &f.ws.join("nat/Cargo.toml"),
+        &manifest("nat", "[workspace]\n"),
+    );
+    for name in ["v", "wt", "dv"] {
+        write(&f.ws.join(name).join("Cargo.toml"), &manifest(name, ""));
+    }
+    for name in ["site", "d", "other", "nat", "v", "wt", "dv"] {
+        write(&f.ws.join(name).join("src/lib.rs"), "");
+    }
+    write(&f.ws.join("d/build.rs"), "fn main() {}\n");
+    write(
+        &f.ws.join("buckal.toml"),
+        &format!(
+            "{}\n[wasm]\ntest_packages = [{test_packages}]\nplatform = \"root//buck2/platforms/wasm:wasm32_unknown_unknown\"\n",
+            BUCKAL_TOML.split("[fixups.extra]").next().unwrap()
+        ),
+    );
+    f
+}
+
+const SITE_WASM_TEST: &str = "[package.metadata.buck2.wasm-test]\nfeatures = [\"test_lib\"]\n\
+     tests = [\"tests::renders\", \"tests::async_fetch\"]\nlabels = [\"browser\"]\n\
+     [package.metadata.buck2.wasm-test-variants.voice]\nfeatures = [\"test_lib\", \"voice\"]\n\
+     tests = [\"tests::renders\"]\n";
+
+#[test]
+fn test_wasm_test_modules_from_the_packages_own_test_graph() {
+    // Muninn //observatory/site (`cfg(all(test, target_arch = "wasm32"))` browser
+    // tests): the library's unit tests compiled for wasm32 in test mode from Cargo's
+    // own `cargo test -p site --lib` graph, per declared feature set, each run by a
+    // browser test.
+    let f = wasm_test_fixture(SITE_WASM_TEST, "\"site\"");
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let platform = "root//buck2/platforms/wasm:wasm32_unknown_unknown";
+
+    let site = f.buck("site");
+    assert!(
+        site.contains("load(\"@buckal//:wasm_browser_test.bzl\", \"wasm_browser_test\")"),
+        "{site}"
+    );
+    // The test-mode module: the library's crate root with `--test`, the test
+    // unit's features and profile, its normal and dev-dependencies as this graph's
+    // variants, for wasm32 only.
+    assert!(
+        site.contains("rust_binary(\n    name = \"wasm-test-module\",\n"),
+        "{site}"
+    );
+    let module = rule(&site, "wasm-test-module");
+    for part in [
+        "    crate = \"site\",\n",
+        "    crate_root = \"src/lib.rs\",\n",
+        "    features = [\"test_lib\"],\n",
+        "\"--test\"",
+        "\"-Copt-level=0\"",
+        "\"-Cdebug-assertions=on\"",
+        "\"linux-x86_64\": {\n            \"target_compatible_with\": [\"prelude//:none\"]",
+    ] {
+        assert!(module.contains(part), "{part}: {module}");
+    }
+    assert_eq!(
+        top_deps(module),
+        [
+            "//d:d-wasm-site__test",
+            "//dv:dv-wasm-site__test",
+            "//wt:wt-wasm-site__test"
+        ],
+        "{module}"
+    );
+    assert!(
+        site.contains(&format!(
+            "configured_alias(\n    name = \"wasm-test-module-wasm32\",\n    actual = \":wasm-test-module\",\n    platform = \"{platform}\",\n    visibility = [\"PUBLIC\"],\n)\n"
+        )),
+        "{site}"
+    );
+    assert!(
+        site.contains(
+            "wasm_browser_test(\n    name = \"unittest-browser\",\n    wasm = \":wasm-test-module-wasm32\",\n    tests = [\n        \"tests::renders\",\n        \"tests::async_fetch\",\n    ],\n    labels = [\"browser\"],\n)\n"
+        ),
+        "{site}"
+    );
+
+    // The voice variant: exactly its own features, its own graph (`v` too).
+    let voice = rule(&site, "wasm-test-module.voice");
+    assert!(
+        voice.contains("    features = [\n        \"test_lib\",\n        \"voice\",\n    ],\n"),
+        "{voice}"
+    );
+    assert_eq!(
+        top_deps(voice),
+        [
+            "//d:d-wasm-site__test__voice",
+            "//dv:dv-wasm-site__test__voice",
+            "//v:v-wasm-site__test__voice",
+            "//wt:wt-wasm-site__test__voice"
+        ],
+        "{voice}"
+    );
+    assert!(
+        site.contains(&format!(
+            "configured_alias(\n    name = \"wasm-test-module-wasm32.voice\",\n    actual = \":wasm-test-module.voice\",\n    platform = \"{platform}\",\n"
+        )),
+        "{site}"
+    );
+    assert!(
+        site.contains(
+            "wasm_browser_test(\n    name = \"unittest-browser.voice\",\n    wasm = \":wasm-test-module-wasm32.voice\",\n    tests = [\"tests::renders\"],\n)\n"
+        ),
+        "{site}"
+    );
+    // The library itself is not in the test graph (nothing links it in).
+    assert!(!site.contains("name = \"site-wasm-"), "{site}");
+
+    // `d` as the site's test graph compiles it: `m` without `desktop` (so no `nat`),
+    // while the workspace's `d` has both.
+    let d = f.buck("d");
+    let d_test = rule(&d, "d-wasm-site__test");
+    assert!(d_test.contains("    features = [\"m\"],\n"), "{d_test}");
+    assert!(!d_test.contains("nat"), "{d_test}");
+    assert!(rule(&d, "d").contains("\"desktop\""), "{d}");
+    // Its build script in this graph: every crate name is a Rust identifier (no
+    // `.` or `+` from the graph key).
+    let build = rule(&d, "build-script-wasm-site__test__voice-build");
+    assert!(
+        build.contains("    crate = \"build_script_wasm_site__test__voice_build\",\n"),
+        "{build}"
+    );
+    for site_or_d in [&site, &d] {
+        for crate_name in site_or_d
+            .lines()
+            .filter_map(|l| l.strip_prefix("    crate = \""))
+            .map(|l| l.trim_end_matches("\","))
+        {
+            assert!(
+                crate_name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "{crate_name}"
+            );
+        }
+    }
+    assert!(!f.buck("nat").contains("-wasm-"), "{}", f.buck("nat"));
+    assert!(!f.buck("other").contains("-wasm-"), "{}", f.buck("other"));
+    // `v` only in the voice graph.
+    let v = f.buck("v");
+    assert!(v.contains("name = \"v-wasm-site__test__voice\""), "{v}");
+    assert!(!v.contains("name = \"v-wasm-site__test\","), "{v}");
+
+    f.migrate(&["--no-cache"]);
+    assert_eq!(f.buck("site"), site);
+    assert_eq!(f.buck("d"), d);
+}
+
+#[test]
+fn test_wasm_test_links_the_library_where_a_dev_dependency_cycle_needs_it() {
+    // `site` is its own dev-dependency (with `extra`), and `dv` depends on `site`:
+    // Cargo builds `site`'s library in the test graph, links it into the unit tests
+    // under its crate name, and `dv`'s variant uses it.
+    let f = wasm_test_fixture(
+        "[package.metadata.buck2.wasm-test]\nfeatures = [\"test_lib\"]\n",
+        "\"site\"",
+    );
+    let site_toml = std::fs::read_to_string(f.ws.join("site/Cargo.toml"))
+        .unwrap()
+        .replace("test_lib = []\n", "test_lib = []\nextra = []\n")
+        .replace(
+            "[dev-dependencies]\n",
+            "[dev-dependencies]\nsite = { path = \".\", features = [\"extra\"] }\n",
+        );
+    write(&f.ws.join("site/Cargo.toml"), &site_toml);
+    write(
+        &f.ws.join("dv/Cargo.toml"),
+        &manifest("dv", "[dependencies]\nsite = { path = \"../site\" }\n"),
+    );
+    let mut toml = std::fs::read_to_string(f.ws.join("buckal.toml")).unwrap();
+    toml = toml.replace(
+        "ignore_tests = false",
+        "ignore_tests = false\nskip_dev_dependency_cycles = true",
+    );
+    write(&f.ws.join("buckal.toml"), &toml);
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let site = f.buck("site");
+    let module = rule(&site, "wasm-test-module");
+    assert_eq!(
+        top_deps(module),
+        [
+            "//d:d-wasm-site__test",
+            "//dv:dv-wasm-site__test",
+            "//wt:wt-wasm-site__test",
+            ":site-wasm-site__test"
+        ],
+        "{module}"
+    );
+    assert!(
+        site.contains("rust_library(\n    name = \"site-wasm-site__test\",\n"),
+        "{site}"
+    );
+    let lib = rule(&site, "site-wasm-site__test");
+    assert!(!lib.contains("--test"), "{lib}");
+    assert!(lib.contains("\"extra\""), "{lib}");
+    assert!(
+        rule(&f.buck("dv"), "dv-wasm-site__test").contains("\"//site:site-wasm-site__test\""),
+        "{}",
+        f.buck("dv")
+    );
+}
+
+#[test]
+fn test_wasm_test_declarations_are_refused_unless_exact() {
+    let refusals = [
+        (
+            SITE_WASM_TEST.to_owned(),
+            "\"site\", \"site\"",
+            "`[wasm] test_packages`: `site` is listed twice",
+        ),
+        (
+            SITE_WASM_TEST.to_owned(),
+            "\"nope\"",
+            "`[wasm] test_packages`: `nope` is no member of the workspace",
+        ),
+        (
+            String::new(),
+            "\"site\"",
+            "`[wasm] test_packages`: `site` declares no `[package.metadata.buck2.wasm-test]`",
+        ),
+        (
+            SITE_WASM_TEST.to_owned(),
+            "",
+            "`site` declares `[package.metadata.buck2.wasm-test]`, but `[wasm] test_packages` does not list it",
+        ),
+        (
+            "[package.metadata.buck2.wasm-test-variants.voice]\nfeatures = [\"voice\"]\n".to_owned(),
+            "\"site\"",
+            "`site`: `[package.metadata.buck2.wasm-test-variants]` needs `[package.metadata.buck2.wasm-test]`",
+        ),
+        (
+            "[package.metadata.buck2.wasm-test]\nfeatures = [\"test_lib\"]\nprofile = \"release\"\n".to_owned(),
+            "\"site\"",
+            "`site`: `[package.metadata.buck2.wasm-test]`: unknown key `profile` (it has `features`, `tests` and `labels`)",
+        ),
+        (
+            "[package.metadata.buck2.wasm-test]\ntests = [\"a\", \"a\"]\n".to_owned(),
+            "\"site\"",
+            "`site`: `[package.metadata.buck2.wasm-test]` `tests`: `a` is listed twice",
+        ),
+        (
+            "[package.metadata.buck2.wasm-test]\n[package.metadata.buck2.wasm-test-variants.voice]\ntests = [\"a\"]\n".to_owned(),
+            "\"site\"",
+            "`site`: `[package.metadata.buck2.wasm-test-variants.voice]`: `features` is required (a variant's exact features)",
+        ),
+        (
+            "[package.metadata.buck2.wasm-test]\n[package.metadata.buck2.wasm-test-variants.\"a.b\"]\nfeatures = []\n".to_owned(),
+            "\"site\"",
+            "`site`: `[package.metadata.buck2.wasm-test-variants.a.b]`: a variant name holds only letters, digits, `_` and `-`",
+        ),
+        (
+            "[lib]\ncrate-type = [\"cdylib\"]\n[package.metadata.buck2.wasm-test]\n".to_owned(),
+            "\"site\"",
+            "`[wasm] test_packages`: `site` has no Rust library whose unit tests could run",
+        ),
+    ];
+    for (metadata, listed, why) in refusals {
+        let f = wasm_test_fixture(&metadata, listed);
+        let output = f.output(&["migrate"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!output.status.success(), "{why}:\n{stderr}");
+        assert!(stderr.contains(why), "{why}:\n{stderr}");
+        assert!(!f.ws.join("site/BUCK").exists(), "{why}");
+    }
+    // A build script is refused; without `[wasm]` at all, so is a declaration.
+    let f = wasm_test_fixture(SITE_WASM_TEST, "\"site\"");
+    write(&f.ws.join("site/build.rs"), "fn main() {}\n");
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("`[wasm] test_packages`: `site` has a build script, which a `wasm-test` module does not support"),
+        "{stderr}"
+    );
+    let f = wasm_test_fixture(SITE_WASM_TEST, "\"site\"");
+    write(
+        &f.ws.join("buckal.toml"),
+        BUCKAL_TOML.split("[fixups.extra]").next().unwrap(),
+    );
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("`site` declares `[package.metadata.buck2.wasm-test]`, but `[wasm] test_packages` does not list it"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn test_wasm_test_names_join_the_namespace_check_and_ownership() {
+    // N21 covers the new names: a binary target named `wasm-test-module` is a second
+    // rule of that name. Refused, nothing written.
+    let f = wasm_test_fixture(SITE_WASM_TEST, "\"site\"");
+    write(
+        &f.ws.join("site/Cargo.toml"),
+        &std::fs::read_to_string(f.ws.join("site/Cargo.toml"))
+            .unwrap()
+            .replace(
+                "[features]",
+                "[[bin]]\nname = \"wasm-test-module\"\npath = \"src/main.rs\"\n[features]",
+            ),
+    );
+    write(&f.ws.join("site/src/main.rs"), "fn main() {}\n");
+    let output = f.output(&["migrate"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains(
+            "generation emits two rules named `wasm-test-module` (`rust_binary` and `rust_binary`)"
+        ),
+        "{stderr}"
+    );
+    assert!(!f.ws.join("site/BUCK").exists());
+
+    // A hand-written call named like a generated one is refused; a hand-written
+    // `wasm_browser_test` is generation's to own, and is removed with a warning.
+    let f = wasm_test_fixture(SITE_WASM_TEST, "\"site\"");
+    f.migrate(&[]);
+    let path = f.ws.join("site/BUCK");
+    let generated = std::fs::read_to_string(&path).unwrap();
+    write(
+        &path,
+        &format!(
+            "{generated}\nsh_test(\n    name = \"unittest-browser.voice\",\n    test = \"x.sh\",\n)\n"
+        ),
+    );
+    let output = f.output(&["migrate", "--no-cache"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("the hand-written `sh_test(name = \"unittest-browser.voice\")` declares the target `unittest-browser.voice`, which generation also emits"),
+        "{stderr}"
+    );
+    write(
+        &path,
+        &format!(
+            "{generated}\nwasm_browser_test(\n    name = \"mine\",\n    wasm = \"x.wasm\",\n)\n"
+        ),
+    );
+    let output = f.output(&["migrate", "--no-cache"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("site/BUCK: removing `wasm_browser_test(name = \"mine\")`: generation owns every `wasm_browser_test` rule of a first-party BUCK file and no longer emits this one"),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), generated);
+}

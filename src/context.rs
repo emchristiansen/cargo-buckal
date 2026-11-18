@@ -14,7 +14,8 @@ use crate::{
     resolve::{BuckalNode, BuckalResolve, NodeKind},
     utils::{UnwrapOrExit, get_buck2_root},
     wasm::{
-        WASM_TRIPLE, declared_module_features, package_dir, resolve_modules, test_env_declaration,
+        WASM_TRIPLE, declared_module_features, declares_tests, package_dir, resolve_modules,
+        resolve_tests, test_env_declaration,
     },
     workspace_inputs::{WorkspaceInputs, resolve_workspace_inputs},
 };
@@ -77,6 +78,7 @@ impl BuckalContext {
         if !repo_config.wasm.is_empty() {
             let module_features = declared_module_features(
                 &repo_config.wasm.packages,
+                &repo_config.wasm.test_packages,
                 &cargo_metadata.packages,
                 &cargo_metadata.workspace_members,
             )
@@ -270,6 +272,21 @@ impl BuckalContext {
 
         let workspace_members = Some(cargo_metadata.workspace_members.iter().cloned().collect());
 
+        // Without `[wasm]`, nothing builds a `wasm-test` declaration: refuse it rather
+        // than ignore it (with `[wasm]`, `resolve_tests` refuses an unlisted one).
+        if repo_config.wasm.is_empty()
+            && let Some(id) = cargo_metadata
+                .workspace_members
+                .iter()
+                .find(|id| declares_tests(&packages_map[id]))
+        {
+            buckal_error!(format!(
+                "`{}` declares `[package.metadata.buck2.wasm-test]`, but `[wasm] test_packages` does not list it",
+                packages_map[id].name
+            ));
+            std::process::exit(1);
+        }
+
         let mut wasm_modules = std::collections::BTreeMap::new();
         let mut declared_test_env = HashMap::new();
         if !repo_config.wasm.is_empty() {
@@ -322,6 +339,40 @@ impl BuckalContext {
                     std::process::exit(1);
                 };
                 resolve.dag[idx].platform_features.wasm_variants = by_module;
+            }
+            let tests = resolve_tests(
+                &wasm.test_packages,
+                &platform,
+                manifest_path.as_deref(),
+                &packages_map,
+                &members,
+            )
+            .unwrap_or_else(|error| {
+                buckal_error!(format!("{error:#}"));
+                std::process::exit(1);
+            });
+            for (id, by_key) in tests.variants {
+                let Some(&idx) = resolve.index_map.get(&id) else {
+                    let keys = by_key.keys().cloned().collect::<Vec<_>>().join("`, `");
+                    buckal_error!(format!(
+                        "`[wasm] test_packages`: `{keys}`'s own graph compiles `{id}`, which the workspace's resolve does not contain"
+                    ));
+                    std::process::exit(1);
+                };
+                let variants = &mut resolve.dag[idx].platform_features.wasm_variants;
+                for (key, variant) in by_key {
+                    // A module key spelled like a test graph key (a package named so).
+                    if variants.insert(key.clone(), variant).is_some() {
+                        buckal_error!(format!(
+                            "`[wasm] test_packages`: the test graph `{key}` has the key of a `[wasm] packages` module; rename that package"
+                        ));
+                        std::process::exit(1);
+                    }
+                }
+            }
+            for (id, by_key) in tests.tests {
+                let idx = resolve.index_map[&id];
+                resolve.dag[idx].platform_features.wasm_tests = by_key;
             }
             for module in &wasm.packages {
                 let package = &packages_map[&members[module]];

@@ -27,6 +27,7 @@ pub enum Rule {
     BuildscriptRun(BuildscriptRun),
     ConfiguredAlias(ConfiguredAlias),
     WasmSha256(WasmSha256),
+    WasmBrowserTest(WasmBrowserTest),
 }
 
 /// Buck2's native `configured_alias`: `actual` configured for `platform`.
@@ -51,6 +52,20 @@ pub struct WasmSha256 {
     pub visibility: Set<String>,
 }
 
+/// The buckal cell's `wasm_browser_test` (`@buckal//:wasm_browser_test.bzl`): runs
+/// the wasm-bindgen test module `wasm` (a wasm32 test-mode compilation) in a
+/// browser; with `tests`, exactly those test names.
+#[derive(Serialize, Debug, PartialEq, Clone)]
+#[serde(rename = "wasm_browser_test")]
+pub struct WasmBrowserTest {
+    pub name: String,
+    pub wasm: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tests: Vec<String>,
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub labels: Set<String>,
+}
+
 impl Rule {
     /// The function a BUCK file calls for the rule (`load` for a load).
     pub fn function(&self) -> &'static str {
@@ -67,6 +82,7 @@ impl Rule {
             Rule::BuildscriptRun(_) => "buildscript_run",
             Rule::ConfiguredAlias(_) => "configured_alias",
             Rule::WasmSha256(_) => "wasm_sha256",
+            Rule::WasmBrowserTest(_) => "wasm_browser_test",
         }
     }
 
@@ -85,6 +101,7 @@ impl Rule {
             Rule::BuildscriptRun(r) => Some(&r.name),
             Rule::ConfiguredAlias(r) => Some(&r.name),
             Rule::WasmSha256(r) => Some(&r.name),
+            Rule::WasmBrowserTest(r) => Some(&r.name),
         }
     }
 
