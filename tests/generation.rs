@@ -4833,18 +4833,26 @@ fn test_a_variant_build_script_has_a_valid_crate_name() {
 }
 
 #[test]
-fn test_build_scripts_sharing_a_crate_name_are_refused() {
-    // The modules `a.b-c` (package `a`, variant `b-c`) and `a-b.c` (package
-    // `a-b`, variant `c`) both build `d`, whose build scripts
-    // `build-script-wasm-a.b-c-build` and `build-script-wasm-a-b.c-build` would
-    // share the crate name `build_script_wasm_a_b_c_build`. Generation refuses
-    // that rather than emit two build scripts one crate name.
+fn test_build_scripts_sharing_a_crate_name_generate() {
+    // `-`, `_` and `.` all become `_` in a build script's crate name, so two
+    // build scripts of one package can share it; Buck2 needs unique rule names
+    // only. Here `d`'s build script is built for the variant `t` of `module`
+    // and for the package `module-t` (`build_script_wasm_module_t_build`), and
+    // for the packages `a-b` and `a_b` (`build_script_wasm_a_b_build`).
     let f = fixture();
     write(
         &f.ws.join("Cargo.toml"),
-        "[workspace]\nresolver = \"2\"\nmembers = [\"a\", \"a-b\", \"d\"]\n",
+        "[workspace]\nresolver = \"2\"\nmembers = [\"module\", \"module-t\", \"a-b\", \"a_b\", \"d\"]\n",
     );
-    for (name, variant) in [("a", "b-c"), ("a-b", "c")] {
+    for (name, variants) in [
+        (
+            "module",
+            "[package.metadata.buck2.wasm-variants.t]\nfeatures = [\"v\"]\n",
+        ),
+        ("module-t", ""),
+        ("a-b", ""),
+        ("a_b", ""),
+    ] {
         write(
             &f.ws.join(name).join("Cargo.toml"),
             &manifest(
@@ -4852,8 +4860,7 @@ fn test_build_scripts_sharing_a_crate_name_are_refused() {
                 &format!(
                     "[lib]\ncrate-type = [\"cdylib\", \"rlib\"]\n[features]\nv = []\n\
                      [dependencies]\nd = {{ path = \"../d\" }}\n\
-                     [package.metadata.buck2.wasm]\nfeatures = []\nprofile = \"release\"\n\
-                     [package.metadata.buck2.wasm-variants.{variant}]\nfeatures = [\"v\"]\n"
+                     [package.metadata.buck2.wasm]\nfeatures = []\nprofile = \"release\"\n{variants}"
                 ),
             ),
         );
@@ -4865,20 +4872,39 @@ fn test_build_scripts_sharing_a_crate_name_are_refused() {
     write(
         &f.ws.join("buckal.toml"),
         &format!(
-            "{}\n[wasm]\npackages = [\"a\", \"a-b\"]\nplatform = \"root//buck2/platforms/wasm:wasm32_unknown_unknown\"\n",
+            "{}\n[wasm]\npackages = [\"module\", \"module-t\", \"a-b\", \"a_b\"]\nplatform = \"root//buck2/platforms/wasm:wasm32_unknown_unknown\"\n",
             BUCKAL_TOML.split("[fixups.extra]").next().unwrap()
         ),
     );
     let output = f.output(&["migrate"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success(), "{stderr}");
-    assert!(
-        stderr.contains(
-            "generation emits two build scripts with the crate name `build_script_wasm_a_b_c_build` (`build-script-wasm-a-b.c-build` and `build-script-wasm-a.b-c-build`)"
-        ),
-        "{stderr}"
-    );
-    assert!(!f.ws.join("d/BUCK").exists());
+    assert!(output.status.success(), "{stderr}");
+    let d = f.buck("d");
+    for (module, crate_name) in [
+        ("module.t", "build_script_wasm_module_t_build"),
+        ("module-t", "build_script_wasm_module_t_build"),
+        ("a-b", "build_script_wasm_a_b_build"),
+        ("a_b", "build_script_wasm_a_b_build"),
+    ] {
+        assert!(
+            rule(&d, &format!("build-script-wasm-{module}-build"))
+                .contains(&format!("    crate = \"{crate_name}\",\n")),
+            "{d}"
+        );
+        rule(&d, &format!("build-script-wasm-{module}-run"));
+    }
+    // Each shared crate name is that of exactly the two build scripts above.
+    let names = crate_names(&d);
+    for crate_name in [
+        "build_script_wasm_module_t_build",
+        "build_script_wasm_a_b_build",
+    ] {
+        assert_eq!(
+            names.iter().filter(|name| **name == crate_name).count(),
+            2,
+            "{d}"
+        );
+    }
 }
 
 #[test]
