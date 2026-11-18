@@ -120,8 +120,16 @@ fn resolve_dep_label(
     ctx: &BuckalContext,
 ) -> Result<(String, Option<String>)> {
     let dep_node = ctx.patched_node(dep_node)?;
-    let dep_package_name = dep_node.name.to_string();
-    let is_renamed = dep.name != dep_package_name.replace("-", "_");
+    // `dep.name` is the name the dependent compiles the dependency as (Cargo's
+    // `--extern` name: the key in `[dependencies]`). The dependency's rule
+    // declares its library's crate name, which is the library target's name and
+    // can differ from the package's (`spacetimedb-core` compiles as
+    // `spacetimedb`). Only a differing extern name needs an alias.
+    let crate_name = match get_lib_targets(dep_node).as_slice() {
+        [lib] => lib.name.replace('-', "_"),
+        _ => dep_node.name.replace('-', "_"),
+    };
+    let is_renamed = dep.name != crate_name;
     let alias = if is_renamed {
         Some(dep.name.clone())
     } else {

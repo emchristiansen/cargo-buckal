@@ -6084,6 +6084,51 @@ fn test_a_standalone_universe_compiles_project_packages_from_their_owners() {
     assert_eq!(f.buck("extra").matches(RUST_FILEGROUP_LOAD).count(), 1);
 }
 
+// Trial 7 (Muninn callosum_native_tests): `spacetimedb-test-datastore` depends on
+// `spacetimedb_core = { package = "spacetimedb-core" }`, whose library is named
+// `spacetimedb`. The key normalizes to the package name, yet differs from the
+// crate name, so Cargo passes `--extern spacetimedb_core`: the dependency needs
+// its alias. A dependency under its library's own name needs none.
+#[test]
+fn test_a_dependency_named_unlike_its_library_crate_is_aliased() {
+    let f = fixture();
+    write(
+        &f.ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"lib-pkg\", \"by_package\", \"by_crate\"]\n",
+    );
+    write(
+        &f.ws.join("lib-pkg/Cargo.toml"),
+        &manifest("lib-pkg", "[lib]\nname = \"libcrate\"\n"),
+    );
+    write(&f.ws.join("lib-pkg/src/lib.rs"), "");
+    write(
+        &f.ws.join("by_package/Cargo.toml"),
+        &manifest(
+            "by_package",
+            "[dependencies]\nlib_pkg = { package = \"lib-pkg\", path = \"../lib-pkg\" }\n",
+        ),
+    );
+    write(&f.ws.join("by_package/src/lib.rs"), "");
+    write(
+        &f.ws.join("by_crate/Cargo.toml"),
+        &manifest(
+            "by_crate",
+            "[dependencies]\nlib-pkg = { path = \"../lib-pkg\" }\n",
+        ),
+    );
+    write(&f.ws.join("by_crate/src/lib.rs"), "");
+    f.migrate(&[]);
+    let by_package = rule(&f.buck("by_package"), "by_package").to_owned();
+    assert!(
+        by_package
+            .contains("    named_deps = {\n        \"lib_pkg\": \"//lib-pkg:libcrate\",\n    },"),
+        "{by_package}"
+    );
+    let by_crate = rule(&f.buck("by_crate"), "by_crate").to_owned();
+    assert!(by_crate.contains("\"//lib-pkg:libcrate\""), "{by_crate}");
+    assert!(!by_crate.contains("named_deps"), "{by_crate}");
+}
+
 // Fable, review 56, p7b and p5.
 #[test]
 fn test_a_universe_compiles_the_project_root_package_and_names_an_unexposable_owner() {
