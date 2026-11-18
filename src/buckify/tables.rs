@@ -301,8 +301,9 @@ pub fn check_universe_names(
 ///
 /// Refused: universes sharing a vendor tree ([`check_universe_names`]), and a
 /// universe whose vendor tree exists but whose record does not (its BUCK files
-/// could not be told from hand-written ones). A universe never generated, with
-/// neither, contributes nothing.
+/// could not be told from hand-written ones), unless a recorded universe of the
+/// same name owns that tree. A universe never generated, with neither,
+/// contributes nothing.
 pub fn standalone_package_dirs(
     root: &Utf8Path,
     layout: &CellLayout,
@@ -311,10 +312,26 @@ pub fn standalone_package_dirs(
 
     let found = standalone_universes(root, layout)?;
     check_universe_names(&found, None)?;
+    // The names whose vendor tree a recorded universe owns.
+    let recorded_names: BTreeSet<&str> = found
+        .iter()
+        .filter(|found| found.recorded)
+        .filter_map(|found| match &found.universe {
+            crate::universe::Universe::Standalone { name, .. } => Some(name.as_str()),
+            crate::universe::Universe::Root => None,
+        })
+        .collect();
     let mut dirs = BTreeSet::new();
     for FoundUniverse { universe, recorded } in &found {
         let dir = universe.config_dir();
         if !recorded {
+            // An unrecorded directory sharing a recorded universe's name (a fixture,
+            // or a copy) does not own that universe's vendor tree.
+            if let crate::universe::Universe::Standalone { name, .. } = universe
+                && recorded_names.contains(name.as_str())
+            {
+                continue;
+            }
             let vendor = root.join(universe.vendor_root());
             if vendor.exists() {
                 return Err(format!(
@@ -900,6 +917,33 @@ mod tests {
         }
         let error = standalone_package_dirs(root, &layout).unwrap_err();
         assert!(error.contains("has no buckal.snap"), "{error}");
+    }
+
+    #[test]
+    fn test_an_unrecorded_namesake_of_a_recorded_universe_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Utf8Path::from_path(dir.path()).unwrap();
+        for path in [
+            "guests/ws/Cargo.toml",
+            "guests/ws/buckal.toml",
+            "fixtures/ws/Cargo.toml",
+            "fixtures/ws/buckal.toml",
+            "third-party/rust/standalone/ws/crates/sdep/2.0.0/BUCK",
+        ] {
+            touch(root, path);
+        }
+        std::fs::write(
+            root.join("guests/ws/buckal.snap"),
+            standalone_record(&["registry+https://github.com/rust-lang/crates.io-index#sdep@2.0.0"]),
+        )
+        .unwrap();
+        let layout = CellLayout::parse("").unwrap();
+        assert_eq!(
+            standalone_package_dirs(root, &layout).unwrap(),
+            ["third-party/rust/standalone/ws/crates/sdep/2.0.0"]
+                .map(str::to_owned)
+                .into()
+        );
     }
 
     #[test]
