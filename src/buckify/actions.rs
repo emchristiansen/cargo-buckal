@@ -476,6 +476,9 @@ struct OwnedNames {
     filegroups: std::collections::BTreeSet<String>,
     exports: std::collections::BTreeSet<String>,
     emitted: std::collections::BTreeSet<String>,
+    /// Generation writes this file's standalone source exposure, a
+    /// `rust_filegroup` ([`crate::universe::STANDALONE_SRCS`]), and its load.
+    emits_rust_filegroup: bool,
     /// The `[package_macro]` call generation writes in this file.
     package_macro: Option<OwnedMacro>,
 }
@@ -516,6 +519,9 @@ impl OwnedNames {
                 .filter_map(Rule::name)
                 .map(str::to_owned)
                 .collect(),
+            emits_rust_filegroup: rules
+                .iter()
+                .any(|rule| matches!(rule, Rule::RustFileGroup(_))),
             package_macro: rules.iter().find_map(|rule| match rule {
                 Rule::PackageMacro(m) => Some(OwnedMacro {
                     bzl: m.bzl.clone(),
@@ -598,12 +604,30 @@ fn hand_written(buck_path: &Utf8Path, owned: &OwnedNames) -> Result<HandWritten,
             _ => None,
         })
         .collect();
+    // Whether a statement generation keeps names `rust_filegroup`: a hand-written
+    // call, or any other use, such as one inside a comprehension or a `def`.
+    let kept_names_rust_filegroup = statements.iter().zip(&marks).any(|(statement, &marked)| {
+        let text = &content[statement.span.clone()];
+        match &statement.kind {
+            TopLevelKind::Load(..) => false,
+            TopLevelKind::Call { function, name } => {
+                !removes_call(owned, function, name.as_deref(), marked, text)
+                    && text.contains(RUST_FILEGROUP)
+            }
+            TopLevelKind::Other => text.contains(RUST_FILEGROUP),
+        }
+    });
     let mut hand = HandWritten::default();
     for (statement, &marked) in statements.iter().zip(&marks) {
         let text = content[statement.with_comments.clone()].to_owned();
         if let TopLevelKind::Load(bzl, bindings) = &statement.kind
             && (bzl.starts_with("@buckal//")
-                || is_generated_rust_filegroup_load(bzl, bindings, owned, &kept_calls))
+                || is_generated_rust_filegroup_load(
+                    bzl,
+                    bindings,
+                    owned,
+                    kept_names_rust_filegroup,
+                ))
         {
             continue;
         }
@@ -634,13 +658,17 @@ fn hand_written(buck_path: &Utf8Path, owned: &OwnedNames) -> Result<HandWritten,
                 if let Some(name) = name
                     && !owned.emitted.contains(name)
                 {
+                    let owns = match function.as_str() {
+                        "filegroup" | "export_file" => format!(
+                            "every `{function}` rule of a first-party BUCK file that it writes (its own names and `export_files`)"
+                        ),
+                        "rust_filegroup" | "alias" => format!(
+                            "the `{function}` named `{name}` of a first-party BUCK file, which exposes the package to standalone universes"
+                        ),
+                        _ => format!("every `{function}` rule of a first-party BUCK file"),
+                    };
                     crate::buckal_warn!(format!(
-                        "{buck_path}: removing `{function}(name = \"{name}\")`: generation owns every `{function}` rule of a first-party BUCK file{} and no longer emits this one",
-                        if matches!(function.as_str(), "filegroup" | "export_file") {
-                            " that it writes (its own names and `export_files`)"
-                        } else {
-                            ""
-                        }
+                        "{buck_path}: removing `{function}(name = \"{name}\")`: generation owns {owns} and no longer emits this one"
                     ));
                 }
             }
@@ -661,27 +689,26 @@ fn hand_written(buck_path: &Utf8Path, owned: &OwnedNames) -> Result<HandWritten,
     Ok(hand)
 }
 
+/// The function the standalone source exposure calls.
+const RUST_FILEGROUP: &str = "rust_filegroup";
+
 /// Whether a load of `bzl` binding `bindings` is the `rust_filegroup` load
 /// generation writes beside a standalone universe's source exposure
 /// ([`crate::universe::STANDALONE_SRCS`]), so it is generation's to replace or
 /// remove: it loads exactly `rust_filegroup` from
-/// [`crate::universe::RUST_FILEGROUP_BZL`], and either generation emits the
-/// exposure again (and with it its own load), or no kept call still uses
-/// `rust_filegroup`. A hand-written `rust_filegroup` call that outlives the
-/// exposure keeps the load it needs.
+/// [`crate::universe::RUST_FILEGROUP_BZL`], and either generation writes the
+/// exposure again (and with it its own load), or no statement generation keeps
+/// names `rust_filegroup` (`kept_names_rust_filegroup`). A hand-written use that
+/// outlives the exposure keeps the load it needs.
 fn is_generated_rust_filegroup_load(
     bzl: &str,
     bindings: &[(String, String)],
     owned: &OwnedNames,
-    kept_calls: &[(&str, &str)],
+    kept_names_rust_filegroup: bool,
 ) -> bool {
-    const RUST_FILEGROUP: &str = "rust_filegroup";
     bzl == crate::universe::RUST_FILEGROUP_BZL
         && matches!(bindings, [(local, their)] if local == RUST_FILEGROUP && their == RUST_FILEGROUP)
-        && (owned.emitted.contains(crate::universe::STANDALONE_SRCS)
-            || !kept_calls
-                .iter()
-                .any(|(function, _)| *function == RUST_FILEGROUP))
+        && (owned.emits_rust_filegroup || !kept_names_rust_filegroup)
 }
 
 /// What the `[package_macro]` rules make of one top-level statement of a BUCK
@@ -1751,6 +1778,7 @@ mod tests {
         let hand_call = "rust_filegroup(\n    name = \"mine\",\n)";
         let emitting = super::OwnedNames {
             emitted: [crate::universe::STANDALONE_SRCS.to_owned()].into(),
+            emits_rust_filegroup: true,
             ..Default::default()
         };
         let not_emitting = super::OwnedNames::default();
@@ -1780,6 +1808,24 @@ mod tests {
         std::fs::write(&path, format!("{wider}\n\n{exposure}")).expect("write BUCK");
         let hand = super::hand_written(&path, &emitting).expect("kept");
         assert_eq!(hand.loads, vec![wider]);
+
+        // Fable, review 56, q1: a use inside a statement other than a call keeps
+        // the load.
+        let comprehension = "[rust_filegroup(name = n) for n in [\"a\", \"b\"]]";
+        std::fs::write(&path, format!("{load}\n\n{comprehension}\n")).expect("write BUCK");
+        let hand = super::hand_written(&path, &not_emitting).expect("kept");
+        assert_eq!(hand.loads, vec![load.clone()]);
+        assert_eq!(hand.statements, vec![comprehension.to_owned()]);
+
+        // q4: another kind of rule named like the exposure is no exposure, so a
+        // hand-written `rust_filegroup` keeps its load.
+        let named_like_exposure = super::OwnedNames {
+            emitted: [crate::universe::STANDALONE_SRCS.to_owned()].into(),
+            ..Default::default()
+        };
+        std::fs::write(&path, format!("{load}\n\n{hand_call}\n")).expect("write BUCK");
+        let hand = super::hand_written(&path, &named_like_exposure).expect("kept");
+        assert_eq!(hand.loads, vec![load]);
     }
 
     // PM-4 (Fable, review 36, probe 8): a load that binds the macro under another

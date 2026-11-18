@@ -126,8 +126,17 @@ impl Universe {
         let (dir, fragment) = rest.split_once('#')?;
         let (name, version) = match fragment.split_once('@') {
             Some((name, version)) => (name, version),
-            // Named after its directory: Cargo leaves the name out.
-            None => (dir.rsplit('/').next()?, fragment),
+            // Named after its directory: Cargo leaves the name out. The project's
+            // own root package (an empty `dir`) is named after the project root.
+            None => match dir.rsplit('/').next().filter(|name| !name.is_empty()) {
+                Some(name) => (name, fragment),
+                None => (
+                    project_root()
+                        .and_then(|root| root.file_name())
+                        .expect("generation selects the universe, and with it the project root, before it names a vendored path package"),
+                    fragment,
+                ),
+            },
         };
         Some(format!("{}/path/{name}/{version}", self.vendor_root()))
     }
@@ -195,7 +204,7 @@ fn enclosing_standalone(cwd: &Utf8Path, buck2_root: &Utf8Path) -> Result<Option<
         if relative.as_str().is_empty() {
             return Ok(None);
         }
-        if holds_file(dir, CONFIG_FILE)? && holds_file(dir, "Cargo.toml")? {
+        if holds_file(dir, "Cargo.toml")? && holds_file(dir, CONFIG_FILE)? {
             return Ok(Some(relative.to_owned()));
         }
     }
