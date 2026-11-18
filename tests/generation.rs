@@ -5820,3 +5820,45 @@ fn test_package_tables_leave_out_other_cells_and_ignored_paths() {
         ]
     );
 }
+
+#[test]
+fn test_package_macro_keeps_a_marked_load_while_a_kept_call_uses_it() {
+    // PM-5 (Fable, review 42, probes e1 and e2): a comment line or a blank line
+    // between the marker and the generated call; then the table is removed. The
+    // call is kept as hand-written, so its load is kept too, with a warning.
+    for between in ["# note: why this package exports\n", "\n"] {
+        let f = fixture();
+        write(
+            &f.ws.join("buckal.toml"),
+            &format!("{BUCKAL_TOML}{PACKAGE_MACRO_TABLE}"),
+        );
+        f.migrate(&[]);
+        let app = f.buck("app");
+        let call = format!("{PACKAGE_MACRO_MARKER}\ndeclare_inputs()\n");
+        assert_eq!(app.matches(&call).count(), 1, "{app}");
+        let edited = format!("{PACKAGE_MACRO_MARKER}\n{between}declare_inputs()\n");
+        write(&f.ws.join("app/BUCK"), &app.replace(&call, &edited));
+        write(&f.ws.join("buckal.toml"), BUCKAL_TOML);
+        let output = f.output(&["migrate"]);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        let app = f.buck("app");
+        assert!(
+            app.contains(&format!(
+                "{PACKAGE_MACRO_MARKER}\nload(\"//buck2:inputs.bzl\", \"declare_inputs\")\n"
+            )),
+            "{between:?}:\n{app}"
+        );
+        assert!(app.contains(&edited), "{between:?}:\n{app}");
+        assert!(
+            stderr.contains(
+                "app/BUCK: keeping the load of `declare_inputs` from `//buck2:inputs.bzl` that an earlier generation wrote from `[package_macro]`, because the kept call `declare_inputs()` still calls it"
+            ),
+            "{between:?}:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("app/BUCK: removing the `declare_inputs()` call"),
+            "{between:?}:\n{stderr}"
+        );
+    }
+}

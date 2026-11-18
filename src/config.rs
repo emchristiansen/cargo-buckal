@@ -234,7 +234,9 @@ pub struct RepoConfig {
 /// first-party load and call too, with `first_party_kwargs`, under the same
 /// takeover, marker and removal rules as a first-party BUCK file. Generation
 /// keeps the rest of that file byte for byte: the load goes directly below its
-/// last `load`, the call at its end. A `platforms/BUCK` without the `@generated`
+/// last `load`, the call at its end. A hand-written statement it takes over
+/// goes with its comments, as in a first-party BUCK file, except that the
+/// comments above the file's first statement (its header) stay. A `platforms/BUCK` without the `@generated`
 /// first line is the repository's own and is left alone.
 ///
 /// In a first-party BUCK file generation emits the macro's `load` and the call
@@ -253,7 +255,14 @@ pub struct RepoConfig {
 /// Generation writes [`crate::buck::PACKAGE_MACRO_MARKER`] on the line directly
 /// above the call and above its load. A later generation recognises a statement
 /// it wrote by that line, and removes the call and its load once the table is
-/// unset, or once the side that called the macro is switched off.
+/// unset, or once the side that called the macro is switched off. A comment line
+/// or a blank line written between the marker and the call unmarks the call,
+/// which is then kept as hand-written; its marked load is then kept too, with a
+/// warning, so the file never calls a name it no longer loads.
+///
+/// Labels are compared as text: `root//buck2:inputs.bzl` is not recognised as
+/// the same file as `//buck2:inputs.bzl`, so a load through another spelling is
+/// treated as a load of another file.
 ///
 /// `tables` names a root-relative `.bzl` path at which generation writes the
 /// repository's package tables (see `crate::buckify::tables`):

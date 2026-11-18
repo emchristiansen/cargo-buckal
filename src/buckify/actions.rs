@@ -496,8 +496,35 @@ fn hand_written(buck_path: &Utf8Path, owned: &OwnedNames) -> Result<HandWritten,
         .unwrap_or_exit_ctx(format!(
             "Failed to parse {buck_path}, whose hand-written content generation would replace"
         ));
+    let marks: Vec<bool> = statements
+        .iter()
+        .map(|statement| is_package_macro_marked(&content, statement))
+        .collect();
+    // The top-level calls this generation keeps, as `(function, call)`: a marked
+    // load an earlier generation wrote stays while one of them uses a name it binds.
+    let kept_calls: Vec<(&str, &str)> = statements
+        .iter()
+        .zip(&marks)
+        .filter_map(|(statement, &marked)| match &statement.kind {
+            TopLevelKind::Call { function, name }
+                if !removes_call(
+                    owned,
+                    function,
+                    name.as_deref(),
+                    marked,
+                    &content[statement.with_comments.clone()],
+                ) =>
+            {
+                Some((
+                    function.as_str(),
+                    content[statement.span.clone()].trim_end(),
+                ))
+            }
+            _ => None,
+        })
+        .collect();
     let mut hand = HandWritten::default();
-    for statement in statements {
+    for (statement, &marked) in statements.iter().zip(&marks) {
         let text = content[statement.with_comments.clone()].to_owned();
         if let TopLevelKind::Load(bzl, _) = &statement.kind
             && bzl.starts_with("@buckal//")
@@ -507,8 +534,9 @@ fn hand_written(buck_path: &Utf8Path, owned: &OwnedNames) -> Result<HandWritten,
         match package_macro_disposition(
             buck_path,
             &content,
-            &statement,
+            statement,
             owned.package_macro.as_ref(),
+            &kept_calls,
         )? {
             MacroDisposition::Drop => continue,
             MacroDisposition::KeepBindingMacro => {
@@ -523,11 +551,7 @@ fn hand_written(buck_path: &Utf8Path, owned: &OwnedNames) -> Result<HandWritten,
         match &statement.kind {
             TopLevelKind::Load(..) => hand.loads.push(text),
             TopLevelKind::Call { function, name }
-                if owned.owns(function, name.as_deref())
-                    // An `export_files` rule generation wrote, recognised by its
-                    // label even without a record of the earlier fixups.
-                    || function == "export_file"
-                        && text.contains(&format!("\"{}\"", crate::buck::EXPORT_FILES_LABEL)) =>
+                if removes_call(owned, function, name.as_deref(), marked, &text) =>
             {
                 // A rule generation owns but no longer emits (a removed target, or
                 // one written by hand in a kind generation owns) goes away: say so.
@@ -579,7 +603,9 @@ enum MacroDisposition {
 }
 
 /// The [`MacroDisposition`] of `statement` of `content`, the BUCK file at
-/// `buck_path`. An `Err` is a refusal: a load generation cannot reconcile with
+/// `buck_path`, given `kept_calls`, the top-level calls the file keeps, as
+/// `(function, call)`: a marked load stays while one of them uses a name it
+/// binds (PM-5). An `Err` is a refusal: a load generation cannot reconcile with
 /// the call it writes (the macro bound under another name, or the macro's name
 /// bound to something else).
 fn package_macro_disposition(
@@ -587,50 +613,28 @@ fn package_macro_disposition(
     content: &str,
     statement: &TopLevelStatement,
     owned: Option<&OwnedMacro>,
+    kept_calls: &[(&str, &str)],
 ) -> Result<MacroDisposition, String> {
     let marked = is_package_macro_marked(content, statement);
     match &statement.kind {
-        // The `[package_macro]` load an earlier generation wrote.
-        TopLevelKind::Load(..) if marked => Ok(MacroDisposition::Drop),
-        TopLevelKind::Load(bzl, bindings) => match owned {
-            // The macro bound under another local name: its calls are calls of
-            // the macro that generation does not recognise as such, so it would
-            // call the macro a second time.
-            Some(OwnedMacro {
-                bzl: macro_bzl,
-                function,
-                ..
-            }) if bzl == macro_bzl
-                && let Some((local, _)) = bindings
-                    .iter()
-                    .find(|(local, their)| their == function && local != function) =>
-            {
-                Err(format!(
-                    "{buck_path}: a hand-written load binds `{function}` of `{macro_bzl}`, the `[package_macro]` function generation calls here, under another name, `{local}`, so generation would call it a second time; load it as `{function}`, whose hand-written call generation then takes over, or remove the load and its calls. The file is left unchanged"
-                ))
+        // The `[package_macro]` load an earlier generation wrote, which no kept
+        // call uses.
+        TopLevelKind::Load(_, bindings)
+            if marked && marked_load_user(bindings, kept_calls).is_none() =>
+        {
+            Ok(MacroDisposition::Drop)
+        }
+        TopLevelKind::Load(bzl, bindings) => {
+            // A marked load that a kept call still uses: dropping it would leave
+            // the call calling a name nothing binds, so it is kept like a
+            // hand-written load (PM-5).
+            if marked && let Some((function, call)) = marked_load_user(bindings, kept_calls) {
+                crate::buckal_warn!(format!(
+                    "{buck_path}: keeping the load of `{function}` from `{bzl}` that an earlier generation wrote from `[package_macro]`, because the kept call `{call}` still calls it: generation removes a call only when the marker is on the line directly above it. Remove the call and the load by hand if the call should go"
+                ));
             }
-            Some(OwnedMacro {
-                bzl: macro_bzl,
-                function,
-                ..
-            }) if bindings.iter().any(|(local, _)| local == function) => {
-                let same = bzl == macro_bzl
-                    && bindings
-                        .iter()
-                        .any(|(local, their)| local == function && their == function);
-                if !same {
-                    return Err(format!(
-                        "{buck_path}: a hand-written load binds `{function}`, the `[package_macro]` function generation calls here, to something other than `{function}` of `{macro_bzl}`; rename the binding. The file is left unchanged"
-                    ));
-                }
-                Ok(if bindings.len() == 1 {
-                    MacroDisposition::Drop
-                } else {
-                    MacroDisposition::KeepBindingMacro
-                })
-            }
-            _ => Ok(MacroDisposition::Other),
-        },
+            hand_load_disposition(buck_path, bzl, bindings, owned)
+        }
         // The `[package_macro]` call an earlier generation wrote, which this one
         // no longer configures.
         TopLevelKind::Call { function, .. }
@@ -664,6 +668,96 @@ fn package_macro_disposition(
     }
 }
 
+/// The kept call, as `(function, call)`, that uses a name `bindings` (of a
+/// marked load) binds, if any.
+fn marked_load_user<'a>(
+    bindings: &[(String, String)],
+    kept_calls: &[(&'a str, &'a str)],
+) -> Option<(&'a str, &'a str)> {
+    kept_calls
+        .iter()
+        .find(|(function, _)| bindings.iter().any(|(local, _)| local == function))
+        .copied()
+}
+
+/// Whether the `[package_macro]` rules remove the top-level call of `function`,
+/// `marked` or not, when generation writes the macro call `owned` (or none): a
+/// marked call the table no longer configures, and every call of the macro.
+fn macro_removes_call(owned: Option<&OwnedMacro>, function: &str, marked: bool) -> bool {
+    match owned {
+        Some(owned) => owned.function == function || marked,
+        None => marked,
+    }
+}
+
+/// The [`MacroDisposition`] of a load of `bzl` with `bindings` that generation
+/// treats as hand-written, when it writes the macro call `owned` (or none).
+fn hand_load_disposition(
+    buck_path: &Utf8Path,
+    bzl: &str,
+    bindings: &[(String, String)],
+    owned: Option<&OwnedMacro>,
+) -> Result<MacroDisposition, String> {
+    match owned {
+        // The macro bound under another local name: its calls are calls of
+        // the macro that generation does not recognise as such, so it would
+        // call the macro a second time.
+        Some(OwnedMacro {
+            bzl: macro_bzl,
+            function,
+            ..
+        }) if bzl == macro_bzl
+            && let Some((local, _)) = bindings
+                .iter()
+                .find(|(local, their)| their == function && local != function) =>
+        {
+            Err(format!(
+                "{buck_path}: a hand-written load binds `{function}` of `{macro_bzl}`, the `[package_macro]` function generation calls here, under another name, `{local}`, so generation would call it a second time; load it as `{function}`, whose hand-written call generation then takes over, or remove the load and its calls. The file is left unchanged"
+            ))
+        }
+        Some(OwnedMacro {
+            bzl: macro_bzl,
+            function,
+            ..
+        }) if bindings.iter().any(|(local, _)| local == function) => {
+            let same = bzl == macro_bzl
+                && bindings
+                    .iter()
+                    .any(|(local, their)| local == function && their == function);
+            if !same {
+                return Err(format!(
+                    "{buck_path}: a hand-written load binds `{function}`, the `[package_macro]` function generation calls here, to something other than `{function}` of `{macro_bzl}`; rename the binding. The file is left unchanged"
+                ));
+            }
+            Ok(if bindings.len() == 1 {
+                MacroDisposition::Drop
+            } else {
+                MacroDisposition::KeepBindingMacro
+            })
+        }
+        _ => Ok(MacroDisposition::Other),
+    }
+}
+
+/// Whether generation removes (or replaces with its own) the top-level call of
+/// `function` named `name`, whose text with its leading comments is `text` and
+/// which is `marked` as written from `[package_macro]`: a marked call the table no
+/// longer configures, and every call generation owns.
+fn removes_call(
+    owned: &OwnedNames,
+    function: &str,
+    name: Option<&str>,
+    marked: bool,
+    text: &str,
+) -> bool {
+    marked && !owned.owns(function, None)
+        || owned.owns(function, name)
+        // An `export_files` rule generation wrote, recognised by its label even
+        // without a record of the earlier fixups.
+        || function == "export_file"
+            && text.contains(&format!("\"{}\"", crate::buck::EXPORT_FILES_LABEL))
+}
+
 /// The warning for a hand-written call `hand` of `function` (the statement alone,
 /// without its comments) in `buck_path` that generation replaces with its own
 /// `[package_macro]` call `owned`, when their arguments differ; `None` when
@@ -693,7 +787,8 @@ fn replaced_arguments_warning(
 /// between, is [`PACKAGE_MACRO_MARKER`], as generation writes it. Other comment
 /// lines and blank lines further up its comment block do not matter, and a
 /// marker separated from the statement by a blank line or another comment line
-/// marks nothing.
+/// marks nothing. [`hand_written`] keeps a marked load while a kept call still
+/// uses a name it binds.
 fn is_package_macro_marked(content: &str, statement: &TopLevelStatement) -> bool {
     content[statement.with_comments.start..statement.span.start]
         .strip_suffix('\n')
@@ -747,20 +842,43 @@ pub(crate) fn platforms_buck(
             .map(|(statements, _)| statements)
             .map_err(|error| format!("{buck_path}: cannot parse it: {error}"))
     };
-    // What goes: each dropped statement, from its marker (or, for a hand-written
-    // statement, its comments) to its end.
+    // What goes: each dropped statement, from its marker (a hand-written one
+    // with its comments, but for the first statement, below the file's header)
+    // to its end.
+    let statements = parse(content)?;
+    // The calls the file keeps: a marked load stays while one of them uses it.
+    let kept_calls: Vec<(&str, &str)> = statements
+        .iter()
+        .filter_map(|statement| match &statement.kind {
+            TopLevelKind::Call { function, .. }
+                if !macro_removes_call(
+                    owned.as_ref(),
+                    function,
+                    is_package_macro_marked(content, statement),
+                ) =>
+            {
+                Some((
+                    function.as_str(),
+                    content[statement.span.clone()].trim_end(),
+                ))
+            }
+            _ => None,
+        })
+        .collect();
     let mut drops: Vec<std::ops::Range<usize>> = Vec::new();
     let mut binds_macro = false;
-    for statement in parse(content)? {
-        match package_macro_disposition(buck_path, content, &statement, owned.as_ref())? {
+    for (index, statement) in statements.iter().enumerate() {
+        match package_macro_disposition(buck_path, content, statement, owned.as_ref(), &kept_calls)?
+        {
             MacroDisposition::Drop => {
-                let start = if is_package_macro_marked(content, &statement) {
+                let start = if is_package_macro_marked(content, statement) {
                     let above = content[..statement.span.start]
                         .strip_suffix('\n')
                         .expect("a marker line precedes a marked statement");
                     above.rfind('\n').map_or(0, |at| at + 1)
-                } else if statement.with_comments.start == 0 {
-                    // Its comments open the file, header and all: they stay.
+                } else if index == 0 {
+                    // The file's first statement: its comments are the file's
+                    // header, which stays.
                     content[..statement.span.start]
                         .rfind('\n')
                         .map_or(0, |at| at + 1)
@@ -1432,6 +1550,86 @@ mod tests {
         }
     }
 
+    // PM-5 (Fable, review 42, probes e1, e1s and e2): a comment line or a blank
+    // line between the marker and the generated call unmarks the call, which is
+    // kept as hand-written. Its marked load is kept with it, so the file does not
+    // call a name it no longer loads.
+    #[test]
+    fn test_package_macro_keeps_a_marked_load_while_a_kept_call_uses_it() {
+        let marker = crate::buck::PACKAGE_MACRO_MARKER;
+        let hand = "load(\"//other:defs.bzl\", \"kept_rule\")\n\nkept_rule(name = \"kept\")\n";
+        let generated = apply_to_root_package(Some(hand), package_macro_config());
+        let call = format!("{marker}\ndeclare_source_tree_inputs()\n");
+        let off = RepoConfig {
+            package_macro: crate::config::PackageMacroConfig {
+                first_party: false,
+                ..package_macro_config().package_macro
+            },
+            ..RepoConfig::default()
+        };
+        for between in ["# note: why this package exports\n", "\n"] {
+            assert_eq!(generated.matches(&call).count(), 1, "{generated}");
+            let edited = generated.replace(
+                &call,
+                &format!("{marker}\n{between}declare_source_tree_inputs()\n"),
+            );
+            // The table removed (e1, e2), or its first-party side switched off (e1s).
+            for (case, config) in [("removed", RepoConfig::default()), ("off", off.clone())] {
+                let content = apply_to_root_package(Some(&edited), config.clone());
+                assert!(
+                    content.contains(&format!("{marker}\n{MACRO_LOAD}\n")),
+                    "{between:?} {case}:\n{content}"
+                );
+                assert!(
+                    content.contains(&format!(
+                        "{marker}\n{between}declare_source_tree_inputs()\n"
+                    )),
+                    "{between:?} {case}:\n{content}"
+                );
+                assert!(content.contains("kept_rule(name = \"kept\")"), "{content}");
+                // A later generation keeps the pair as it is.
+                assert_eq!(
+                    apply_to_root_package(Some(&content), config),
+                    content,
+                    "{between:?} {case}"
+                );
+            }
+            // Configured again, the call is taken over and the file is the
+            // generated one.
+            assert_eq!(
+                apply_to_root_package(Some(&edited), package_macro_config()),
+                generated,
+                "{between:?}"
+            );
+        }
+    }
+
+    // PM-5's mirror (Fable, review 42, probe e3): a comment line between the marker
+    // and the generated load unmarks the load. Once the table is removed the
+    // marked call goes and the load stays, binding a name nothing calls.
+    #[test]
+    fn test_package_macro_unmarked_load_stays_when_its_marked_call_goes() {
+        let marker = crate::buck::PACKAGE_MACRO_MARKER;
+        let generated = apply_to_root_package(None, package_macro_config());
+        let load = format!("{marker}\n{MACRO_LOAD}\n");
+        assert_eq!(generated.matches(&load).count(), 1, "{generated}");
+        let edited = generated.replace(
+            &load,
+            &format!("{marker}\n# note: the inputs macro\n{MACRO_LOAD}\n"),
+        );
+        let content = apply_to_root_package(Some(&edited), RepoConfig::default());
+        assert!(
+            content.contains(&format!(
+                "{marker}\n# note: the inputs macro\n{MACRO_LOAD}\n"
+            )),
+            "{content}"
+        );
+        assert!(
+            !content.contains("declare_source_tree_inputs()"),
+            "{content}"
+        );
+    }
+
     // PM-4 (Fable, review 36, probe 8): a load that binds the macro under another
     // local name is refused, rather than calling the macro a second time.
     #[test]
@@ -1604,6 +1802,7 @@ mod tests {
             "{PLATFORMS_ASSET}\n{MACRO_LOAD}\n\n# by hand\ndeclare_source_tree_inputs(whole = True)\n"
         );
         let content = platforms_text(&hand, &config);
+        // The generated file: the hand call goes with its comment.
         assert_eq!(
             content,
             platforms_text(PLATFORMS_ASSET, &config),
@@ -1673,6 +1872,31 @@ mod tests {
         );
         assert_eq!(content.matches(MACRO_LOAD).count(), 1, "{content}");
         assert_eq!(platforms(&content, &platforms_config(&[])).unwrap(), None);
+    }
+
+    // PM-5 in platforms/BUCK: a blank line or a comment line between the marker
+    // and the call unmarks the call, which is kept; so is its marked load.
+    #[test]
+    fn test_platforms_buck_keeps_a_marked_load_while_a_kept_call_uses_it() {
+        let marker = crate::buck::PACKAGE_MACRO_MARKER;
+        let config = platforms_config(&[]);
+        let generated = platforms_text(PLATFORMS_ASSET, &config);
+        let call = format!("{marker}\ndeclare_source_tree_inputs()\n");
+        for between in ["# note\n", "\n"] {
+            let edited = generated.replace(
+                &call,
+                &format!("{marker}\n{between}declare_source_tree_inputs()\n"),
+            );
+            let unset = crate::config::PackageMacroConfig::default();
+            let kept = platforms_text(&edited, &unset);
+            assert_eq!(kept, edited, "{between:?}");
+            assert!(
+                kept.contains(&format!("{marker}\n{MACRO_LOAD}\n")),
+                "{kept}"
+            );
+            // Configured again, the call is taken over: the generated file.
+            assert_eq!(platforms_text(&edited, &config), generated, "{between:?}");
+        }
     }
 
     #[test]
