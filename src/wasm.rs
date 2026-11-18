@@ -18,7 +18,9 @@
 //! (a `rust_binary` compiled with `--test`, so nothing runs it natively), its
 //! wasm32 `configured_alias` `wasm-test-module-wasm32[.<name>]`, and the buckal
 //! cell's `wasm_browser_test(name = "unittest-browser[.<name>]", wasm = <alias>)`,
-//! which runs it in a browser.
+//! which runs it in a browser. Generation owns every `wasm_browser_test` call in a
+//! BUCK file it writes, and a declaration has no `timeout_seconds`, so a generated
+//! browser test always has the rule's default timeout.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -99,9 +101,11 @@ pub fn module_alias(key: &str) -> String {
 /// The key of a package's `wasm-test` graph, which names its libraries' variants
 /// (`<lib>-wasm-<key>`): `<package>__test`, or `<package>__test__<variant>`. It
 /// holds only letters, digits, `_` and `-`, so the crate names derived from it
-/// (variant build scripts) are Rust identifiers, and no module key (`<package>`,
-/// `<package>.<variant>`) is spelled like it unless a package is named so, which
-/// [`resolve_tests`] refuses.
+/// (variant build scripts) are Rust identifiers. Two graphs can share a key
+/// (`a` with variant `b`, and `a__test__b` without one), and a module key
+/// (`<package>`, `<package>.<variant>`) can be spelled like one when a package is
+/// named so. [`resolve_tests`] refuses the first, and the generation refuses the
+/// second where the two graphs share a library.
 pub fn test_key(package: &str, variant: Option<&str>) -> String {
     match variant {
         None => format!("{package}__test"),
@@ -609,6 +613,7 @@ pub fn resolve_tests(
 ) -> Result<TestVariants> {
     let mut resolved = TestVariants::default();
     let mut seen = BTreeSet::new();
+    let mut keys = BTreeMap::new();
     for tested in test_packages {
         if !seen.insert(tested) {
             bail!("`[wasm] test_packages`: `{tested}` is listed twice");
@@ -645,6 +650,7 @@ pub fn resolve_tests(
         }
         for (variant, graph) in declaration.graphs() {
             let key = test_key(tested, variant);
+            claim_test_key(&mut keys, &key, tested, variant)?;
             let (libs, test) = resolve_package_test_graph(
                 manifest_path,
                 packages,
@@ -699,6 +705,27 @@ pub fn resolve_tests(
     Ok(resolved)
 }
 
+/// Records that `package`'s graph `variant` uses `key`, refusing a key that an
+/// earlier graph already uses: the second graph's library variants would otherwise
+/// replace the first's without a word.
+fn claim_test_key(
+    keys: &mut BTreeMap<String, String>,
+    key: &str,
+    package: &str,
+    variant: Option<&str>,
+) -> Result<()> {
+    let graph = match variant {
+        None => format!("`{package}`'s default `wasm-test` graph"),
+        Some(variant) => format!("`{package}`'s `wasm-test` variant `{variant}`"),
+    };
+    if let Some(earlier) = keys.insert(key.to_owned(), graph.clone()) {
+        bail!(
+            "`[wasm] test_packages`: {graph} and {earlier} both have the test graph key `{key}`; rename the package or the variant"
+        );
+    }
+    Ok(())
+}
+
 /// What [`resolve_tests`] resolves.
 #[derive(Debug, Default)]
 pub struct TestVariants {
@@ -719,8 +746,9 @@ pub fn package_dir(manifest: &Utf8PathBuf, root: &Utf8PathBuf) -> Option<String>
 
 #[cfg(test)]
 mod tests {
-    use super::{profile_flags, test_graph, test_key, test_rule_name};
+    use super::{claim_test_key, profile_flags, test_graph, test_key, test_rule_name};
     use crate::platform_features::UnitProfile;
+    use std::collections::BTreeMap;
 
     #[test]
     fn test_wasm_test_keys_and_names() {
@@ -735,6 +763,28 @@ mod tests {
         assert_eq!(
             test_rule_name("unittest-browser", Some("voice")),
             "unittest-browser.voice"
+        );
+    }
+
+    #[test]
+    fn test_wasm_test_key_collision_is_refused() {
+        // `a` with variant `b` and `a__test__b` without one share `a__test__b__test`.
+        assert_eq!(test_key("a", Some("b__test")), test_key("a__test__b", None));
+        let mut keys = BTreeMap::new();
+        claim_test_key(
+            &mut keys,
+            &test_key("a", Some("b__test")),
+            "a",
+            Some("b__test"),
+        )
+        .unwrap();
+        claim_test_key(&mut keys, &test_key("a", None), "a", None).unwrap();
+        let error = claim_test_key(&mut keys, &test_key("a__test__b", None), "a__test__b", None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "`[wasm] test_packages`: `a__test__b`'s default `wasm-test` graph and `a`'s `wasm-test` variant `b__test` both have the test graph key `a__test__b__test`; rename the package or the variant"
         );
     }
 

@@ -283,8 +283,6 @@ pub struct PackageTestUnit {
     /// Its dependencies (`PackageId::repr`), the package itself included when its
     /// library is linked in.
     pub deps: BTreeSet<String>,
-    /// Build dependencies of the package's build script, if it has one.
-    pub build: BTreeSet<String>,
     pub profile: UnitProfile,
 }
 
@@ -369,7 +367,6 @@ pub fn resolve_package_test_graph(
             Some(PackageTestUnit {
                 features: target.features.get(package).cloned().unwrap_or_default(),
                 deps: deps.role(EdgeRole::Dev).clone(),
-                build: deps.role(EdgeRole::Build).clone(),
                 profile: profile.clone(),
             })
         }
