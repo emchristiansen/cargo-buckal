@@ -678,6 +678,14 @@ pub struct PackageFixup {
     /// refused.
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub tests: Map<String, TestFixup>,
+    /// Further `rust_test` rules over the library's unit tests, one per name: each
+    /// is `unittest.<name>`, compiled exactly as `unittest` is, so that a subset of
+    /// the same cases can run in its own process with its own `[fixups.<pkg>.tests."unittest.<name>"]`
+    /// arguments, run-time environment and resources. A package without unit tests,
+    /// or a name that is empty or holds anything but ASCII letters, digits and `_`,
+    /// is refused.
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub unit_test_variants: Set<String>,
     /// `target_compatible_with` constraints (or config settings) of the package's
     /// libraries (every `rust_library`, including its variants), binaries and build
     /// scripts (the build script binaries and their `buildscript_run`), e.g. to keep
@@ -817,6 +825,9 @@ pub struct TestFixup {
     /// `test_runtime_tools`; `""` gives this test none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_tools: Option<String>,
+    /// Run-time inputs of this test alone, after the package's `test_resources`.
+    #[serde(skip_serializing_if = "Set::is_empty")]
+    pub resources: Set<String>,
 }
 
 /// Test arguments (e.g. a narrowing selection such as `--declared-skip-substring
