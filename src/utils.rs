@@ -647,7 +647,8 @@ impl<T, E: std::fmt::Display> UnwrapOrExit<T> for Result<T, E> {
         match self {
             Ok(value) => value,
             Err(error) => {
-                buckal_error!(error);
+                // `{:#}`: an anyhow error's whole chain, not only its outermost message.
+                buckal_error!("{:#}", error);
                 std::process::exit(1);
             }
         }
@@ -657,7 +658,7 @@ impl<T, E: std::fmt::Display> UnwrapOrExit<T> for Result<T, E> {
         match self {
             Ok(value) => value,
             Err(error) => {
-                buckal_error!("{}:\n{}", context, error);
+                buckal_error!("{}:\n{:#}", context, error);
                 std::process::exit(1);
             }
         }
