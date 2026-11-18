@@ -1001,6 +1001,10 @@ fn wasm_variant_rules(
             ..Default::default()
         };
         let name = wasm_variant_name(lib_name, module);
+        let bin_node = BuckalNode {
+            platform_features: resolution.clone(),
+            ..node.clone()
+        };
         let mut variant = variant_rules(
             node,
             resolution,
@@ -1014,6 +1018,31 @@ fn wasm_variant_rules(
             library.rustc_flags.extend(wasm.rustc_flags.iter().cloned());
         }
         if wasm.root
+            && let Some(platform) = &ctx.repo_config.wasm.platform
+            && let Some(bin) = &wasm.bin
+        {
+            // The module is the package's binary `bin`, compiled for wasm32 with
+            // this graph's dependencies, its own library as this variant, and the
+            // profile's flags with the link-time ones.
+            if let Some(bin_target) = node
+                .targets
+                .iter()
+                .find(|t| t.name == bin.name && t.kind.contains(&TargetKind::Bin))
+            {
+                let binary_name = wasm_variant_name(&bin.name, module);
+                let mut binary =
+                    emit_rust_binary(&bin_node, bin_target, manifest_dir, &binary_name, ctx);
+                binary.rustc_flags.extend(bin.rustc_flags.iter().cloned());
+                binary.deps_mut().insert(format!(":{name}"));
+                variant.push(Rule::RustBinary(binary));
+                variant.push(Rule::ConfiguredAlias(crate::buck::ConfiguredAlias {
+                    name: crate::wasm::bin_module_alias(module),
+                    actual: format!(":{binary_name}"),
+                    platform: platform.clone(),
+                    visibility: Set::from(["PUBLIC".to_owned()]),
+                }));
+            }
+        } else if wasm.root
             && let Some(platform) = &ctx.repo_config.wasm.platform
         {
             let alias = crate::wasm::module_alias(module);

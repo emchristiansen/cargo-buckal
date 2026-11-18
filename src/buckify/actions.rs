@@ -551,11 +551,13 @@ impl OwnedNames {
             ("export_file", Some(name)) => self.exports.contains(name),
             ("rust_filegroup", Some(name)) => name == crate::universe::STANDALONE_SRCS,
             ("alias", Some(name)) => name == crate::universe::STANDALONE_MANIFEST,
-            ("configured_alias", Some(name)) => {
-                [crate::wasm::MODULE_ALIAS, crate::wasm::TEST_MODULE_ALIAS]
-                    .iter()
-                    .any(|alias| name == *alias || name.starts_with(&format!("{alias}.")))
-            }
+            ("configured_alias", Some(name)) => [
+                crate::wasm::MODULE_ALIAS,
+                crate::wasm::BIN_MODULE_ALIAS,
+                crate::wasm::TEST_MODULE_ALIAS,
+            ]
+            .iter()
+            .any(|alias| name == *alias || name.starts_with(&format!("{alias}."))),
             _ => GENERATED_RULE_KINDS.contains(&function),
         }
     }

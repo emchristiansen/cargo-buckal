@@ -450,8 +450,13 @@ impl BuckalContext {
                     .ok()
                     .flatten()
                     .expect("a module's declaration was read");
-                for (key, _, _) in declaration.modules(module) {
-                    wasm_modules.insert(key, dir.clone());
+                // A binary module (`bin`) has no `[cdylib]` output for a test's
+                // `run_env` to name, so a test-env declaration of one is refused
+                // as a module `[wasm] packages` does not build.
+                if declaration.bin.is_none() {
+                    for (key, _, _) in declaration.modules(module) {
+                        wasm_modules.insert(key, dir.clone());
+                    }
                 }
             }
             for id in &first_party {
