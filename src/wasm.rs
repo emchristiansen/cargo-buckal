@@ -758,8 +758,10 @@ pub fn resolve_tests(
                     tests: graph.tests.clone(),
                     labels: graph.labels.iter().cloned().collect(),
                     integration: None,
+                    variants_key: None,
                 },
             );
+            let graph_libs = libs.clone();
             insert_test_variants(&mut resolved, libs, &key, platform)?;
             for target in &graph.integration_tests {
                 let declared = package.targets.iter().any(|t| {
@@ -789,6 +791,23 @@ pub fn resolve_tests(
                 let (mut rustc_flags, root_flags) = profile_flags(&test.profile)
                     .with_context(|| format!("`[wasm] test_packages`: `{it_key}`: `{tested}`"))?;
                 rustc_flags.extend(root_flags);
+                // Cargo resolves features for the package and its dev-dependencies,
+                // not per test target, so an integration test's graph is normally the
+                // library unit tests' graph plus the package's own library. Then its
+                // module uses that graph's variants (`key`), with the package's
+                // library added to them, rather than a copy of every library under
+                // its own key. Any difference keeps the target's own key.
+                let variants_key = if shares_graph(&libs, &graph_libs, id) {
+                    let own: HashMap<_, _> = libs
+                        .into_iter()
+                        .filter(|(pkg, _)| pkg == id && !graph_libs.contains_key(pkg))
+                        .collect();
+                    insert_test_variants(&mut resolved, own, &key, platform)?;
+                    Some(key.clone())
+                } else {
+                    insert_test_variants(&mut resolved, libs, &it_key, platform)?;
+                    None
+                };
                 resolved.tests.entry(id.clone()).or_default().insert(
                     it_key.clone(),
                     WasmTest {
@@ -799,9 +818,9 @@ pub fn resolve_tests(
                         tests: Vec::new(),
                         labels: graph.labels.iter().cloned().collect(),
                         integration: Some(target.clone()),
+                        variants_key,
                     },
                 );
-                insert_test_variants(&mut resolved, libs, &it_key, platform)?;
             }
         }
     }
@@ -815,9 +834,27 @@ pub fn resolve_tests(
     Ok(resolved)
 }
 
-/// Records that `package`'s graph `variant` uses `key`, refusing a key that an
-/// earlier graph already uses: the second graph's library variants would otherwise
-/// replace the first's without a word.
+/// Whether an integration test's graph `libs` is the library unit tests' graph
+/// `graph_libs` plus the package `id`'s own library: every other library equal, and
+/// `id`'s, where the unit tests' graph builds it too, equal.
+fn shares_graph(
+    libs: &HashMap<PackageId, crate::platform_features::PackageGraphLib>,
+    graph_libs: &HashMap<PackageId, crate::platform_features::PackageGraphLib>,
+    id: &PackageId,
+) -> bool {
+    let others = |m: &HashMap<PackageId, crate::platform_features::PackageGraphLib>| {
+        m.iter()
+            .filter(|(pkg, _)| *pkg != id)
+            .map(|(pkg, lib)| (pkg.clone(), lib.clone()))
+            .collect::<HashMap<_, _>>()
+    };
+    libs.contains_key(id)
+        && others(libs) == others(graph_libs)
+        && graph_libs
+            .get(id)
+            .is_none_or(|lib| Some(lib) == libs.get(id))
+}
+
 /// Give every library of a resolved `wasm-test` graph its `<lib>-wasm-<key>` variant.
 fn insert_test_variants(
     resolved: &mut TestVariants,
@@ -844,6 +881,9 @@ fn insert_test_variants(
     Ok(())
 }
 
+/// Records that `package`'s graph `variant` uses `key`, refusing a key that an
+/// earlier graph already uses: the second graph's library variants would otherwise
+/// replace the first's without a word.
 fn claim_test_key(
     keys: &mut BTreeMap<String, String>,
     key: &str,

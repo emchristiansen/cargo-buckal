@@ -1145,6 +1145,8 @@ fn wasm_test_rules(
                 target
             }
         };
+        // The graph whose library variants the module's dependencies use.
+        let variants_key = test.variants_key.as_deref().unwrap_or(key.as_str());
         let rule_name = |base: &str| match &test.integration {
             None => test_rule_name(base, variant),
             Some(name) => integration_rule_name(name, base, variant),
@@ -1163,7 +1165,7 @@ fn wasm_test_rules(
                 ..Default::default()
             },
             host_variant_deps: node.platform_features.host_variant_deps.clone(),
-            wasm_rules: Some(key.clone()),
+            wasm_rules: Some(variants_key.to_owned()),
             ..Default::default()
         };
         let test_node = BuckalNode {
@@ -1177,7 +1179,7 @@ fn wasm_test_rules(
         if self_linked {
             binary
                 .deps
-                .insert(format!(":{}", wasm_variant_name(lib_name, key)));
+                .insert(format!(":{}", wasm_variant_name(lib_name, variants_key)));
         }
         let alias = rule_name(TEST_MODULE_ALIAS);
         rules.push(Rule::RustBinary(binary));

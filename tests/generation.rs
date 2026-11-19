@@ -3294,8 +3294,9 @@ fn test_a_self_dev_dependency_links_the_library_into_its_unit_tests() {
     );
     write(&f.ws.join("selfie/tests/it.rs"), "");
     // Without a self dev-dependency, Cargo does not link the library into its
-    // own unit tests.
+    // own unit tests, even though its integration test links it (Fable review 127).
     write(&f.ws.join("plain/Cargo.toml"), &manifest("plain", ""));
+    write(&f.ws.join("plain/tests/it.rs"), "");
     write(
         &f.ws.join("plain/src/lib.rs"),
         "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n}\n",
@@ -3321,6 +3322,7 @@ fn test_a_self_dev_dependency_links_the_library_into_its_unit_tests() {
     assert!(top_deps(rule(&selfie, "selfie")).is_empty(), "{selfie}");
     let plain = f.buck("plain");
     assert!(top_deps(rule(&plain, "unittest")).is_empty(), "{plain}");
+    assert!(!plain.contains("plain-test"), "{plain}");
 }
 
 #[test]
@@ -5411,8 +5413,9 @@ fn test_wasm_test_integration_targets_get_modules_of_their_own() {
     );
 
     // The integration test's module: its own crate root and crate name with
-    // `--test`, its graph's dependencies as that graph's variants, and the
-    // library as that graph builds it.
+    // `--test`, and the library as its graph builds it. Its graph is the library
+    // unit tests' graph plus the library, so it uses that graph's variants, with
+    // the library added, rather than copies of its own (Fable review 127).
     let module = rule(&site, "test_about-wasm-test-module");
     for part in [
         "    crate = \"test_about\",\n",
@@ -5426,15 +5429,24 @@ fn test_wasm_test_integration_targets_get_modules_of_their_own() {
     assert_eq!(
         top_deps(module),
         [
-            "//d:d-wasm-site__test__it__test_about",
-            "//dv:dv-wasm-site__test__it__test_about",
-            "//wt:wt-wasm-site__test__it__test_about",
-            ":site-wasm-site__test__it__test_about"
+            "//d:d-wasm-site__test",
+            "//dv:dv-wasm-site__test",
+            "//wt:wt-wasm-site__test",
+            ":site-wasm-site__test"
         ],
         "{module}"
     );
-    let lib = rule(&site, "site-wasm-site__test__it__test_about");
+    let lib = rule(&site, "site-wasm-site__test");
     assert!(!lib.contains("--test"), "{lib}");
+    // The library unit tests' module does not link it.
+    assert!(
+        !top_deps(rule(&site, "wasm-test-module")).contains(&":site-wasm-site__test"),
+        "{site}"
+    );
+    for package in ["site", "d", "dv", "wt", "v"] {
+        let buck = f.buck(package);
+        assert!(!buck.contains("__it__"), "{package}: {buck}");
+    }
     assert!(
         site.contains(&format!(
             "configured_alias(\n    name = \"test_about-wasm-test-module-wasm32\",\n    actual = \":test_about-wasm-test-module\",\n    platform = \"{platform}\",\n    visibility = [\"PUBLIC\"],\n)\n"
@@ -5455,7 +5467,7 @@ fn test_wasm_test_integration_targets_get_modules_of_their_own() {
         "{voice}"
     );
     assert!(
-        top_deps(voice).contains(&"//v:v-wasm-site__test__voice__it__test_about"),
+        top_deps(voice).contains(&"//v:v-wasm-site__test__voice"),
         "{voice}"
     );
     assert!(
