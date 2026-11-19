@@ -536,7 +536,7 @@ impl OwnedNames {
     /// Whether generation owns the call of `function` named `name`: every call of a
     /// Rust, build-script, vendoring, `wasm_sha256` or `wasm_browser_test` rule
     /// kind, the `filegroup` and `export_file` calls it writes, and the modules' and
-    /// test-mode modules' `configured_alias`es.
+    /// test-mode modules' `configured_alias`es (integration-test targets' included).
     /// An owned call generation does not emit is removed, with a warning.
     fn owns(&self, function: &str, name: Option<&str>) -> bool {
         if self
@@ -551,13 +551,21 @@ impl OwnedNames {
             ("export_file", Some(name)) => self.exports.contains(name),
             ("rust_filegroup", Some(name)) => name == crate::universe::STANDALONE_SRCS,
             ("alias", Some(name)) => name == crate::universe::STANDALONE_MANIFEST,
-            ("configured_alias", Some(name)) => [
+            ("configured_alias", Some(name)) => {
+                [
                 crate::wasm::MODULE_ALIAS,
                 crate::wasm::BIN_MODULE_ALIAS,
                 crate::wasm::TEST_MODULE_ALIAS,
             ]
             .iter()
-            .any(|alias| name == *alias || name.starts_with(&format!("{alias}."))),
+            .any(|alias| name == *alias || name.starts_with(&format!("{alias}.")))
+                // An integration-test target's test-mode module alias,
+                // `<target>-wasm-test-module-wasm32[.<variant>]`.
+                || name
+                    .split_once('.')
+                    .map_or(name, |(base, _)| base)
+                    .ends_with(&format!("-{}", crate::wasm::TEST_MODULE_ALIAS))
+            }
             _ => GENERATED_RULE_KINDS.contains(&function),
         }
     }

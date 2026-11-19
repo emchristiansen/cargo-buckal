@@ -445,7 +445,10 @@ impl PackageMacroConfig {
 /// declared `features`, from Cargo's own `cargo test -p <package> --lib --features
 /// <features> --target wasm32-unknown-unknown` graph. `--lib` names the library
 /// explicitly, so a listed package with `[lib] test = false` still gets its browser
-/// test (and no native `unittest`). See `crate::wasm` for what is emitted.
+/// test (and no native `unittest`). A graph's `integration-tests` names
+/// integration-test targets, each compiled from its own `cargo test -p <package>
+/// --test <name>` graph and run in a browser test of its own. See `crate::wasm` for
+/// what is emitted.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct WasmConfig {
@@ -455,7 +458,8 @@ pub struct WasmConfig {
     /// `root//buck2/platforms/wasm:wasm32_unknown_unknown`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
-    /// Packages whose library unit tests run in a browser (`wasm-test`).
+    /// Packages whose library unit tests, and declared integration-test targets,
+    /// run in a browser (`wasm-test`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub test_packages: Vec<String>,
     /// The target triple the modules are built for: `wasm32-unknown-unknown`

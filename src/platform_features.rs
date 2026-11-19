@@ -287,6 +287,15 @@ pub struct WasmTest {
     pub tests: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub labels: BTreeSet<String>,
+    /// The integration-test target this unit is the harness of; `None`: the
+    /// library's unit tests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integration: Option<String>,
+    /// The test graph key whose library variants this unit's dependencies use,
+    /// where that is not its own key: an integration test whose graph is its
+    /// package's library unit-test graph plus the package's own library.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variants_key: Option<String>,
 }
 
 /// The library unit-test unit of a package's own test graph.
@@ -357,30 +366,48 @@ pub fn resolve_package_graph(
 /// <triple> --features <features>`, by package, and the package's library unit-test
 /// unit (`None` when Cargo compiles none, as for a package without a library; `--lib`
 /// names the library explicitly, so `[lib] test = false` still compiles its unit tests).
+/// With `integration`, the graph is `--test <integration>`'s instead and the unit is
+/// that integration-test target's harness.
 pub fn resolve_package_test_graph(
     manifest_path: Option<&str>,
     packages: &HashMap<PackageId, Package>,
     package: &PackageId,
     name: &str,
     features: &[String],
+    integration: Option<&str>,
     triple: &str,
 ) -> Result<(HashMap<PackageId, PackageGraphLib>, Option<PackageTestUnit>)> {
     let output = run_unit_graph(
         manifest_path,
         triple,
-        GraphShape::PackageTest(name, features),
+        GraphShape::PackageTest(name, features, integration),
     )
-    .with_context(|| format!("failed to resolve `{name}`'s own test graph for `{triple}`"))?;
+    .with_context(|| match integration {
+        None => format!("failed to resolve `{name}`'s own test graph for `{triple}`"),
+        Some(target) => {
+            format!("failed to resolve `{name}`'s test `{target}`'s own graph for `{triple}`")
+        }
+    })?;
     let parsed = parse_unit_graph(&output, packages)
         .with_context(|| format!("failed to read Cargo's unit test graph of `{name}`"))?;
     let target = parsed.target;
-    let test = match target.test_profiles.get(package) {
+    let profiles = match integration {
+        None => &target.test_profiles,
+        Some(_) => &target.integration_profiles,
+    };
+    let test = match profiles.get(package) {
         None => None,
         Some(profile) => {
             let deps = target.deps.get(package).cloned().unwrap_or_default();
+            let mut deps = deps.role(EdgeRole::Dev).clone();
+            // An integration test always links the package's own library, as this
+            // graph builds it.
+            if integration.is_some() {
+                deps.insert(package.repr.clone());
+            }
             Some(PackageTestUnit {
                 features: target.features.get(package).cloned().unwrap_or_default(),
-                deps: deps.role(EdgeRole::Dev).clone(),
+                deps,
                 profile: profile.clone(),
             })
         }
@@ -714,8 +741,9 @@ enum GraphShape<'a> {
     /// the package's own graph.
     Package(&'a str, &'a [String], &'a str),
     /// `cargo test -p <package> --lib --no-run`, with these `--features`: the
-    /// package's own graph of its library unit tests.
-    PackageTest(&'a str, &'a [String]),
+    /// package's own graph of its library unit tests; with an integration-test
+    /// target, `--test <target>` instead of `--lib`: that target's own graph.
+    PackageTest(&'a str, &'a [String], Option<&'a str>),
 }
 
 /// What a unit graph compiles besides each package's resolution.
@@ -1148,8 +1176,13 @@ fn run_unit_graph(manifest_path: Option<&str>, triple: &str, shape: GraphShape) 
             }
             "cargo build -p"
         }
-        GraphShape::PackageTest(package, features) => {
-            cmd.args(["test", "-p", package, "--lib", "--no-run"]);
+        GraphShape::PackageTest(package, features, integration) => {
+            cmd.args(["test", "-p", package]);
+            match integration {
+                None => cmd.arg("--lib"),
+                Some(target) => cmd.args(["--test", target]),
+            };
+            cmd.arg("--no-run");
             if !features.is_empty() {
                 cmd.args(["--features", &features.join(",")]);
             }
@@ -1214,6 +1247,9 @@ pub(crate) struct ContextTree {
     pub profiles: HashMap<PackageId, UnitProfile>,
     /// The profile of each package's library unit-test unit in this context.
     pub test_profiles: HashMap<PackageId, UnitProfile>,
+    /// The profile of each package's integration-test unit in this context, which
+    /// only a package's own `--test <name>` graph reads (it holds one such unit).
+    pub integration_profiles: HashMap<PackageId, UnitProfile>,
 }
 
 /// The profile Cargo resolved for one unit (`--unit-graph`'s `profile`).
@@ -1298,6 +1334,11 @@ impl Unit {
         })
     }
 
+    /// A unit of one of the package's integration-test targets (`tests/<name>.rs`).
+    fn is_integration_test_target(&self) -> bool {
+        self.target.kind.iter().any(|k| k == "test")
+    }
+
     /// The role of this unit's dependencies: tests and examples see dev-dependencies,
     /// the library and binaries normal ones.
     fn edge_role(&self) -> EdgeRole {
@@ -1363,13 +1404,24 @@ pub(crate) fn parse_unit_graph(
         {
             context.test_profiles.insert(id.clone(), profile.clone());
         }
+        if u.mode == "test"
+            && u.is_integration_test_target()
+            && let Some(profile) = &u.profile
+        {
+            context
+                .integration_profiles
+                .insert(id.clone(), profile.clone());
+        }
         let deps = context.deps.entry(id).or_default();
         let role = u.edge_role();
         for dep in &u.dependencies {
             let v = unit(dep.index)?;
             // A dev-dependency of the package on itself: Cargo links the library
             // (built as the tests resolve it) into the library's own unit-test
-            // harness, under its crate name. Recorded as a dev edge to itself.
+            // harness, under its crate name. Recorded as a dev edge to itself. An
+            // integration test's link to its own library is not recorded here: the
+            // native unit tests read this edge (`resolve_package_test_graph` adds
+            // that link to the integration-test unit alone).
             if v.pkg_id == u.pkg_id && u.mode == "test" && u.is_lib_target() && v.is_lib_build() {
                 deps.dev.insert(u.pkg_id.clone());
                 continue;

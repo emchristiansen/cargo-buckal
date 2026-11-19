@@ -25,7 +25,13 @@
 //! (a `rust_binary` compiled with `--test`, so nothing runs it natively), its
 //! wasm32 `configured_alias` `wasm-test-module-wasm32[.<name>]`, and the buckal
 //! cell's `wasm_browser_test(name = "unittest-browser[.<name>]", wasm = <alias>)`,
-//! which runs it in a browser. Generation owns every `wasm_browser_test` call in a
+//! which runs it in a browser. A graph's `integration-tests` names integration-test
+//! targets of the package (`tests/<name>.rs`, distinct from `tests`, which names
+//! test functions): each is compiled for wasm32 from Cargo's own `cargo test -p
+//! <package> --test <name> --target wasm32-unknown-unknown --features <features>`
+//! graph, keyed [`integration_test_key`], as the module `<name>-wasm-test-module[.<variant>]`
+//! with the alias `<name>-wasm-test-module-wasm32[.<variant>]` and the browser test
+//! `<name>-browser[.<variant>]`. Generation owns every `wasm_browser_test` call in a
 //! BUCK file it writes, and a declaration has no `timeout_seconds`, so a generated
 //! browser test always has the rule's default timeout.
 
@@ -59,6 +65,9 @@ pub const TEST_MODULE_ALIAS: &str = "wasm-test-module-wasm32";
 
 /// The name of a package's browser test (`wasm_browser_test`).
 pub const BROWSER_TEST: &str = "unittest-browser";
+
+/// The suffix of an integration-test target's browser test, `<target>-browser`.
+pub const INTEGRATION_BROWSER_TEST: &str = "browser";
 
 /// The buckal cell file defining `wasm_browser_test`.
 pub const BROWSER_TEST_BZL: &str = "@buckal//:wasm_browser_test.bzl";
@@ -137,6 +146,18 @@ pub fn test_key(package: &str, variant: Option<&str>) -> String {
     }
 }
 
+/// The key of integration-test target `target`'s graph within the `wasm-test` graph
+/// `graph_key`: `<graph_key>__it__<target>`, with `-` in the target's name spelled `_`.
+pub fn integration_test_key(graph_key: &str, target: &str) -> String {
+    format!("{graph_key}__it__{}", target.replace('-', "_"))
+}
+
+/// The rule name of integration-test target `target`'s `base` rule (a module, its
+/// alias or its browser test) for a `wasm-test` variant: `<target>-<base>[.<variant>]`.
+pub fn integration_rule_name(target: &str, base: &str, variant: Option<&str>) -> String {
+    test_rule_name(&format!("{target}-{base}"), variant)
+}
+
 /// The rule name `base` for a `wasm-test` variant: `base`, or `base.<variant>`.
 pub fn test_rule_name(base: &str, variant: Option<&str>) -> String {
     match variant {
@@ -145,13 +166,15 @@ pub fn test_rule_name(base: &str, variant: Option<&str>) -> String {
     }
 }
 
-/// One `wasm-test` graph of a package: exactly these features, and the browser
-/// test's declared test names and labels.
+/// One `wasm-test` graph of a package: exactly these features, the browser
+/// test's declared test names and labels, and the integration-test targets each
+/// compiled for wasm32 and run in a browser of their own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestGraph {
     pub features: Vec<String>,
     pub tests: Vec<String>,
     pub labels: Vec<String>,
+    pub integration_tests: Vec<String>,
 }
 
 /// A package's `[package.metadata.buck2.wasm-test]` and its variants
@@ -191,9 +214,11 @@ fn test_graph(value: &serde_json::Value, where_: &str, variant: bool) -> Result<
         .with_context(|| format!("{where_} is not a table"))?;
     if let Some(key) = table
         .keys()
-        .find(|k| !["features", "tests", "labels"].contains(&k.as_str()))
+        .find(|k| !["features", "tests", "labels", "integration-tests"].contains(&k.as_str()))
     {
-        bail!("{where_}: unknown key `{key}` (it has `features`, `tests` and `labels`)");
+        bail!(
+            "{where_}: unknown key `{key}` (it has `features`, `tests`, `labels` and `integration-tests`)"
+        );
     }
     let list = |key: &str| -> Result<Vec<String>> {
         let Some(value) = table.get(key) else {
@@ -218,6 +243,7 @@ fn test_graph(value: &serde_json::Value, where_: &str, variant: bool) -> Result<
         features: list("features")?,
         tests: list("tests")?,
         labels: list("labels")?,
+        integration_tests: list("integration-tests")?,
     })
 }
 
@@ -711,6 +737,7 @@ pub fn resolve_tests(
                 id,
                 tested,
                 &graph.features,
+                None,
                 WASM_TRIPLE,
             )?;
             let Some(test) = test else {
@@ -730,21 +757,68 @@ pub fn resolve_tests(
                     rustc_flags,
                     tests: graph.tests.clone(),
                     labels: graph.labels.iter().cloned().collect(),
+                    integration: None,
+                    variants_key: None,
                 },
             );
-            for (pkg, lib) in libs {
-                let (rustc_flags, _) = profile_flags(&lib.profile)
-                    .with_context(|| format!("`[wasm] test_packages`: `{key}`: `{pkg}`"))?;
-                resolved.variants.entry(pkg).or_default().insert(
-                    key.clone(),
-                    WasmVariant {
+            let graph_libs = libs.clone();
+            insert_test_variants(&mut resolved, libs, &key, platform)?;
+            for target in &graph.integration_tests {
+                let declared = package.targets.iter().any(|t| {
+                    t.name == *target && t.kind.contains(&cargo_metadata::TargetKind::Test)
+                });
+                if !declared {
+                    bail!(
+                        "`[wasm] test_packages`: `{key}` names `{target}` in `integration-tests`, which is no integration-test target of `{tested}`"
+                    );
+                }
+                let it_key = integration_test_key(&key, target);
+                claim_test_key(&mut keys, &it_key, tested, variant)?;
+                let (libs, test) = resolve_package_test_graph(
+                    manifest_path,
+                    packages,
+                    id,
+                    tested,
+                    &graph.features,
+                    Some(target),
+                    WASM_TRIPLE,
+                )?;
+                let Some(test) = test else {
+                    bail!(
+                        "`[wasm] test_packages`: `cargo test -p {tested} --test {target}` compiles no test harness for {WASM_TRIPLE} (`{it_key}`)"
+                    );
+                };
+                let (mut rustc_flags, root_flags) = profile_flags(&test.profile)
+                    .with_context(|| format!("`[wasm] test_packages`: `{it_key}`: `{tested}`"))?;
+                rustc_flags.extend(root_flags);
+                // Cargo resolves features for the package and its dev-dependencies,
+                // not per test target, so an integration test's graph is normally the
+                // library unit tests' graph plus the package's own library. Then its
+                // module uses that graph's variants (`key`), with the package's
+                // library added to them, rather than a copy of every library under
+                // its own key. Any difference keeps the target's own key.
+                let variants_key = if shares_graph(&libs, &graph_libs, id) {
+                    let own: HashMap<_, _> = libs
+                        .into_iter()
+                        .filter(|(pkg, _)| pkg == id && !graph_libs.contains_key(pkg))
+                        .collect();
+                    insert_test_variants(&mut resolved, own, &key, platform)?;
+                    Some(key.clone())
+                } else {
+                    insert_test_variants(&mut resolved, libs, &it_key, platform)?;
+                    None
+                };
+                resolved.tests.entry(id.clone()).or_default().insert(
+                    it_key.clone(),
+                    WasmTest {
                         platform: platform.to_owned(),
-                        features: lib.features,
-                        normal: lib.normal,
-                        build: lib.build,
+                        features: test.features,
+                        deps: test.deps,
                         rustc_flags,
-                        root: false,
-                        bin: None,
+                        tests: Vec::new(),
+                        labels: graph.labels.iter().cloned().collect(),
+                        integration: Some(target.clone()),
+                        variants_key,
                     },
                 );
             }
@@ -758,6 +832,53 @@ pub fn resolve_tests(
         }
     }
     Ok(resolved)
+}
+
+/// Whether an integration test's graph `libs` is the library unit tests' graph
+/// `graph_libs` plus the package `id`'s own library: every other library equal, and
+/// `id`'s, where the unit tests' graph builds it too, equal.
+fn shares_graph(
+    libs: &HashMap<PackageId, crate::platform_features::PackageGraphLib>,
+    graph_libs: &HashMap<PackageId, crate::platform_features::PackageGraphLib>,
+    id: &PackageId,
+) -> bool {
+    let others = |m: &HashMap<PackageId, crate::platform_features::PackageGraphLib>| {
+        m.iter()
+            .filter(|(pkg, _)| *pkg != id)
+            .map(|(pkg, lib)| (pkg.clone(), lib.clone()))
+            .collect::<HashMap<_, _>>()
+    };
+    libs.contains_key(id)
+        && others(libs) == others(graph_libs)
+        && graph_libs
+            .get(id)
+            .is_none_or(|lib| Some(lib) == libs.get(id))
+}
+
+/// Give every library of a resolved `wasm-test` graph its `<lib>-wasm-<key>` variant.
+fn insert_test_variants(
+    resolved: &mut TestVariants,
+    libs: HashMap<PackageId, crate::platform_features::PackageGraphLib>,
+    key: &str,
+    platform: &str,
+) -> Result<()> {
+    for (pkg, lib) in libs {
+        let (rustc_flags, _) = profile_flags(&lib.profile)
+            .with_context(|| format!("`[wasm] test_packages`: `{key}`: `{pkg}`"))?;
+        resolved.variants.entry(pkg).or_default().insert(
+            key.to_owned(),
+            WasmVariant {
+                platform: platform.to_owned(),
+                features: lib.features,
+                normal: lib.normal,
+                build: lib.build,
+                rustc_flags,
+                root: false,
+                bin: None,
+            },
+        );
+    }
+    Ok(())
 }
 
 /// Records that `package`'s graph `variant` uses `key`, refusing a key that an
