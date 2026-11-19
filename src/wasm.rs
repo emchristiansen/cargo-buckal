@@ -762,6 +762,10 @@ pub fn resolve_tests(
                 },
             );
             let graph_libs = libs.clone();
+            // The package's library as the first integration target sharing `key`
+            // resolved it.
+            let mut shared: HashMap<String, crate::platform_features::PackageGraphLib> =
+                HashMap::new();
             insert_test_variants(&mut resolved, libs, &key, platform)?;
             for target in &graph.integration_tests {
                 let declared = package.targets.iter().any(|t| {
@@ -770,6 +774,11 @@ pub fn resolve_tests(
                 if !declared {
                     bail!(
                         "`[wasm] test_packages`: `{key}` names `{target}` in `integration-tests`, which is no integration-test target of `{tested}`"
+                    );
+                }
+                if !has_test_harness(&package.manifest_path, target)? {
+                    bail!(
+                        "`[wasm] test_packages`: `{key}` names `{target}` in `integration-tests`, which has `harness = false`; its module would be compiled with `--test`, which such a target is not"
                     );
                 }
                 let it_key = integration_test_key(&key, target);
@@ -797,7 +806,13 @@ pub fn resolve_tests(
                 // module uses that graph's variants (`key`), with the package's
                 // library added to them, rather than a copy of every library under
                 // its own key. Any difference keeps the target's own key.
-                let variants_key = if shares_graph(&libs, &graph_libs, id) {
+                // A later target sharing the key must resolve the package's library as
+                // the first did; otherwise it would replace that variant unchecked
+                // (Fable review 128).
+                let variants_key = if shares_graph(&libs, &graph_libs, id, shared.get(&key)) {
+                    if let Some(lib) = libs.get(id) {
+                        shared.entry(key.clone()).or_insert_with(|| lib.clone());
+                    }
                     let own: HashMap<_, _> = libs
                         .into_iter()
                         .filter(|(pkg, _)| pkg == id && !graph_libs.contains_key(pkg))
@@ -836,11 +851,13 @@ pub fn resolve_tests(
 
 /// Whether an integration test's graph `libs` is the library unit tests' graph
 /// `graph_libs` plus the package `id`'s own library: every other library equal, and
-/// `id`'s, where the unit tests' graph builds it too, equal.
+/// `id`'s equal to the unit tests' graph's where that builds it too, and to
+/// `earlier`, the library as an earlier target sharing the graph resolved it.
 fn shares_graph(
     libs: &HashMap<PackageId, crate::platform_features::PackageGraphLib>,
     graph_libs: &HashMap<PackageId, crate::platform_features::PackageGraphLib>,
     id: &PackageId,
+    earlier: Option<&crate::platform_features::PackageGraphLib>,
 ) -> bool {
     let others = |m: &HashMap<PackageId, crate::platform_features::PackageGraphLib>| {
         m.iter()
@@ -853,6 +870,24 @@ fn shares_graph(
         && graph_libs
             .get(id)
             .is_none_or(|lib| Some(lib) == libs.get(id))
+        && earlier.is_none_or(|lib| Some(lib) == libs.get(id))
+}
+
+/// Whether integration-test target `target` of the package at `manifest` has
+/// libtest's harness: false only where a `[[test]]` entry of that name sets
+/// `harness = false`. `cargo metadata` and the unit graph do not say.
+fn has_test_harness(manifest: &Utf8PathBuf, target: &str) -> Result<bool> {
+    let text =
+        std::fs::read_to_string(manifest).with_context(|| format!("reading `{manifest}`"))?;
+    let doc: toml::Table =
+        toml::from_str(&text).with_context(|| format!("parsing `{manifest}`"))?;
+    let Some(tests) = doc.get("test").and_then(toml::Value::as_array) else {
+        return Ok(true);
+    };
+    Ok(!tests.iter().any(|t| {
+        t.get("name").and_then(toml::Value::as_str) == Some(target)
+            && t.get("harness").and_then(toml::Value::as_bool) == Some(false)
+    }))
 }
 
 /// Give every library of a resolved `wasm-test` graph its `<lib>-wasm-<key>` variant.
@@ -922,7 +957,9 @@ pub fn package_dir(manifest: &Utf8PathBuf, root: &Utf8PathBuf) -> Option<String>
 
 #[cfg(test)]
 mod tests {
-    use super::{claim_test_key, profile_flags, test_graph, test_key, test_rule_name};
+    use super::{
+        claim_test_key, profile_flags, shares_graph, test_graph, test_key, test_rule_name,
+    };
     use crate::platform_features::UnitProfile;
     use std::collections::BTreeMap;
 
@@ -1053,5 +1090,51 @@ mod tests {
             r#"{"opt_level": "3", "lto": "maybe", "codegen_units": null, "debuginfo": 0, "debug_assertions": false, "overflow_checks": false, "incremental": false, "panic": "unwind", "strip": {"resolved": "None"}}"#,
         );
         assert!(profile_flags(&unknown).is_err());
+    }
+    #[test]
+    fn test_an_integration_target_shares_the_unit_tests_graph_only_when_equal() {
+        use crate::platform_features::PackageGraphLib;
+        use cargo_metadata::PackageId;
+        let lib = |features: &[&str]| PackageGraphLib {
+            features: features.iter().map(|f| (*f).to_owned()).collect(),
+            normal: Default::default(),
+            build: Default::default(),
+            profile: unit_profile(
+                r#"{"opt_level": "0", "lto": "false", "codegen_units": null, "debuginfo": 2, "debug_assertions": true, "overflow_checks": true, "incremental": false, "panic": "unwind", "strip": {"resolved": "None"}}"#,
+            ),
+        };
+        let id = |repr: &str| PackageId {
+            repr: repr.to_owned(),
+        };
+        let (site, dep) = (id("site"), id("dep"));
+        let graph = std::collections::HashMap::from([(dep.clone(), lib(&["m"]))]);
+        let with_site = |site_lib: PackageGraphLib, dep_lib: PackageGraphLib| {
+            std::collections::HashMap::from([(site.clone(), site_lib), (dep.clone(), dep_lib)])
+        };
+        let target = with_site(lib(&["test_lib"]), lib(&["m"]));
+        // The unit tests' graph plus the package's library: shared.
+        assert!(shares_graph(&target, &graph, &site, None));
+        // An earlier sharing target resolved the library the same: shared.
+        assert!(shares_graph(
+            &target,
+            &graph,
+            &site,
+            Some(&lib(&["test_lib"]))
+        ));
+        // ...or differently: the target's own key (the fallback).
+        assert!(!shares_graph(&target, &graph, &site, Some(&lib(&[]))));
+        // Another library differs: the fallback.
+        assert!(!shares_graph(
+            &with_site(lib(&["test_lib"]), lib(&[])),
+            &graph,
+            &site,
+            None
+        ));
+        // The package's library is absent: the fallback.
+        assert!(!shares_graph(&graph, &graph, &site, None));
+        // The unit tests' graph builds the library too, differently: the fallback.
+        let cyclic = with_site(lib(&["extra"]), lib(&["m"]));
+        assert!(!shares_graph(&target, &cyclic, &site, None));
+        assert!(shares_graph(&cyclic, &cyclic, &site, None));
     }
 }
