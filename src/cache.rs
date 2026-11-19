@@ -59,6 +59,10 @@ use crate::resolve::BuckalResolve;
 /// Version 16: with configured platforms, no `compatible_with` from the static package
 ///            table (Buck2 refuses it beside `target_compatible_with`).
 /// Version 17: no edge to a proc-macro package that gets no rules (Fable N20).
+/// Version 18: a `[package.metadata.buck2.wasm]` module may be its package's binary
+///            (`bin`).
+/// Version 19: browser tests for a package's wasm32 integration-test targets
+///            (`integration-tests`).
 /// Version 20: a `wasm-test` integration target with `harness = false` is refused, and
 ///            a target uses its graph's library variants only where it resolves the
 ///            package's library as every earlier target sharing them did.

@@ -31,7 +31,12 @@
 //! <package> --test <name> --target wasm32-unknown-unknown --features <features>`
 //! graph, keyed [`integration_test_key`], as the module `<name>-wasm-test-module[.<variant>]`
 //! with the alias `<name>-wasm-test-module-wasm32[.<variant>]` and the browser test
-//! `<name>-browser[.<variant>]`. Generation owns every `wasm_browser_test` call in a
+//! `<name>-browser[.<variant>]`. A target with `harness = false` is refused, as are
+//! two targets whose keys are equal (names differing only by `-` and `_`). Such a
+//! target uses the graph's own library variants, with the package's library added,
+//! where its graph is that graph plus the package's library, resolved as every
+//! earlier target sharing them resolved it; otherwise it has variants of its own,
+//! under its key. Generation owns every `wasm_browser_test` call in a
 //! BUCK file it writes, and a declaration has no `timeout_seconds`, so a generated
 //! browser test always has the rule's default timeout.
 
@@ -730,7 +735,7 @@ pub fn resolve_tests(
         }
         for (variant, graph) in declaration.graphs() {
             let key = test_key(tested, variant);
-            claim_test_key(&mut keys, &key, tested, variant)?;
+            claim_test_key(&mut keys, &key, tested, variant, None)?;
             let (libs, test) = resolve_package_test_graph(
                 manifest_path,
                 packages,
@@ -764,8 +769,7 @@ pub fn resolve_tests(
             let graph_libs = libs.clone();
             // The package's library as the first integration target sharing `key`
             // resolved it.
-            let mut shared: HashMap<String, crate::platform_features::PackageGraphLib> =
-                HashMap::new();
+            let mut shared: Option<crate::platform_features::PackageGraphLib> = None;
             insert_test_variants(&mut resolved, libs, &key, platform)?;
             for target in &graph.integration_tests {
                 let declared = package.targets.iter().any(|t| {
@@ -782,7 +786,7 @@ pub fn resolve_tests(
                     );
                 }
                 let it_key = integration_test_key(&key, target);
-                claim_test_key(&mut keys, &it_key, tested, variant)?;
+                claim_test_key(&mut keys, &it_key, tested, variant, Some(target))?;
                 let (libs, test) = resolve_package_test_graph(
                     manifest_path,
                     packages,
@@ -809,9 +813,9 @@ pub fn resolve_tests(
                 // A later target sharing the key must resolve the package's library as
                 // the first did; otherwise it would replace that variant unchecked
                 // (Fable review 128).
-                let variants_key = if shares_graph(&libs, &graph_libs, id, shared.get(&key)) {
-                    if let Some(lib) = libs.get(id) {
-                        shared.entry(key.clone()).or_insert_with(|| lib.clone());
+                let variants_key = if shares_graph(&libs, &graph_libs, id, shared.as_ref()) {
+                    if shared.is_none() {
+                        shared = libs.get(id).cloned();
                     }
                     let own: HashMap<_, _> = libs
                         .into_iter()
@@ -916,22 +920,32 @@ fn insert_test_variants(
     Ok(())
 }
 
-/// Records that `package`'s graph `variant` uses `key`, refusing a key that an
-/// earlier graph already uses: the second graph's library variants would otherwise
-/// replace the first's without a word.
+/// Records that `package`'s graph `variant`, or its integration-test `target` in that
+/// graph, uses `key`, refusing a key that an earlier one already uses: the second's
+/// library variants would otherwise replace the first's without a word.
 fn claim_test_key(
     keys: &mut BTreeMap<String, String>,
     key: &str,
     package: &str,
     variant: Option<&str>,
+    target: Option<&str>,
 ) -> Result<()> {
     let graph = match variant {
         None => format!("`{package}`'s default `wasm-test` graph"),
         Some(variant) => format!("`{package}`'s `wasm-test` variant `{variant}`"),
     };
-    if let Some(earlier) = keys.insert(key.to_owned(), graph.clone()) {
+    let user = match target {
+        None => graph,
+        Some(target) => format!("integration-test target `{target}` of {graph}"),
+    };
+    if let Some(earlier) = keys.insert(key.to_owned(), user.clone()) {
+        let rename = if target.is_some() || earlier.starts_with("integration-test target") {
+            "the package, the variant or the integration-test target"
+        } else {
+            "the package or the variant"
+        };
         bail!(
-            "`[wasm] test_packages`: {graph} and {earlier} both have the test graph key `{key}`; rename the package or the variant"
+            "`[wasm] test_packages`: {user} and {earlier} both have the test graph key `{key}`; rename {rename}"
         );
     }
     Ok(())
@@ -989,12 +1003,19 @@ mod tests {
             &test_key("a", Some("b__test")),
             "a",
             Some("b__test"),
+            None,
         )
         .unwrap();
-        claim_test_key(&mut keys, &test_key("a", None), "a", None).unwrap();
-        let error = claim_test_key(&mut keys, &test_key("a__test__b", None), "a__test__b", None)
-            .unwrap_err()
-            .to_string();
+        claim_test_key(&mut keys, &test_key("a", None), "a", None, None).unwrap();
+        let error = claim_test_key(
+            &mut keys,
+            &test_key("a__test__b", None),
+            "a__test__b",
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
         assert_eq!(
             error,
             "`[wasm] test_packages`: `a__test__b`'s default `wasm-test` graph and `a`'s `wasm-test` variant `b__test` both have the test graph key `a__test__b__test`; rename the package or the variant"
