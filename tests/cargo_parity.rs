@@ -722,6 +722,7 @@ fn wasm_test_graph_mismatches(
         &root,
         package,
         features,
+        None,
         triple,
     )
     .unwrap();

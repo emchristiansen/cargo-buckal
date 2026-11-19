@@ -1104,17 +1104,50 @@ fn wasm_test_rules(
     ctx: &BuckalContext,
 ) -> Vec<Rule> {
     use crate::platform_features::{Edges, PlatformResolution};
-    use crate::wasm::{BROWSER_TEST, TEST_MODULE, TEST_MODULE_ALIAS, test_key, test_rule_name};
+    use crate::wasm::{
+        BROWSER_TEST, INTEGRATION_BROWSER_TEST, TEST_MODULE, TEST_MODULE_ALIAS,
+        integration_rule_name, integration_test_key, test_key, test_rule_name,
+    };
     let mut rules = Vec::new();
     let Some(platform) = &ctx.repo_config.wasm.platform else {
         return rules;
     };
     let default_key = test_key(&node.name, None);
     for (key, test) in &node.platform_features.wasm_tests {
-        let variant = if *key == default_key {
+        // An integration-test target's graph is keyed within its `wasm-test` graph's.
+        let graph_key = match &test.integration {
+            None => key.as_str(),
+            Some(target) => key
+                .strip_suffix(integration_test_key("", target).as_str())
+                .unwrap_or(key),
+        };
+        let variant = if graph_key == default_key {
             None
         } else {
-            key.strip_prefix(&format!("{default_key}__"))
+            graph_key.strip_prefix(&format!("{default_key}__"))
+        };
+        // The target whose sources the module compiles: the library, or the
+        // integration-test target.
+        let source_target = match &test.integration {
+            None => lib_target,
+            Some(name) => {
+                let Some(target) = node
+                    .targets
+                    .iter()
+                    .find(|t| t.name == *name && t.kind.contains(&TargetKind::Test))
+                else {
+                    buckal_error!(format!(
+                        "`{}`: the `wasm-test` integration test `{name}` is no integration-test target",
+                        node.name
+                    ));
+                    std::process::exit(1);
+                };
+                target
+            }
+        };
+        let rule_name = |base: &str| match &test.integration {
+            None => test_rule_name(base, variant),
+            Some(name) => integration_rule_name(name, base, variant),
         };
         let on = |set: &Set<String>| {
             std::collections::BTreeMap::from([(test.platform.clone(), set.clone())])
@@ -1137,8 +1170,8 @@ fn wasm_test_rules(
             platform_features: resolution,
             ..node.clone()
         };
-        let module = test_rule_name(TEST_MODULE, variant);
-        let mut binary = emit_test_module(&test_node, lib_target, manifest_dir, &module, ctx);
+        let module = rule_name(TEST_MODULE);
+        let mut binary = emit_test_module(&test_node, source_target, manifest_dir, &module, ctx);
         binary.rustc_flags.extend(test.rustc_flags.iter().cloned());
         binary.rustc_flags.push("--test".to_owned());
         if self_linked {
@@ -1146,7 +1179,7 @@ fn wasm_test_rules(
                 .deps
                 .insert(format!(":{}", wasm_variant_name(lib_name, key)));
         }
-        let alias = test_rule_name(TEST_MODULE_ALIAS, variant);
+        let alias = rule_name(TEST_MODULE_ALIAS);
         rules.push(Rule::RustBinary(binary));
         rules.push(Rule::ConfiguredAlias(crate::buck::ConfiguredAlias {
             name: alias.clone(),
@@ -1155,7 +1188,10 @@ fn wasm_test_rules(
             visibility: Set::from(["PUBLIC".to_owned()]),
         }));
         rules.push(Rule::WasmBrowserTest(crate::buck::WasmBrowserTest {
-            name: test_rule_name(BROWSER_TEST, variant),
+            name: match &test.integration {
+                None => test_rule_name(BROWSER_TEST, variant),
+                Some(name) => integration_rule_name(name, INTEGRATION_BROWSER_TEST, variant),
+            },
             wasm: format!(":{alias}"),
             tests: test.tests.clone(),
             labels: test.labels.clone(),
