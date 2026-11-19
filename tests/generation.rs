@@ -5592,7 +5592,7 @@ fn test_wasm_test_integration_targets_with_hyphenated_names() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "{stderr}");
     assert!(
-        stderr.contains("both have the test graph key `site__test__it__test_about`"),
+        stderr.contains("`[wasm] test_packages`: integration-test target `test_about` of `site`'s default `wasm-test` graph and integration-test target `test-about` of `site`'s default `wasm-test` graph both have the test graph key `site__test__it__test_about`; rename the package, the variant or the integration-test target"),
         "{stderr}"
     );
     assert!(!f.ws.join("site/BUCK").exists());
