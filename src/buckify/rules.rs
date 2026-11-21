@@ -353,12 +353,19 @@ fn buckify_root_node_targets(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule
     let production = node.platform_features.exec_resolution();
     let tests = node.platform_features.test_resolution();
     // Cargo builds the binaries and tests of workspace members only: of a path
-    // dependency outside the workspace, only the library.
+    // dependency outside the workspace, only the library. An `emit_bins` fixup
+    // asks for such a package's binaries as well.
     let member = ctx.is_workspace_member(&node.package_id);
+    let emit_bins_fixup = ctx
+        .repo_config
+        .fixups
+        .get(&node.name)
+        .is_some_and(|fixup| fixup.emit_bins);
+    let emit_bins = member || emit_bins_fixup;
     let bin_targets: Vec<_> = node
         .targets
         .iter()
-        .filter(|t| member && t.kind.contains(&TargetKind::Bin))
+        .filter(|t| emit_bins && t.kind.contains(&TargetKind::Bin))
         .filter(|t| {
             let per_platform = !ctx.repo_config.feature_platforms.is_empty();
             features_enable(&production, &t.required_features, per_platform)
@@ -469,12 +476,15 @@ fn buckify_root_node_targets(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule
     // package only the tests build) as its unit tests, and as an executable only
     // for its package's integration tests (for `CARGO_BIN_EXE_<name>`): without
     // one, there is no binary to emit.
+    // An `emit_bins` fixup emits the executable anyway, for a package whose own
+    // unit tests run its test-only binary (as a dev shell builds it for them).
     let integration_tests = !ctx.repo_config.ignore_tests && !test_targets.is_empty();
     let emitted_bins: Vec<&BuckalTarget> = bin_targets
         .iter()
         .copied()
         .filter(|t| {
             integration_tests
+                || emit_bins_fixup
                 || !node.platform_features.test_context && has_required_features(&exec_node, t)
         })
         .collect();
@@ -2435,6 +2445,7 @@ mod tests {
                 target_compatible_with: Default::default(),
                 extra_deps: Default::default(),
                 buildscript: Default::default(),
+                emit_bins: false,
             },
         );
 
