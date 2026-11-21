@@ -614,8 +614,10 @@ fn buckify_root_node_targets(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule
     // harness over the binary's crate root, compiled in the test context (like the
     // library's), with the dev-dependencies and the package's library. Cargo gives
     // it `CARGO_BIN_NAME` but no `CARGO_BIN_EXE_*` (only integration tests and
-    // benches get those).
-    if !ctx.repo_config.ignore_tests {
+    // benches get those). Like the library's unit tests, only a workspace member's:
+    // the binaries an `emit_bins` fixup adds to a path package outside the workspace
+    // are executables only, as Cargo tests no such package.
+    if member && !ctx.repo_config.ignore_tests {
         let per_platform = !ctx.repo_config.feature_platforms.is_empty();
         for bin_target in bin_targets
             .iter()
