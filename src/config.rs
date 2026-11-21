@@ -637,6 +637,12 @@ pub struct PackageFixup {
     /// `runtime_tools` of every test target of the package.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_runtime_tools: Option<String>,
+    /// Emit the binaries of this path package although it is not a workspace member.
+    /// Cargo builds only the library of a path dependency outside the workspace; a
+    /// repository that installs such a package's binary another way (a Nix dev shell)
+    /// and whose tests run it by name sets this, so Buck2 builds the binary too.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub emit_bins: bool,
     /// Files of a first-party package to export to other packages, as paths relative
     /// to the package directory (e.g. a manifest another package's test reads). Each
     /// becomes `export_file(name = <path>, src = <path>, mode = "reference")` in the

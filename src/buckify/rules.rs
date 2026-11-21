@@ -353,12 +353,19 @@ fn buckify_root_node_targets(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule
     let production = node.platform_features.exec_resolution();
     let tests = node.platform_features.test_resolution();
     // Cargo builds the binaries and tests of workspace members only: of a path
-    // dependency outside the workspace, only the library.
+    // dependency outside the workspace, only the library. An `emit_bins` fixup
+    // asks for such a package's binaries as well.
     let member = ctx.is_workspace_member(&node.package_id);
+    let emit_bins = member
+        || ctx
+            .repo_config
+            .fixups
+            .get(&node.name)
+            .is_some_and(|fixup| fixup.emit_bins);
     let bin_targets: Vec<_> = node
         .targets
         .iter()
-        .filter(|t| member && t.kind.contains(&TargetKind::Bin))
+        .filter(|t| emit_bins && t.kind.contains(&TargetKind::Bin))
         .filter(|t| {
             let per_platform = !ctx.repo_config.feature_platforms.is_empty();
             features_enable(&production, &t.required_features, per_platform)
@@ -2435,6 +2442,7 @@ mod tests {
                 target_compatible_with: Default::default(),
                 extra_deps: Default::default(),
                 buildscript: Default::default(),
+                emit_bins: false,
             },
         );
 
