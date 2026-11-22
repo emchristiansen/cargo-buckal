@@ -1908,6 +1908,7 @@ pub fn vendor_package(node: &BuckalNode) -> Utf8PathBuf {
     let vendor_dir =
         get_vendor_dir(&node.package_id).unwrap_or_exit_ctx("failed to get vendor directory");
     if !vendor_dir.exists() {
+        crate::generated_output::check_write(&vendor_dir).unwrap_or_exit();
         std::fs::create_dir_all(&vendor_dir).expect("Failed to create target directory");
     }
 

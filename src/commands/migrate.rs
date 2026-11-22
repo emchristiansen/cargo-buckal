@@ -35,6 +35,11 @@ pub struct MigrateArgs {
     #[arg(long, conflicts_with = "init")]
     pub manifest_path: Option<String>,
 
+    /// Refuse generated destinations outside this directory, following existing symlinks.
+    /// Cargo dependency-cache materialization remains permitted.
+    #[arg(long, conflicts_with_all = ["init", "fetch"])]
+    pub output_root: Option<PathBuf>,
+
     /// Accept and record a changed list of host compilations that resolve
     /// differently per configured platform (otherwise a change stops generation)
     #[clap(long)]
@@ -42,6 +47,9 @@ pub struct MigrateArgs {
 }
 
 pub fn execute(args: &MigrateArgs) {
+    if let Some(root) = &args.output_root {
+        crate::generated_output::confine(root).unwrap_or_exit();
+    }
     // Ensure all prerequisites are installed before proceeding
     ensure_prerequisites().unwrap_or_exit();
 

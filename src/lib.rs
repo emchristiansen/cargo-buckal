@@ -9,6 +9,7 @@ pub mod commands;
 pub mod config;
 pub mod context;
 pub mod filter;
+mod generated_output;
 pub mod platform;
 pub mod platform_features;
 pub mod registry;

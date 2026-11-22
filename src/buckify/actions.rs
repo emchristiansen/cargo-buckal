@@ -317,6 +317,7 @@ impl BuckalChange {
         };
 
         for (path, content) in writes {
+            crate::generated_output::check_write(&path).unwrap_or_exit();
             if let Some(dir) = path.parent() {
                 std::fs::create_dir_all(dir).expect("Failed to create the package directory");
             }
@@ -324,12 +325,14 @@ impl BuckalChange {
         }
         for vendor_dir in removals {
             if vendor_dir.exists() {
+                crate::generated_output::check_remove(&vendor_dir).unwrap_or_exit();
                 std::fs::remove_dir_all(&vendor_dir).expect("Failed to remove vendor directory");
             }
             if let Some(package_dir) = vendor_dir.parent()
                 && package_dir.exists()
                 && package_dir.read_dir().unwrap().next().is_none()
             {
+                crate::generated_output::check_remove(package_dir).unwrap_or_exit();
                 std::fs::remove_dir_all(package_dir)
                     .expect("Failed to remove empty package directory");
             }
