@@ -565,6 +565,8 @@ impl TablesPlan {
             let full = self.root.join(path);
             match std::fs::read_to_string(&full) {
                 Ok(content) if is_generated_tables(&content) => {
+                    crate::generated_output::check_remove(&full)
+                        .map_err(|error| format!("cannot remove {full}: {error}"))?;
                     std::fs::remove_file(&full)
                         .map_err(|error| format!("cannot remove {full}: {error}"))?;
                     buckal_warn!(format!(
@@ -593,6 +595,8 @@ impl TablesPlan {
         let text = tables.render();
         let full = self.root.join(&path);
         if std::fs::read_to_string(&full).ok().as_deref() != Some(text.as_str()) {
+            crate::generated_output::check_write(&full)
+                .map_err(|error| format!("cannot write {full}: {error}"))?;
             if let Some(dir) = full.parent() {
                 std::fs::create_dir_all(dir)
                     .map_err(|error| format!("cannot create {dir}: {error}"))?;
